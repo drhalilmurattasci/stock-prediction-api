@@ -1,0 +1,6 @@
+# Feast feature store config — PLACEHOLDER (TODO)
+# project: stock_api
+# registry: data/feast/registry.db
+# provider: local
+# offline_store: { type: postgres }   # TimescaleDB
+# online_store:  { type: redis }

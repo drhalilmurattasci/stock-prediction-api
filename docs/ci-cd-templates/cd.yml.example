@@ -1,0 +1,12 @@
+# CD workflow — PLACEHOLDER TEMPLATE (TODO: implement)
+# Move to .github/workflows/cd.yml using a token with the `workflow` scope.
+# Intended: build & push Docker image, deploy to Hostinger VPS / cloud on release.
+name: cd
+on:
+  release:
+    types: [ published ]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "TODO: build image, push registry, deploy"

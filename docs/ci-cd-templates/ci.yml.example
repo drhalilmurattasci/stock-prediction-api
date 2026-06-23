@@ -1,0 +1,13 @@
+# CI workflow — PLACEHOLDER TEMPLATE (TODO: implement)
+# Move to .github/workflows/ci.yml using a token with the `workflow` scope.
+# Intended: lint (ruff) + type-check (mypy) + test (pytest) on push/PR.
+name: ci
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "TODO: checkout, setup uv + python 3.12, install, ruff, mypy, pytest"

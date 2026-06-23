@@ -1,0 +1,9 @@
+# Application settings example (non-secret) — PLACEHOLDER
+# TODO: fill in. Secrets belong in .env, not here.
+app:
+  env: local
+  log_level: INFO
+forecasting:
+  default_model: chronos        # baselines | chronos | nixtla | gboost
+  horizons: [1, 5, 21]
+  intervals: [0.5, 0.8, 0.95]
