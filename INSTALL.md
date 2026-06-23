@@ -1,0 +1,507 @@
+# INSTALL — Stock Market Analysis & Price Prediction API
+
+> Start-to-finish installation guide for the stack defined in [STOCK_API_MASTER_PLAN.md](STOCK_API_MASTER_PLAN.md).
+> **Target machine:** Windows 11 Pro (build 26200), PowerShell. **Detected 2026-06-23.**
+> Infra (TimescaleDB, Redis, Prefect, MLflow) runs in **Docker containers**; dev tooling (Git, Python, uv) installs **natively**.
+
+---
+
+## 0. What this installs
+
+| Layer | Component | Method | Runs as |
+|---|---|---|---|
+| Package mgr | winget | (present) | native |
+| VCS | Git | (present) | native |
+| Runtime | Python **3.12** | uv-managed | native venv |
+| Env/pkg mgr | **uv** | winget | native |
+| Containers | **Docker Desktop** + WSL2 | winget + GUI | native host |
+| Database | **TimescaleDB** (PostgreSQL 17) | Docker image | container |
+| Cache/broker | **Redis 7** | Docker image | container |
+| Orchestration | **Prefect 3** | Docker image | container |
+| ML tracking | **MLflow** | Docker image | container |
+| API + ML libs | FastAPI, Pydantic, SQLAlchemy, pandas, torch, XGBoost, Darts, Chronos, vectorbt, … | uv pip | native venv |
+
+**Estimated time:** 30–60 min (most of it Docker image pulls + Python wheel downloads). One reboot required (WSL2).
+
+---
+
+## 1. Machine baseline (detected on this host)
+
+| Tool | Status | Version / path |
+|---|---|---|
+| winget | ✅ present | v1.28.240 |
+| Git | ✅ present | 2.54.0 |
+| Python (system) | ✅ present | 3.13.13 — *project will pin 3.12 instead* |
+| pip | ✅ present | 26.0.1 |
+| Node / npm | ✅ present | 24.16.0 / 11.13.0 |
+| WSL | ✅ present | platform installed (backend confirmed in Step 2) |
+| uv | ❌ missing | install in Step 3 |
+| Docker | ❌ missing | install in Step 2 |
+| Hardware | ✅ | 63 GB RAM, 16 logical CPUs — ample for local ML |
+
+> ⚠️ **Admin note:** the shell used for the survey was **non-elevated**. Steps **2 (WSL2)** and the **Docker Desktop install** require an **Administrator PowerShell** (UAC). Open one via: Start → type `powershell` → right-click → **Run as administrator**.
+
+---
+
+## 2. Step 1 — Enable WSL2 + install Docker Desktop
+
+Docker Desktop on Windows uses the **WSL2** backend. Enable it first.
+
+### 2.1 Enable WSL2 (Administrator PowerShell, one-time)
+
+```powershell
+# Enables the WSL + Virtual Machine Platform features and sets WSL2 as default.
+wsl --install --no-distribution
+wsl --set-default-version 2
+wsl --status
+```
+
+> If `wsl --install` reports features were enabled, **reboot now** before continuing.
+> Docker Desktop ships its own WSL distro, so `--no-distribution` is enough (no Ubuntu needed). Want a full Linux env too? Use `wsl --install -d Ubuntu`.
+
+**Verify (after reboot):**
+```powershell
+wsl --status          # should show "Default Version: 2"
+wsl --version         # WSL kernel version
+```
+
+### 2.2 Install Docker Desktop (Administrator PowerShell)
+
+```powershell
+winget install -e --id Docker.DockerDesktop --accept-source-agreements --accept-package-agreements
+```
+
+### 2.3 First-run configuration (GUI, one-time, manual)
+
+1. Launch **Docker Desktop** (Start menu). Accept the service agreement.
+2. You can **skip sign-in** (not required for local use).
+3. **Settings → General →** ensure *“Use the WSL 2 based engine”* is checked.
+4. **Settings → Resources → WSL Integration →** leave defaults (Docker manages its own distro).
+5. Wait until the whale icon shows **“Engine running.”**
+
+**Verify:**
+```powershell
+docker version
+docker run --rm hello-world      # prints "Hello from Docker!"
+docker compose version
+```
+
+> 🔧 If `docker` is “not recognized,” open a **new** terminal (PATH was updated by the installer).
+
+---
+
+## 3. Step 2 — Install uv (Python env & package manager)
+
+```powershell
+winget install -e --id astral-sh.uv --accept-source-agreements --accept-package-agreements
+```
+
+**Verify** (open a new terminal so PATH refreshes):
+```powershell
+uv --version
+```
+
+> Fallback if winget can’t find it: `powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+
+---
+
+## 4. Step 3 — Install project Python 3.12
+
+The system has Python 3.13, but several ML libraries (Darts, NeuralForecast, some torch builds) ship reliable wheels for **3.12**. Let `uv` manage an isolated 3.12 — it won’t touch your system Python.
+
+```powershell
+uv python install 3.12
+uv python list            # confirms 3.12 is available to uv
+```
+
+---
+
+## 5. Step 4 — Create the project files
+
+All commands below run from the project root **`A:\tansel`**.
+
+### 5.1 `pyproject.toml`
+
+Create **`A:\tansel\pyproject.toml`** with dependency groups (core always; `ml` and `dev` optional):
+
+```toml
+[project]
+name = "stock-prediction-api"
+version = "0.1.0"
+description = "Stock market analysis & probabilistic price-prediction API"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  # --- API & web ---
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.34",
+  "gunicorn>=23.0",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  "httpx>=0.28",
+  "slowapi>=0.1.9",
+  "python-jose[cryptography]>=3.3",
+  "passlib[bcrypt]>=1.7",
+  "python-dotenv>=1.0",
+  # --- data layer ---
+  "sqlalchemy>=2.0",
+  "psycopg[binary]>=3.2",
+  "asyncpg>=0.30",
+  "alembic>=1.14",
+  "redis>=5.2",
+  # --- analytics core ---
+  "pandas>=2.2",
+  "numpy>=1.26",
+  "pandas-ta>=0.3.14b",
+  "scikit-learn>=1.5",
+  "statsmodels>=0.14",
+  # --- orchestration / tracking clients ---
+  "prefect>=3.1",
+  "mlflow>=2.19",
+  # --- observability ---
+  "prometheus-client>=0.21",
+  "sentry-sdk>=2.19",
+  "structlog>=24.4",
+  # --- vendor SDKs ---
+  "polygon-api-client>=1.14",
+  "finnhub-python>=2.4",
+]
+
+[project.optional-dependencies]
+ml = [
+  "torch>=2.5",                 # CPU build by default; see GPU note in Appendix
+  "xgboost>=2.1",
+  "lightgbm>=4.5",
+  "catboost>=1.2",
+  "statsforecast>=2.0",
+  "neuralforecast>=2.0",
+  "darts>=0.31",
+  "chronos-forecasting>=1.5",
+  "pmdarima>=2.0",
+  "vectorbt>=0.27",
+  "backtrader>=1.9",
+]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "ipython>=8.30",
+]
+
+[tool.uv]
+package = false
+```
+
+### 5.2 `.env.example`
+
+Create **`A:\tansel\.env.example`** (copy to `.env` and fill in real keys — never commit `.env`):
+
+```dotenv
+# ---- Database (TimescaleDB) ----
+POSTGRES_USER=stockapi
+POSTGRES_PASSWORD=change_me_strong
+POSTGRES_DB=stockapi
+DATABASE_URL=postgresql+psycopg://stockapi:change_me_strong@localhost:5432/stockapi
+
+# ---- Redis ----
+REDIS_URL=redis://localhost:6379/0
+
+# ---- Services ----
+PREFECT_API_URL=http://localhost:4200/api
+MLFLOW_TRACKING_URI=http://localhost:5000
+
+# ---- Vendor API keys (fill these in) ----
+POLYGON_API_KEY=
+FMP_API_KEY=
+FINNHUB_API_KEY=
+NASDAQ_DATA_LINK_API_KEY=
+
+# ---- App ----
+APP_ENV=local
+JWT_SECRET=change_me_random_64_chars
+LOG_LEVEL=INFO
+```
+
+### 5.3 `.gitignore`
+
+Create **`A:\tansel\.gitignore`**:
+
+```gitignore
+.venv/
+__pycache__/
+*.pyc
+.env
+.mlflow/
+mlruns/
+data/pgdata/
+data/redis/
+.prefect/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+```
+
+### 5.4 `docker-compose.yml`
+
+Create **`A:\tansel\docker-compose.yml`**:
+
+```yaml
+name: stock-api
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    container_name: stockapi-timescaledb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/pgdata:/var/lib/postgresql/data
+      - ./scripts/db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: stockapi-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prefect:
+    image: prefecthq/prefect:3-latest
+    container_name: stockapi-prefect
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+    ports:
+      - "4200:4200"
+    volumes:
+      - ./data/prefect:/root/.prefect
+
+  mlflow:
+    image: python:3.12-slim
+    container_name: stockapi-mlflow
+    working_dir: /mlflow
+    command: >
+      bash -c "pip install --no-cache-dir mlflow>=2.19 &&
+               mlflow server --host 0.0.0.0 --port 5000
+               --backend-store-uri sqlite:////mlflow/mlflow.db
+               --artifacts-destination /mlflow/artifacts"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data/mlflow:/mlflow
+```
+
+### 5.5 TimescaleDB init script
+
+Create **`A:\tansel\scripts\db-init\01-extensions.sql`** (auto-run on first DB boot):
+
+```sql
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+-- Example hypertable (uncomment once the bars table exists):
+-- CREATE TABLE IF NOT EXISTS bars (
+--   symbol text NOT NULL, ts timestamptz NOT NULL,
+--   open double precision, high double precision, low double precision,
+--   close double precision, volume double precision,
+--   PRIMARY KEY (symbol, ts)
+-- );
+-- SELECT create_hypertable('bars', 'ts', if_not_exists => TRUE);
+```
+
+---
+
+## 6. Step 5 — Create the virtual env & install Python deps
+
+From **`A:\tansel`**:
+
+```powershell
+# Create the .env from the template, then edit it with your real keys
+Copy-Item .env.example .env
+
+# Create a 3.12 venv managed by uv
+uv venv --python 3.12
+
+# Activate it (PowerShell)
+.\.venv\Scripts\Activate.ps1
+
+# Install core + dev deps (fast)
+uv pip install -e ".[dev]"
+
+# Install the heavy ML stack (torch, darts, chronos, etc.) — takes longer
+uv pip install -e ".[ml]"
+```
+
+**Verify the environment:**
+```powershell
+python --version                       # Python 3.12.x
+python -c "import fastapi, pandas, sqlalchemy, redis, prefect, mlflow; print('core OK')"
+python -c "import torch, xgboost, darts, statsforecast; print('ml OK')"
+```
+
+> 🔧 If `Activate.ps1` is blocked: `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`, then retry.
+> 🔧 `pandas-ta` may warn about `pkg_resources`/`numpy` — harmless. If a hard error, see Troubleshooting.
+
+---
+
+## 7. Step 6 — Bring up the infrastructure
+
+Make sure **Docker Desktop is running** (whale icon → “Engine running”), then from **`A:\tansel`**:
+
+```powershell
+docker compose up -d
+docker compose ps           # all services should be "running"/"healthy"
+```
+
+First run pulls images (TimescaleDB, Redis, Prefect) and the MLflow container pip-installs MLflow on boot (~1–2 min the first time).
+
+**Watch logs if needed:**
+```powershell
+docker compose logs -f timescaledb
+docker compose logs -f mlflow
+```
+
+---
+
+## 8. Step 7 — Verify every component (smoke tests)
+
+| Component | Command | Expected |
+|---|---|---|
+| Docker engine | `docker version` | client + server versions |
+| TimescaleDB up | `docker exec stockapi-timescaledb pg_isready -U stockapi` | `accepting connections` |
+| Timescale ext | `docker exec stockapi-timescaledb psql -U stockapi -d stockapi -c "SELECT extversion FROM pg_extension WHERE extname='timescaledb';"` | a version row |
+| Redis | `docker exec stockapi-redis redis-cli ping` | `PONG` |
+| Prefect UI | open `http://localhost:4200` | Prefect dashboard |
+| MLflow UI | open `http://localhost:5000` | MLflow dashboard |
+| DB from Python | see snippet below | `db OK` |
+
+```powershell
+python -c "import os,sqlalchemy as sa; from dotenv import load_dotenv; load_dotenv(); e=sa.create_engine(os.environ['DATABASE_URL']); c=e.connect(); print('db OK', c.execute(sa.text('select 1')).scalar())"
+```
+
+✅ When all rows pass, the platform is fully installed and running.
+
+---
+
+## 9. Step 8 — Run the API (after the app skeleton exists)
+
+Once the FastAPI app is scaffolded (e.g. `app/main.py` with the `/v1/...` endpoints from the master plan roadmap):
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --reload --port 8000
+# Swagger docs: http://localhost:8000/docs
+# Health:       http://localhost:8000/healthz
+```
+
+> The repo skeleton is a separate scaffolding step. This INSTALL.md gets the **environment + infra** fully ready; ask to generate the app skeleton next.
+
+---
+
+## 10. Daily start / stop
+
+```powershell
+# Start a work session
+docker compose up -d                 # infra
+.\.venv\Scripts\Activate.ps1         # python env
+uvicorn app.main:app --reload        # api (once it exists)
+
+# Stop
+docker compose stop                  # stop containers, keep data
+deactivate                           # leave the venv
+```
+
+---
+
+## 11. Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `winget` install needs admin / silently fails | Run PowerShell **as Administrator**. |
+| Docker Desktop won’t start / “WSL 2 not installed” | Re-run `wsl --install`, **reboot**, ensure Virtualization is **Enabled in BIOS/UEFI** (Intel VT-x / AMD-V). |
+| Virtualization disabled | Reboot → BIOS/UEFI → enable **Intel VT-x / SVM Mode** → save & exit. |
+| `docker` not recognized after install | Open a **new** terminal (PATH refresh) or sign out/in. |
+| Port already in use (5432/6379/4200/5000) | Find owner: `Get-NetTCPConnection -LocalPort 5432 \| Select OwningProcess` then `Get-Process -Id <pid>`; stop it or change the host port in `docker-compose.yml`. |
+| `Activate.ps1` blocked | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. |
+| TimescaleDB extension missing | Confirm `scripts/db-init/01-extensions.sql` mounted; it only runs on a **fresh** volume — `docker compose down -v` then `up` to re-init (destroys local data). |
+| MLflow container slow first boot | Expected — it pip-installs MLflow on start. Subsequent boots reuse the layer cache. |
+| `torch` install huge / slow | Default is CPU build. For GPU see Appendix A. |
+| `TA-Lib` build error | TA-Lib is **optional** (we default to `pandas-ta`). See Appendix B to add it. |
+
+---
+
+## 12. Uninstall / rollback
+
+```powershell
+# Stop and remove containers + volumes (DESTROYS local DB/Redis/MLflow data)
+docker compose down -v
+
+# Remove the Python env
+Remove-Item -Recurse -Force .\.venv
+
+# Remove installed apps (optional)
+winget uninstall -e --id Docker.DockerDesktop
+winget uninstall -e --id astral-sh.uv
+```
+
+---
+
+## Appendix A — GPU (CUDA) PyTorch (optional)
+
+This host has ample RAM; if you also have an NVIDIA GPU and want CUDA acceleration:
+
+```powershell
+uv pip uninstall torch
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+```
+
+## Appendix B — TA-Lib on Windows (optional)
+
+`pandas-ta` (pure Python) is the default and needs no extra steps. To add the faster C-backed **TA-Lib**:
+
+```powershell
+# Prebuilt wheel (preferred on Windows — no C toolchain needed)
+uv pip install TA-Lib
+# If no wheel resolves for 3.12, grab a prebuilt wheel matching cp312/win_amd64
+# from a trusted wheel mirror and: uv pip install path\to\TA_Lib-...-cp312-win_amd64.whl
+```
+
+## Appendix C — VS Code (optional editor)
+
+```powershell
+winget install -e --id Microsoft.VisualStudioCode --accept-source-agreements --accept-package-agreements
+# Recommended extensions: ms-python.python, ms-python.vscode-pylance, ms-azuretools.vscode-docker, charliermarsh.ruff
+```
+
+## Appendix D — Version-pinning policy
+
+Image tags (`latest-pg17`, `3-latest`) and `>=` ranges favor a smooth first install. **Before production**, pin every image to an exact digest/tag and freeze Python deps with `uv pip freeze > requirements.lock`. Verify current versions at each vendor’s site — they change frequently.
+
+---
+
+## Install checklist
+
+- [ ] WSL2 enabled + rebooted (`wsl --status` → version 2)
+- [ ] Docker Desktop installed, engine running (`docker run --rm hello-world`)
+- [ ] uv installed (`uv --version`)
+- [ ] Python 3.12 available to uv (`uv python list`)
+- [ ] Project files created (`pyproject.toml`, `.env`, `docker-compose.yml`, init SQL)
+- [ ] `.venv` created, `[dev]` + `[ml]` installed (import checks pass)
+- [ ] `docker compose up -d` → all services healthy
+- [ ] Smoke-test matrix all green (DB, Redis, Prefect, MLflow)
+- [ ] (later) App skeleton scaffolded → `uvicorn` serves `/docs`

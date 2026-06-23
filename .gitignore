@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Env & secrets
+.env
+*.env
+!.env.example
+
+# Data / runtime
+data/
+mlruns/
+.mlflow/
+.prefect/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temp
+_*.tmp.md
+*.log
