@@ -234,9 +234,6 @@ The **cloud path** (AWS / Azure / GCP) is the deliberate upgrade for what a sing
 This catalog enumerates the full, current (2026) feature set of every API and framework in scope.
 
 ### 5.1 Market & Fundamental Data APIs
-
-I now have comprehensive, current (2026) data covering all required dimensions. Here is the markdown block.
-
 ### Massive (formerly Polygon.io)
 
 - **What it is**: Developer-first market-data platform providing real-time and historical pricing, reference, fundamental, and news data for US equities, options, indices, FX, crypto, and futures via REST, WebSocket, and flat files (Polygon.io rebranded to Massive.com in 2026; same product, endpoints, and pricing).
@@ -286,9 +283,6 @@ Sources:
 - [Official Python client (GitHub)](https://github.com/polygon-io/client-python)
 - [Official JVM client (GitHub)](https://github.com/polygon-io/client-jvm)
 - [Market Data APIs Compared 2026 — AI Fin Hub](https://aifinhub.io/articles/market-data-apis-compared-2026/)
-
-I now have comprehensive information to compile the final markdown block.
-
 ### Databento US Equities (incl. US Equities Mini)
 
 - **What it is:** Institutional-grade, normalized market data platform delivering real-time and historical US equities (and futures/options) data via a single unified API, sourced from colocated direct/proprietary feeds with nanosecond timestamps.
@@ -318,9 +312,6 @@ I now have comprehensive information to compile the final markdown block.
 - **Licensing / redistribution notes:** Non-professional + non-redistributing → instant attestation, no exchange ILA needed. Professional use or any redistribution → Databento brokers the exchange license/ILA (some historical redistribution requires a license). US Equities Mini is **derived data** with no exchange license fees and instant approval, but is contractually restricted: it **cannot be reverse-engineered to the original feeds** and is **not a substitute for the original prop feeds**. No explicit published ML/AI-training grant — derived/internal use is the safe default; confirm AI-training/model-distribution rights directly with Databento before training on or redistributing derived outputs.
 
 - **Role in OUR stack:** Primary high-fidelity ingestion layer for a stock analysis + prediction API. Use **US Equities Mini** (BBO + trades) as the cost-effective real-time/intraday top-of-book feed and **US Equities Summary** for EOD bars; pull **OHLCV** and **tick/MBP-10** history via the Historical batch/timeseries API to build training datasets and backtests. Use the **Reference API** (`corporate_actions` + `adjustment_factors` + `security_master`) to back-adjust prices, normalize symbology, and keep a clean instrument universe. Code once against the unified schemas so the same pipeline serves backtest (historical replay) and live inference; engineer technical indicators/features in-house since Databento ships raw normalized data, not derived signals. Mind redistribution limits — if the prediction API exposes raw quotes/prices downstream, secure the appropriate ILA/redistribution license first.
-
-I now have comprehensive, verified information across pricing, endpoints, coverage, auth, rate limits, licensing, and SDKs. Here is the deliverable.
-
 ### Financial Modeling Prep (FMP) API
 
 - **What it is**: A REST + WebSocket financial data API providing real-time/historical market prices and deep company fundamentals across global asset classes, aimed at developers, fintechs, and quant/ML workflows.
@@ -360,9 +351,6 @@ I now have comprehensive, verified information across pricing, endpoints, covera
 - **Role in OUR stack**: Primary fundamentals + historical-price backbone for a stock analysis & prediction API. Use Bulk/flat-file endpoints to ingest the full universe (profiles, daily prices, statements, ratios, estimates) into our feature store for model training; use intraday + WebSocket for live features and near-real-time scoring; pull earnings transcripts, analyst estimates, insider/13F/congressional ownership, and news sentiment as alpha-signal features; use DCF/ratios/key-metrics endpoints to power fundamental valuation outputs. Caveat: no options chains/greeks and no short-interest (supplement from an options-focused vendor if needed), and we'd need an Enterprise Data Display/redistribution + ML-training license before surfacing FMP-derived data or model outputs to external customers.
 
 Sources: [FMP Pricing](https://site.financialmodelingprep.com/developer/docs/pricing), [FMP Docs](https://site.financialmodelingprep.com/developer/docs), [Find My Moat FMP Review 2026](https://www.findmymoat.com/tools/financial-modeling-prep-fmp), [FMP Terms of Service](https://site.financialmodelingprep.com/terms-of-service), [FMP Bulk Endpoints](https://site.financialmodelingprep.com/developer/docs/bulk-endpoints), [fmpsdk](https://github.com/daxm/fmpsdk)
-
-I now have comprehensive, current (2026) information across all required dimensions. Here is the markdown block.
-
 ### Tiingo
 
 - **What it is**: A low-cost financial markets data API providing end-of-day and intraday prices, fundamentals, curated news, crypto, and FX, with proprietary error-corrected EOD data and 30+ years of history.
@@ -628,9 +616,6 @@ I have enough detail across all three. The Binance Spot REST default limit is we
 - **SDKs / official client libraries:** REST/WebSocket documented with examples; historically Python and JS/community wrappers; Postman/OpenAPI; no broad first-party multi-language SDK suite emphasized.
 - **Licensing / redistribution notes:** Commercial/redistribution terms negotiated per contract; regulated indices carry benchmark-licensing requirements; redistribution, display, and ML-training rights are explicitly licensed deal-by-deal (institutional licensing model).
 - **Role in OUR stack:** Premium/institutional augmentation — regulated benchmark reference rates, cross-venue tick history for high-fidelity backtesting, plus the only one of the three offering native news/sentiment signals to feed prediction features; reserved for production/commercial tiers given paid-only access post-2026.
-
-I now have comprehensive, current (2026) information on all three products. Producing the final markdown block.
-
 ### Forex Data APIs — OANDA v20 API · Twelve Data Forex · Polygon.io / Massive Forex
 
 - **OANDA v20 REST & Streaming API**
@@ -757,7 +742,7 @@ Sources:
 - [AI.FORECAST function — BigQuery](https://cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-ai-forecast)
 - [TimesFM in BigQuery and AlloyDB — Google Cloud Blog](https://cloud.google.com/blog/products/data-analytics/timesfm-models-in-bigquery-and-alloydb)
 
-I now have comprehensive, current (2026) data on all libraries. These are open-source modeling libraries (not commercial data APIs), so I've mapped the requested schema to fit: "Endpoints/capabilities" → model families/APIs; "Asset classes & coverage" → input data the library handles; "Pricing/Free tier" → open-source/free; "Auth/Rate limits" → N/A for self-hosted libraries. Here is the dense factual block.
+> These are open-source modeling libraries (not commercial data APIs), so the schema below is adapted: capabilities → model families/APIs; coverage → input data handled; pricing → open-source/free; auth/limits → N/A for self-hosted libraries.
 
 ### Modeling Libraries (Darts, sktime, statsmodels, pmdarima, XGBoost/LightGBM/CatBoost, PyTorch Forecasting, Prophet/NeuralProphet)
 
@@ -792,9 +777,6 @@ I now have comprehensive, current (2026) data on all libraries. These are open-s
 - **Licensing / redistribution notes**: Permissive — **Darts (Apache-2.0)**, **sktime (BSD-3)**, **statsmodels (BSD-3)**, **pmdarima (MIT)**, **XGBoost (Apache-2.0)**, **LightGBM (MIT)**, **CatBoost (Apache-2.0)**, **PyTorch Forecasting (MIT)**, **Prophet (MIT)**, **NeuralProphet (MIT)**. All allow unrestricted commercial/internal use, model-training, and embedding in a closed-source product; no redistribution restrictions on outputs and no ML-training-rights limits (data-licensing constraints come from the vendor feed, not these libraries). Note: foundation models bundled via Darts wrappers (Chronos, TimesFM, TiRex) carry their own model-weight licenses to check separately.
 
 - **Role in OUR stack**: These are the prediction engine of the analysis+forecast API. Pipeline: ingest OHLCV/fundamentals/news features from data vendors → feature engineering → model layer. Use **statsmodels + pmdarima** for transparent statistical baselines (ARIMA/SARIMAX/GARCH-style diagnostics, stationarity tests, explainable benchmarks); **XGBoost/LightGBM/CatBoost** as the workhorse for tabular, feature-rich next-bar/return and directional-classification models (fast, strong, SHAP-explainable); **Darts** as the orchestration layer giving one API to compare classical, ML, and deep models plus backtesting, conformal prediction intervals, and zero-shot foundation models; **sktime** for pipeline composition, reduction, hierarchical (sector/portfolio) forecasting and rigorous CV/benchmarking; **PyTorch Forecasting** (TFT/N-BEATS/N-HiTS/DeepAR) for high-capacity multi-horizon, multi-asset probabilistic forecasts with covariates; **Prophet/NeuralProphet** for fast interpretable trend/seasonality/holiday decomposition surfaced to end users. Outputs (point + probabilistic forecasts, intervals, feature attributions) are served behind our REST API; all run free in-process, so cost and rate limits are pure compute.
-
-I now have comprehensive, verified data. Compiling the final markdown block.
-
 ### Serving, Data & Infrastructure Tooling
 
 #### API & Web Layer
@@ -812,21 +794,21 @@ I now have comprehensive, verified data. Compiling the final markdown block.
 - **Redis** — in-memory key-value store used for caching, messaging, and counters. · **Role in our stack:** caches hot quotes/indicator results, serves as the Celery broker/result backend, and holds slowapi rate-limit counters. · **Key features:** sub-millisecond reads with TTL expiry, pub/sub and list/stream primitives for queues, atomic `INCR`/`INCRBY` for limiters, optional persistence (RDB/AOF) and Lua scripting.
 
 #### Ingestion & Orchestration
-- **Prefect (recommended)** — modern Python-native dataflow orchestrator. · **Role in our stack:** primary scheduler for market-data ingestion, feature recomputation, and model-training/backtest DAGs. · **Key features:** `@flow`/`@task` decorators with automatic retries and caching, dynamic/parameterized runs, observability UI with run history and logs, scheduling without a separate DSL. **When to choose:** complex dependency graphs, data lineage/observability needs, and pipelines that evolve frequently.
-- **Celery + beat** — distributed task queue with a periodic scheduler. · **Role in our stack:** alternative/complementary engine for high-throughput fan-out work (e.g. per-symbol prediction jobs) using Redis as broker. · **Key features:** horizontal worker scaling, `beat` cron-style periodic tasks, retries/acks-late and task routing/priorities. **When to choose:** you already run a worker fleet and need raw task throughput and fine-grained queue control rather than DAG semantics.
-- **APScheduler** — lightweight in-process job scheduler. · **Role in our stack:** the minimal option for a single-node deployment or MVP that just needs a few cron/interval jobs without extra infrastructure. · **Key features:** cron/interval/date triggers, persistent job stores (SQLAlchemy/Redis), runs embedded in the API process, no broker required.
+- **Celery + Beat (committed)** — distributed task queue with a periodic scheduler. · **Role in our stack:** the single, committed orchestration system (see §4). Celery Beat runs scheduled ingestion (EOD fundamentals, intraday bar polling, news sweeps) while Celery workers run async jobs, heavy feature computation, backtests, and per-symbol prediction fan-out — all over the Redis broker already in the stack. · **Key features:** horizontal worker scaling, `beat` cron-style periodic tasks, retries/acks-late, rate-limit-aware backoff, idempotent upserts, and task routing/priorities. **Why over Prefect:** Celery already has to exist for off-request-thread compute, so we run one scheduler, not two.
+- **Prefect (deferred migration target — NOT adopted day one)** — modern Python-native dataflow orchestrator. · **Role in our stack:** the migration target *if and only if* DAG-style data lineage, complex multi-stage backfills, or a richer observability UI become a real requirement; we do not pay for a second scheduler on day one. · **Key features:** `@flow`/`@task` decorators with retries/caching, dynamic/parameterized runs, observability UI with run history and logs. **When to revisit:** cross-dataset dependency graphs and lineage/observability needs Celery + Beat cannot express cleanly.
+- **APScheduler (not used)** — lightweight in-process job scheduler. · **Role in our stack:** not adopted; noted only as the minimal single-node alternative — Celery Beat already covers scheduled jobs without adding a second system. · **Key features:** cron/interval/date triggers, persistent job stores, embedded in-process scheduling, no broker required.
 
 #### ML Lifecycle & Serving
 - **MLflow** — open-source platform for experiment tracking and model management. · **Role in our stack:** logs every training run (params/metrics/artifacts) and governs promoted forecasting models in the registry. · **Key features:** experiment tracking with autologging, model registry with versioning and aliases (e.g. `@champion`/`@challenger`), full run-to-model lineage for reproducibility, `mlflow.search_logged_models()` and pluggable artifact/backing stores.
-- **Feast** — open-source feature store for ML. · **Role in our stack:** defines and serves engineered indicators/features consistently for both training and low-latency online prediction. · **Key features:** offline store (e.g. Postgres/TimescaleDB) for historical training data, online store (e.g. Redis) for real-time serving, point-in-time-correct joins that prevent label leakage, declarative feature views and registry.
-- **BentoML** — framework for packaging and serving ML models as production services. · **Role in our stack:** wraps trained predictors into versioned, containerizable inference services callable from FastAPI or deployed standalone. · **Key features:** "Bento" artifact packaging with dependencies, adaptive request batching, multi-framework runners, auto-generated OpenAPI service and OCI image builds.
+- **Feast (optional — adopt only when online/offline feature skew becomes a real pain)** — open-source feature store for ML. · **Role in our stack:** deferred per §4; when adopted, defines and serves engineered indicators/features consistently for both training and low-latency online prediction. · **Key features:** offline store (e.g. Postgres/TimescaleDB) for historical training data, online store (e.g. Redis) for real-time serving, point-in-time-correct joins that prevent label leakage, declarative feature views and registry.
+- **BentoML (optional escape hatch — for scaled/GPU serving separate from the API tier)** — framework for packaging and serving ML models as production services. · **Role in our stack:** deferred per §4; the escape hatch when models need independent scaling, adaptive batching, or GPU-backed servers — wraps trained predictors into versioned, containerizable inference services callable from FastAPI or deployed standalone. · **Key features:** "Bento" artifact packaging with dependencies, adaptive request batching, multi-framework runners, auto-generated OpenAPI service and OCI image builds.
 - **ONNX Runtime (optional)** — cross-platform, optimized inference engine for ONNX-format models. · **Role in our stack:** optional path to export trained models to ONNX for faster, framework-agnostic, lower-latency CPU/GPU inference. · **Key features:** graph optimizations and operator fusion, execution providers (CPU/CUDA/TensorRT), quantization for smaller/faster models, portable single-format deployment.
 
 #### Indicators & Backtesting
 - **pandas-ta** — pure-Python technical-analysis library built on pandas. · **Role in our stack:** default engine for computing 130+ indicators (RSI, MACD, Bollinger Bands, ATR) over OHLCV DataFrames in the feature pipeline. · **Key features:** DataFrame `.ta` accessor, large indicator set, candlestick patterns, easy vectorized integration with pandas/numpy.
 - **TA-Lib** — C-backed technical-analysis library with Python bindings. · **Role in our stack:** high-performance/precise indicator computation where speed or industry-standard formulas matter (requires the native C library). · **Key features:** ~150 functions, fast C implementations, well-established reference definitions, abstract API for batch indicator calls.
-- **vectorbt** — vectorized backtesting and quantitative-analysis framework. · **Role in our stack:** rapid, large-scale strategy/parameter-sweep backtesting and signal evaluation across many symbols. · **Key features:** numpy/Numba-accelerated simulations, hyperparameter grid backtests, rich portfolio metrics and plotting, signal-based entry/exit modeling.
-- **backtrader** — event-driven backtesting and trading framework. · **Role in our stack:** realistic, order-level validation of strategies (sizing, commissions, slippage) before model/strategy promotion. · **Key features:** event-driven engine, broker/commission/slippage simulation, built-in indicators and analyzers, live-trading broker hooks. **Bias-free discipline:** all backtests use point-in-time data and walk-forward/out-of-sample splits with no look-ahead — features and labels are computed only from information available at each bar to avoid look-ahead and survivorship bias.
+- **vectorbt (committed)** — vectorized backtesting and quantitative-analysis framework. · **Role in our stack:** the committed backtesting engine (§4) — rapid, large-scale strategy/parameter-sweep backtesting and signal evaluation across many symbols, run as Celery jobs with results logged to MLflow. · **Key features:** numpy/Numba-accelerated simulations, hyperparameter grid backtests, rich portfolio metrics and plotting, signal-based entry/exit modeling. **Bias-free discipline:** all backtests use strictly point-in-time data and walk-forward/purged out-of-sample splits with realistic costs and slippage — features and labels are computed only from information available at each bar, to avoid look-ahead and survivorship bias.
+- **backtrader (not adopted)** — event-driven backtesting and trading framework. · **Role in our stack:** *not part of the committed stack* — §4 commits vectorbt only. Kept as a reference for event-driven, order-level fill simulation should vectorbt's vectorized model prove insufficient. · **Key features:** event-driven engine, broker/commission/slippage simulation, built-in indicators and analyzers, live-trading broker hooks.
 
 #### Containerization, CI/CD & Observability
 - **Docker + docker-compose** — container runtime and multi-service local orchestration. · **Role in our stack:** packages the API, workers, and ML services into reproducible images and wires up Postgres/TimescaleDB, Redis, and the app for local/dev environments. · **Key features:** multi-stage builds for slim images, `compose` service graph with networks/volumes, health checks and dependency ordering, env-driven configuration.
@@ -934,6 +916,57 @@ API endpoints we'll expose (sequenced by phase):
 - `GET /v1/models` — model registry: versions, metrics, champion/challenger *(P4/P5)*
 - `GET /metrics` — operational metrics (Prometheus) *(P0/P5)*
 - `WS /v1/stream` (+ `POST /v1/alerts`, webhooks) — streaming prices/signals & alerts *(P6)*
+
+---
+
+### 6.1 Candidate enhancements — 2026-07-06 analysis & brainstorm (backlog, not yet committed)
+
+A mid-2026 competitive scan (2026-07-06; re-verify periodically) **did not find a direct developer API** that combines a REST/WebSocket product with calibrated probabilistic forecasts and a live, independently verifiable calibration record. The incumbents scanned lean on self-reported backtests instead — and several are adjacent rather than direct comparators (Nixtla TimeGPT is bring-your-own-data forecasting infrastructure; Numerai Signals *buys* signals rather than selling a forecast API; Danelfin/FinBrain/Kavout are the nearest products but ship scores/intervals without published coverage reports). The product's differentiating wedge is therefore **"honest, verifiable uncertainty."** The items below are sequenced candidates to *promote* into the committed P0–P6 deliverables above; they are not themselves commitments. Effort: **S** = days · **M** = 1–2 wk · **L** = ~1 mo · **XL** = multi-month.
+
+**Cross-cutting doctrine gates (decide before the phase they block):**
+- **Model-weight licensing:** confirm Chronos-2 (and any foundation-model) weights permit commercial serving *and* fine-tuning before building on them — the not-to-do list forbids research-only weights in a paid product. *Gate before P4.*
+- **Vendor Enterprise / ML-training licenses:** assign an owner + timeline to secure redistribution/ML-training rights from Polygon/FMP/Finnhub before any customer-facing launch. *Gate before P3 launch.*
+- **Monetization design:** pricing tiers and quota semantics constrain the P0 rate-limit middleware and the API-key model — decide the tiering shape early even if billing itself ships in P6.
+
+**P0 — Foundations**
+- `Idempotency-Key` on `POST /v1/forecast` and `/v1/backtest` (doctrine-mandated, currently unscheduled) — *S*. *(contract header already stubbed 2026-07-06.)*
+- Decide the API-key CRUD + self-serve key issuance + `GET /v1/usage` schema now to avoid rework — *M*.
+
+**P1 — Ingestion**
+- Vendor cost-guard middleware (per-vendor Redis token buckets; 80% → cache-only + alert, 100% → serve last-known-good with honest freshness headers) — *S*.
+- Synthetic canary symbols (closed-form truth flowing through ingest → adjust → features → forecast, filtered at the API boundary) — *S*.
+- Chaos/gap replay harness (record vendor cassettes now while cheap; replay mutated ones — missing days, late corporate actions, 429 storms) — *M*.
+- Snapshot-pinning schema (`as_of`, `snapshot_id`) must land here so forecasts can reference an immutable snapshot — *L*.
+- `/v1/data-quality/{symbol}` cross-vendor consensus + adjustment-factor ledger (expose mandatory hygiene as product) — *M*.
+- Cross-sectional rank features via Timescale continuous aggregates (licensing-safe edge single-series models structurally lack) — *M*.
+
+**P2 — Analysis**
+- `GET /v1/universe?as_of=` survivorship-bias-free membership + `/changes` diff (Sharadar). *Gated* on written Nasdaq Data Link redistribution confirmation; the tradable/delisting half is safe, index-membership is at-risk — *M*.
+
+**P3 — Baseline forecasting**
+- Conformal calibration layer (CQR + Adaptive Conformal Inference) wrapping *every* model incl. the baselines — *M*. **← highest-value: manufactures the calibration wedge — a distribution-free coverage *target* under documented calibration assumptions (exchangeability is fragile on financial series across regime shifts, so pair with regime-conditional/adaptive variants and empirical validation).**
+- Forecast provenance block in the `/v1/forecast` contract — **DONE** (contract locked + hardened 2026-07-06).
+- Tamper-evident forecast hash archive from day one (SHA-256 every forecast + daily Merkle root + full symbol/model/horizon manifest, before outcomes are known) — *S*.
+- Historical forecast+outcome archive as a sellable research dataset — *S*.
+
+**P4 — ML & backtesting**
+- Regime stack: `/v1/regimes` (HMM/BOCPD) + regime-conditional (Mondrian) conformal + machine-readable `interval_drivers` (why an interval is wide) — *L*. *(watch rare-regime finite-sample coverage.)*
+- Model arbitration: `model=auto` FFORMA-style router + Vincentized quantile ensemble, with naive kept in the pool so unbeatable symbols get the honest naive forecast — *M*.
+- Event-calendar features (days-to-earnings, FOMC/CPI proximity) as known-future covariates and interval drivers — *S*.
+- Quantized Chronos-2 nightly batch precompute with baseline fallback + CPU fencing (makes foundation-model forecasts viable on one VPS) — *M*.
+
+**P5 — Productionization**
+- Public calibration scoreboard: `/v1/calibration` + model-health page ("Proof, not promises"), backed by the day-one hash archive — *M*. **← the marketing wedge; uncopyable without 12 months of honest history. Design display rules (min window, confidence bands) up front.**
+- Live-ops credibility loop: versioned MLflow promotion gates + shadow champion/challenger + two-speed drift recalibration (nightly ACI + drift-triggered retrain). Note: ACI recalibration must version into the ETag/model identity or the "identical bytes" determinism promise breaks — *L*.
+
+**P6 — Distribution & expansion**
+- Official MCP server + auto-generated typed SDKs (MCP is table stakes for 2026 finance APIs; nobody serves *calibrated* forecasts over it) — *M*.
+- Snapshot-pinned free sandbox (25 symbols, deterministic) as zero-friction top-of-funnel — *M*.
+- Alpaca paper-trading forward-validation ledger `/v1/track-record` (strict model-validation framing, in-payload disclaimers, legal review of page copy) — *M*.
+- Backtest-as-a-service (`POST /v1/backtest`, constrained strategy DSL, doctrine-enforced costs/embargo/survivorship defaults) — *L*. *(singular `/v1/backtest` to match the committed API list; standardize on RESTful job-collection semantics only if that endpoint is ever restructured.)*
+- Fintech B2B layer: portfolio distribution aggregation (correlation-aware) + white-label fan-chart embed with non-removable disclaimer — *L*.
+- Chronos-2 LoRA fine-tuning with a zero-shot-vs-tuned promotion gate (spot GPU, never idle) — *XL*.
+- BIST / Borsa Istanbul as a defensible wedge market (native-language moat; start vendor licensing due-diligence early) — *XL*.
 
 ---
 

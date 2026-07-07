@@ -1,9 +1,18 @@
-# CI/CD templates (PLACEHOLDER)
+# CI/CD
 
-These `*.yml.example` files are GitHub Actions placeholders. They live here instead of
-`.github/workflows/` because the token used for the initial push lacked the `workflow`
-OAuth scope (GitHub blocks pushing workflow files without it).
+The real workflows now live in [`.github/workflows/`](../../.github/workflows/):
 
-**To activate:** re-authenticate with `gh auth refresh -s workflow` (or use a PAT that
-has the `workflow` scope), then move each file into `.github/workflows/` with its real
-name (drop the `.example` suffix) and implement the steps.
+- **`ci.yml`** — lint (ruff), format check, type-check (mypy), and tests (pytest) on push/PR.
+- **`cd.yml`** — build and push the Docker image to GHCR on a published release.
+
+## Pushing workflow files
+
+GitHub blocks pushing files under `.github/workflows/` unless the credential has the
+`workflow` OAuth scope. If a push is rejected for this reason, refresh your auth:
+
+```bash
+gh auth refresh -s workflow
+# or use a Personal Access Token that includes the `workflow` scope
+```
+
+The previous `*.yml.example` placeholders have been promoted and removed.

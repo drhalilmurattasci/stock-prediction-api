@@ -2,7 +2,7 @@
 
 > Start-to-finish installation guide for the stack defined in [STOCK_API_MASTER_PLAN.md](STOCK_API_MASTER_PLAN.md).
 > **Target machine:** Windows 11 Pro (build 26200), PowerShell. **Detected 2026-06-23.**
-> Infra (TimescaleDB, Redis, Prefect, MLflow) runs in **Docker containers**; dev tooling (Git, Python, uv) installs **natively**.
+> Infra (TimescaleDB, Redis, MLflow) runs in **Docker containers**; dev tooling (Git, Python, uv) and the Celery worker/beat install **natively**.
 
 ---
 
@@ -17,7 +17,7 @@
 | Containers | **Docker Desktop** + WSL2 | winget + GUI | native host |
 | Database | **TimescaleDB** (PostgreSQL 17) | Docker image | container |
 | Cache/broker | **Redis 7** | Docker image | container |
-| Orchestration | **Prefect 3** | Docker image | container |
+| Orchestration | **Celery + Beat** (Redis broker) | uv pip | native process |
 | ML tracking | **MLflow** | Docker image | container |
 | API + ML libs | FastAPI, Pydantic, SQLAlchemy, pandas, torch, XGBoost, Darts, Chronos, vectorbt, … | uv pip | native venv |
 
@@ -138,6 +138,7 @@ dependencies = [
   "pydantic>=2.9",
   "pydantic-settings>=2.6",
   "httpx>=0.28",
+  "tenacity>=9.0",
   "slowapi>=0.1.9",
   "python-jose[cryptography]>=3.3",
   "passlib[bcrypt]>=1.7",
@@ -148,14 +149,15 @@ dependencies = [
   "asyncpg>=0.30",
   "alembic>=1.14",
   "redis>=5.2",
+  # --- orchestration (task queue + scheduler) ---
+  "celery[redis]>=5.4",
   # --- analytics core ---
   "pandas>=2.2",
   "numpy>=1.26",
   "pandas-ta>=0.3.14b",
   "scikit-learn>=1.5",
   "statsmodels>=0.14",
-  # --- orchestration / tracking clients ---
-  "prefect>=3.1",
+  # --- tracking client ---
   "mlflow>=2.19",
   # --- observability ---
   "prometheus-client>=0.21",
@@ -178,7 +180,6 @@ ml = [
   "chronos-forecasting>=1.5",
   "pmdarima>=2.0",
   "vectorbt>=0.27",
-  "backtrader>=1.9",
 ]
 dev = [
   "pytest>=8.3",
@@ -190,6 +191,45 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "data_sources", "ingestion", "ml", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "C4", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI uses callables in argument defaults by design (Depends/Header/...).
+extend-immutable-calls = [
+  "fastapi.Depends",
+  "fastapi.Header",
+  "fastapi.Query",
+  "fastapi.Path",
+  "fastapi.Body",
+  "fastapi.Security",
+  "fastapi.Cookie",
+  "fastapi.Form",
+  "fastapi.File",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "data_sources", "ingestion", "ml", "tests"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+check_untyped_defs = true
+files = ["app", "data_sources", "ingestion", "ml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
 ```
 
 ### 5.2 `.env.example`
@@ -201,13 +241,23 @@ Create **`A:\tansel\.env.example`** (copy to `.env` and fill in real keys — ne
 POSTGRES_USER=stockapi
 POSTGRES_PASSWORD=change_me_strong
 POSTGRES_DB=stockapi
-DATABASE_URL=postgresql+psycopg://stockapi:change_me_strong@localhost:5432/stockapi
+# Async driver (asyncpg) — the app uses full async I/O end to end.
+# Alembic derives a sync (psycopg) URL from this automatically.
+DATABASE_URL=postgresql+asyncpg://stockapi:change_me_strong@localhost:5432/stockapi
 
-# ---- Redis ----
+# ---- Redis (cache) ----
 REDIS_URL=redis://localhost:6379/0
 
+# ---- Celery (task queue + Beat scheduler) ----
+CELERY_BROKER_URL=redis://localhost:6379/1
+CELERY_RESULT_BACKEND=redis://localhost:6379/2
+
+# ---- Rate limiting ----
+# memory:// is fine for a single worker in dev; use redis://localhost:6379/3 so
+# limits are shared across workers in production.
+RATE_LIMIT_STORAGE_URI=memory://
+
 # ---- Services ----
-PREFECT_API_URL=http://localhost:4200/api
 MLFLOW_TRACKING_URI=http://localhost:5000
 
 # ---- Vendor API keys (fill these in) ----
@@ -215,11 +265,20 @@ POLYGON_API_KEY=
 FMP_API_KEY=
 FINNHUB_API_KEY=
 NASDAQ_DATA_LINK_API_KEY=
+# Optional / expansion sources:
+# ALPACA_API_KEY=
+# ALPACA_API_SECRET=
+# DATABENTO_API_KEY=
 
 # ---- App ----
 APP_ENV=local
-JWT_SECRET=change_me_random_64_chars
 LOG_LEVEL=INFO
+JWT_SECRET=change_me_random_64_chars
+# Comma-separated API keys accepted by the API. Empty = allow anonymous (dev only).
+API_KEYS=
+
+# ---- Observability ----
+SENTRY_DSN=
 ```
 
 ### 5.3 `.gitignore`
@@ -233,9 +292,7 @@ __pycache__/
 .env
 .mlflow/
 mlruns/
-data/pgdata/
-data/redis/
-.prefect/
+data/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -281,21 +338,12 @@ services:
       timeout: 5s
       retries: 5
 
-  prefect:
-    image: prefecthq/prefect:3-latest
-    container_name: stockapi-prefect
-    command: prefect server start --host 0.0.0.0
-    environment:
-      PREFECT_SERVER_API_HOST: 0.0.0.0
-    ports:
-      - "4200:4200"
-    volumes:
-      - ./data/prefect:/root/.prefect
-
   mlflow:
     image: python:3.12-slim
     container_name: stockapi-mlflow
     working_dir: /mlflow
+    # Local-dev deviation: sqlite backend + local artifact dir. Production uses a
+    # Postgres backend + S3-compatible artifact store (MinIO) per the master plan.
     command: >
       bash -c "pip install --no-cache-dir mlflow>=2.19 &&
                mlflow server --host 0.0.0.0 --port 5000
@@ -305,6 +353,11 @@ services:
       - "5000:5000"
     volumes:
       - ./data/mlflow:/mlflow
+
+  # The app tier (api / worker / beat) lives under the `app` compose profile so
+  # `docker compose up` stays infra-only. Start the full stack with:
+  #   docker compose --profile app up -d --build   (requires a committed uv.lock)
+  # See docker-compose.yml in the repo for the api/worker/beat service definitions.
 ```
 
 ### 5.5 TimescaleDB init script
@@ -333,23 +386,21 @@ From **`A:\tansel`**:
 # Create the .env from the template, then edit it with your real keys
 Copy-Item .env.example .env
 
-# Create a 3.12 venv managed by uv
-uv venv --python 3.12
+# Resolve + lock dependencies (writes uv.lock), then install core + dev into .venv
+uv lock
+uv sync --extra dev
 
-# Activate it (PowerShell)
+# Add the heavy ML stack (torch, darts, chronos, etc.) — takes longer
+uv sync --extra dev --extra ml
+
+# Activate the uv-managed venv (PowerShell)
 .\.venv\Scripts\Activate.ps1
-
-# Install core + dev deps (fast)
-uv pip install -e ".[dev]"
-
-# Install the heavy ML stack (torch, darts, chronos, etc.) — takes longer
-uv pip install -e ".[ml]"
 ```
 
 **Verify the environment:**
 ```powershell
 python --version                       # Python 3.12.x
-python -c "import fastapi, pandas, sqlalchemy, redis, prefect, mlflow; print('core OK')"
+python -c "import fastapi, pandas, sqlalchemy, redis, celery, mlflow; print('core OK')"
 python -c "import torch, xgboost, darts, statsforecast; print('ml OK')"
 ```
 
@@ -367,7 +418,7 @@ docker compose up -d
 docker compose ps           # all services should be "running"/"healthy"
 ```
 
-First run pulls images (TimescaleDB, Redis, Prefect) and the MLflow container pip-installs MLflow on boot (~1–2 min the first time).
+First run pulls images (TimescaleDB, Redis) and the MLflow container pip-installs MLflow on boot (~1–2 min the first time).
 
 **Watch logs if needed:**
 ```powershell
@@ -385,30 +436,35 @@ docker compose logs -f mlflow
 | TimescaleDB up | `docker exec stockapi-timescaledb pg_isready -U stockapi` | `accepting connections` |
 | Timescale ext | `docker exec stockapi-timescaledb psql -U stockapi -d stockapi -c "SELECT extversion FROM pg_extension WHERE extname='timescaledb';"` | a version row |
 | Redis | `docker exec stockapi-redis redis-cli ping` | `PONG` |
-| Prefect UI | open `http://localhost:4200` | Prefect dashboard |
 | MLflow UI | open `http://localhost:5000` | MLflow dashboard |
+| Celery worker | `celery -A ingestion.celery_app.celery_app inspect ping` (after starting a worker) | `pong` from one node |
 | DB from Python | see snippet below | `db OK` |
 
 ```powershell
-python -c "import os,sqlalchemy as sa; from dotenv import load_dotenv; load_dotenv(); e=sa.create_engine(os.environ['DATABASE_URL']); c=e.connect(); print('db OK', c.execute(sa.text('select 1')).scalar())"
+python -c "import os,sqlalchemy as sa; from dotenv import load_dotenv; load_dotenv(); url=os.environ['DATABASE_URL'].replace('+asyncpg','+psycopg'); e=sa.create_engine(url); c=e.connect(); print('db OK', c.execute(sa.text('select 1')).scalar())"
 ```
 
 ✅ When all rows pass, the platform is fully installed and running.
 
 ---
 
-## 9. Step 8 — Run the API (after the app skeleton exists)
+## 9. Step 8 — Run the API and workers
 
-Once the FastAPI app is scaffolded (e.g. `app/main.py` with the `/v1/...` endpoints from the master plan roadmap):
+The FastAPI app spine is present (Phase 0). Apply migrations, then run the API and,
+in separate terminals, the Celery worker and Beat scheduler:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
+alembic upgrade head                 # create the timescaledb extension baseline
 uvicorn app.main:app --reload --port 8000
 # Swagger docs: http://localhost:8000/docs
-# Health:       http://localhost:8000/healthz
-```
+# Liveness:     http://localhost:8000/healthz
+# Readiness:    http://localhost:8000/readyz    (checks DB + Redis)
 
-> The repo skeleton is a separate scaffolding step. This INSTALL.md gets the **environment + infra** fully ready; ask to generate the app skeleton next.
+# In separate terminals (optional until Phase 1 ingestion tasks do real work):
+celery -A ingestion.celery_app.celery_app worker --loglevel=INFO
+celery -A ingestion.celery_app.celery_app beat   --loglevel=INFO
+```
 
 ---
 
@@ -418,7 +474,8 @@ uvicorn app.main:app --reload --port 8000
 # Start a work session
 docker compose up -d                 # infra
 .\.venv\Scripts\Activate.ps1         # python env
-uvicorn app.main:app --reload        # api (once it exists)
+uvicorn app.main:app --reload        # api
+# (optional) celery -A ingestion.celery_app.celery_app worker --loglevel=INFO
 
 # Stop
 docker compose stop                  # stop containers, keep data
@@ -435,7 +492,7 @@ deactivate                           # leave the venv
 | Docker Desktop won’t start / “WSL 2 not installed” | Re-run `wsl --install`, **reboot**, ensure Virtualization is **Enabled in BIOS/UEFI** (Intel VT-x / AMD-V). |
 | Virtualization disabled | Reboot → BIOS/UEFI → enable **Intel VT-x / SVM Mode** → save & exit. |
 | `docker` not recognized after install | Open a **new** terminal (PATH refresh) or sign out/in. |
-| Port already in use (5432/6379/4200/5000) | Find owner: `Get-NetTCPConnection -LocalPort 5432 \| Select OwningProcess` then `Get-Process -Id <pid>`; stop it or change the host port in `docker-compose.yml`. |
+| Port already in use (5432/6379/5000/8000) | Find owner: `Get-NetTCPConnection -LocalPort 5432 \| Select OwningProcess` then `Get-Process -Id <pid>`; stop it or change the host port in `docker-compose.yml`. |
 | `Activate.ps1` blocked | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. |
 | TimescaleDB extension missing | Confirm `scripts/db-init/01-extensions.sql` mounted; it only runs on a **fresh** volume — `docker compose down -v` then `up` to re-init (destroys local data). |
 | MLflow container slow first boot | Expected — it pip-installs MLflow on start. Subsequent boots reuse the layer cache. |
@@ -490,7 +547,7 @@ winget install -e --id Microsoft.VisualStudioCode --accept-source-agreements --a
 
 ## Appendix D — Version-pinning policy
 
-Image tags (`latest-pg17`, `3-latest`) and `>=` ranges favor a smooth first install. **Before production**, pin every image to an exact digest/tag and freeze Python deps with `uv pip freeze > requirements.lock`. Verify current versions at each vendor’s site — they change frequently.
+Image tags (`latest-pg17`) and `>=` ranges favor a smooth first install. **Before production**, pin every image to an exact digest/tag and commit a `uv.lock` (`uv lock`) for reproducible builds. Verify current versions at each vendor’s site — they change frequently.
 
 ---
 
@@ -501,7 +558,7 @@ Image tags (`latest-pg17`, `3-latest`) and `>=` ranges favor a smooth first inst
 - [ ] uv installed (`uv --version`)
 - [ ] Python 3.12 available to uv (`uv python list`)
 - [ ] Project files created (`pyproject.toml`, `.env`, `docker-compose.yml`, init SQL)
-- [ ] `.venv` created, `[dev]` + `[ml]` installed (import checks pass)
+- [ ] `uv sync --extra dev` (+ `--extra ml`) installed, import checks pass
 - [ ] `docker compose up -d` → all services healthy
-- [ ] Smoke-test matrix all green (DB, Redis, Prefect, MLflow)
-- [ ] (later) App skeleton scaffolded → `uvicorn` serves `/docs`
+- [ ] Smoke-test matrix all green (DB, Redis, MLflow)
+- [ ] `alembic upgrade head` → `uvicorn` serves `/docs`, `/healthz` returns 200

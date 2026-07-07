@@ -1,5 +1,20 @@
-"""Aggregates all v1 routers under /v1.
+"""Aggregates all versioned routers under the ``/v1`` prefix."""
 
-Placeholder scaffold — NO logic yet. TODO: implement.
-Design reference: STOCK_API_MASTER_PLAN.md
-"""
+from __future__ import annotations
+
+from fastapi import APIRouter
+
+from app.api.v1 import (
+    backtest,
+    forecast,
+    fundamentals,
+    indicators,
+    news,
+    prices,
+    signals,
+)
+
+api_router = APIRouter()
+
+for module in (prices, fundamentals, indicators, news, forecast, backtest, signals):
+    api_router.include_router(module.router)

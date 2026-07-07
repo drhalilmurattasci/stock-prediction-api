@@ -1,10 +1,64 @@
-# Makefile — developer shortcuts (PLACEHOLDER, no recipes yet)
-# TODO: implement targets. Intended:
-#   make install   # uv pip install -e ".[dev,ml]"
-#   make up        # docker compose up -d
-#   make down      # docker compose down
-#   make api       # uvicorn app.main:app --reload
-#   make test      # pytest
-#   make lint      # ruff check .
-#   make fmt       # ruff format .
-#   make migrate   # alembic upgrade head
+.PHONY: help install install-ml lock up up-app down logs api worker beat lint fmt type test migrate revision
+
+help:
+	@echo "Targets:"
+	@echo "  install     uv sync (core + dev)"
+	@echo "  install-ml  uv sync (core + dev + ml)"
+	@echo "  lock        uv lock (generate uv.lock)"
+	@echo "  up          docker compose up -d (infra: timescaledb, redis, mlflow)"
+	@echo "  up-app      docker compose --profile app up -d --build (full stack; needs uv.lock)"
+	@echo "  down        docker compose down"
+	@echo "  api         run the API with reload"
+	@echo "  worker      run the Celery worker"
+	@echo "  beat        run the Celery Beat scheduler"
+	@echo "  lint/fmt/type/test   ruff / ruff format / mypy / pytest"
+	@echo "  migrate     alembic upgrade head"
+	@echo "  revision    alembic revision --autogenerate m=\"message\""
+
+install:
+	uv sync --extra dev
+
+install-ml:
+	uv sync --extra dev --extra ml
+
+lock:
+	uv lock
+
+up:
+	docker compose up -d
+
+up-app:
+	docker compose --profile app up -d --build
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f
+
+api:
+	uvicorn app.main:app --reload
+
+worker:
+	celery -A ingestion.celery_app.celery_app worker --loglevel=INFO
+
+beat:
+	celery -A ingestion.celery_app.celery_app beat --loglevel=INFO
+
+lint:
+	uv run ruff check .
+
+fmt:
+	uv run ruff format .
+
+type:
+	uv run mypy
+
+test:
+	uv run pytest
+
+migrate:
+	uv run alembic upgrade head
+
+revision:
+	uv run alembic revision --autogenerate -m "$(m)"

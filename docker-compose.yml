@@ -1,5 +1,10 @@
 name: stock-api
 
+# Default `docker compose up` starts backing infra only (matches the native-dev
+# flow in INSTALL.md). The app tier (api/worker/beat) is under the `app` profile;
+# start the full stack with `docker compose --profile app up -d --build`
+# (requires a committed uv.lock — run `uv lock` first).
+
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg17
@@ -33,21 +38,12 @@ services:
       timeout: 5s
       retries: 5
 
-  prefect:
-    image: prefecthq/prefect:3-latest
-    container_name: stockapi-prefect
-    command: prefect server start --host 0.0.0.0
-    environment:
-      PREFECT_SERVER_API_HOST: 0.0.0.0
-    ports:
-      - "4200:4200"
-    volumes:
-      - ./data/prefect:/root/.prefect
-
   mlflow:
     image: python:3.12-slim
     container_name: stockapi-mlflow
     working_dir: /mlflow
+    # Local-dev deviation: sqlite backend + local artifact dir. Production uses a
+    # Postgres backend + S3-compatible artifact store (MinIO) per the master plan.
     command: >
       bash -c "pip install --no-cache-dir mlflow>=2.19 &&
                mlflow server --host 0.0.0.0 --port 5000
@@ -57,3 +53,53 @@ services:
       - "5000:5000"
     volumes:
       - ./data/mlflow:/mlflow
+
+  api:
+    profiles: ["app"]
+    build: .
+    container_name: stockapi-api
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    profiles: ["app"]
+    build: .
+    container_name: stockapi-worker
+    command: ["celery", "-A", "ingestion.celery_app.celery_app", "worker", "--loglevel=INFO"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    profiles: ["app"]
+    build: .
+    container_name: stockapi-beat
+    command: ["celery", "-A", "ingestion.celery_app.celery_app", "beat", "--loglevel=INFO"]
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      redis:
+        condition: service_healthy

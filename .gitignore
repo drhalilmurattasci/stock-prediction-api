@@ -16,7 +16,6 @@ __pycache__/
 data/
 mlruns/
 .mlflow/
-.prefect/
 
 # Editors / OS
 .vscode/

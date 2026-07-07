@@ -1,5 +1,4 @@
-# Application settings example (non-secret) — PLACEHOLDER
-# TODO: fill in. Secrets belong in .env, not here.
+# Application settings example (non-secret). Secrets belong in .env, not here.
 app:
   env: local
   log_level: INFO

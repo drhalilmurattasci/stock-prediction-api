@@ -11,6 +11,7 @@ dependencies = [
   "pydantic>=2.9",
   "pydantic-settings>=2.6",
   "httpx>=0.28",
+  "tenacity>=9.0",
   "slowapi>=0.1.9",
   "python-jose[cryptography]>=3.3",
   "passlib[bcrypt]>=1.7",
@@ -21,14 +22,15 @@ dependencies = [
   "asyncpg>=0.30",
   "alembic>=1.14",
   "redis>=5.2",
+  # --- orchestration (task queue + scheduler) ---
+  "celery[redis]>=5.4",
   # --- analytics core ---
   "pandas>=2.2",
   "numpy>=1.26",
   "pandas-ta>=0.3.14b",
   "scikit-learn>=1.5",
   "statsmodels>=0.14",
-  # --- orchestration / tracking clients ---
-  "prefect>=3.1",
+  # --- tracking client ---
   "mlflow>=2.19",
   # --- observability ---
   "prometheus-client>=0.21",
@@ -51,7 +53,6 @@ ml = [
   "chronos-forecasting>=1.5",
   "pmdarima>=2.0",
   "vectorbt>=0.27",
-  "backtrader>=1.9",
 ]
 dev = [
   "pytest>=8.3",
@@ -63,3 +64,42 @@ dev = [
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "data_sources", "ingestion", "ml", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "C4", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI uses callables in argument defaults by design (Depends/Header/...).
+extend-immutable-calls = [
+  "fastapi.Depends",
+  "fastapi.Header",
+  "fastapi.Query",
+  "fastapi.Path",
+  "fastapi.Body",
+  "fastapi.Security",
+  "fastapi.Cookie",
+  "fastapi.Form",
+  "fastapi.File",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "data_sources", "ingestion", "ml", "tests"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+check_untyped_defs = true
+files = ["app", "data_sources", "ingestion", "ml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"

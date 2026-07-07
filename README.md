@@ -6,7 +6,19 @@ A REST/WebSocket API that ingests market data, computes structured analysis (tre
 
 ## Status
 
-📐 **Planning & setup phase.** The architecture, full API/vendor feature catalog, engineering doctrine, committed tech stack, and phased roadmap are documented. App scaffolding is next.
+🚧 **Phase 0 — Foundations.** The FastAPI application spine is runnable: `/healthz`, `/readyz`, `/metrics`, `/v1` router surface (endpoints stubbed with `501` until later phases), structured logging with request IDs, error envelope, API-key auth + rate-limit wiring, Celery app + Beat schedule, and Alembic wired to an async engine. Data ingestion and forecasting land in Phases 1–3.
+
+## Quickstart
+
+```bash
+cp .env.example .env          # fill in vendor keys
+uv sync --extra dev           # install core + dev deps (uv lock committed)
+docker compose up -d          # infra: timescaledb, redis, mlflow
+uv run alembic upgrade head   # apply migrations
+make api                      # uvicorn app.main:app --reload  ->  http://localhost:8000/docs
+```
+
+See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Run the workers with `make worker` / `make beat`.
 
 ## Documentation
 
@@ -17,16 +29,16 @@ A REST/WebSocket API that ingests market data, computes structured analysis (tre
 
 ## Tech stack (committed)
 
-- **Core:** Python 3.12 · FastAPI · Pydantic v2 · httpx
+- **Core:** Python 3.12 · FastAPI · Pydantic v2 · httpx + tenacity
 - **Data:** TimescaleDB / PostgreSQL · Redis
-- **Orchestration:** Prefect
+- **Orchestration:** Celery + Beat (Redis broker)
 - **Modeling:** Chronos-2 · Nixtla · Darts / PyTorch Forecasting · XGBoost / LightGBM · statsmodels
-- **ML lifecycle:** MLflow · Feast · BentoML
-- **Backtesting:** vectorbt · backtrader (bias-free discipline)
+- **ML lifecycle:** MLflow · Feast *(optional, later)* · BentoML *(scaling escape hatch)*
+- **Backtesting:** vectorbt (bias-free discipline)
 - **Ops:** Docker · GitHub Actions · Prometheus + Grafana · Sentry
 
 **Data sources:** Polygon/Massive (prices) · FMP (fundamentals) · Finnhub (news/sentiment) · Sharadar (point-in-time fundamentals); Databento US Equities Mini as redistribution-safe upgrade.
 
 ## License
 
-TBD.
+Proprietary — all rights reserved. See [LICENSE](LICENSE).
