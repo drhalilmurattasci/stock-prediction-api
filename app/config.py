@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,24 +20,31 @@ class Settings(BaseSettings):
     )
 
     # --- app ---
-    app_env: Literal["local", "staging", "production"] = "local"
+    app_env: Literal["local", "test", "staging", "production"] = "local"
     log_level: str = "INFO"
     project_name: str = "Stock Prediction API"
     api_v1_prefix: str = "/v1"
 
     # --- database (async driver) ---
     database_url: str = "postgresql+asyncpg://stockapi:change_me_strong@localhost:5432/stockapi"
+    database_pool_size: int = Field(default=5, ge=1)
+    database_max_overflow: int = Field(default=5, ge=0)
+    database_pool_timeout: int = Field(default=30, ge=1)
 
     # --- redis (cache) ---
-    redis_url: str = "redis://localhost:6379/0"
+    redis_cache_url: str = Field(
+        default="redis://localhost:6379/0",
+        validation_alias=AliasChoices("REDIS_CACHE_URL", "REDIS_URL"),
+    )
 
     # --- celery (broker + result backend) ---
-    celery_broker_url: str = "redis://localhost:6379/1"
-    celery_result_backend: str = "redis://localhost:6379/2"
+    celery_broker_url: str = "redis://localhost:6380/0"
+    celery_result_backend: str = "redis://localhost:6380/1"
 
     # --- rate limiting ---
     rate_limit_storage_uri: str = "memory://"
     rate_limit_default: str = "120/minute"
+    rate_limit_enabled: bool = True
 
     # --- services ---
     mlflow_tracking_uri: str = "http://localhost:5000"
@@ -69,6 +77,11 @@ class Settings(BaseSettings):
     def sync_database_url(self) -> str:
         """Sync SQLAlchemy URL (psycopg) for non-async contexts."""
         return self.database_url.replace("+asyncpg", "+psycopg")
+
+    @property
+    def redis_url(self) -> str:
+        """Backward-compatible alias for the cache Redis URL."""
+        return self.redis_cache_url
 
 
 @lru_cache

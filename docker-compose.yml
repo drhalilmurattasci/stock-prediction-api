@@ -24,14 +24,44 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
+  redis-cache:
     image: redis:7-alpine
-    container_name: stockapi-redis
-    command: ["redis-server", "--appendonly", "yes"]
+    container_name: stockapi-redis-cache
+    command:
+      [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--maxmemory",
+        "256mb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+      ]
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-celery:
+    image: redis:7-alpine
+    container_name: stockapi-redis-celery
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
+    ports:
+      - "6380:6379"
     volumes:
-      - ./data/redis:/data
+      - ./data/redis-celery:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -61,16 +91,19 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/1
-      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      REDIS_CACHE_URL: redis://redis-cache:6379/0
+      RATE_LIMIT_STORAGE_URI: redis://redis-cache:6379/1
+      CELERY_BROKER_URL: redis://redis-celery:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
       MLFLOW_TRACKING_URI: http://mlflow:5000
     ports:
       - "8000:8000"
     depends_on:
       timescaledb:
         condition: service_healthy
-      redis:
+      redis-cache:
+        condition: service_healthy
+      redis-celery:
         condition: service_healthy
 
   worker:
@@ -81,14 +114,16 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/1
-      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      REDIS_CACHE_URL: redis://redis-cache:6379/0
+      CELERY_BROKER_URL: redis://redis-celery:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
       MLFLOW_TRACKING_URI: http://mlflow:5000
     depends_on:
       timescaledb:
         condition: service_healthy
-      redis:
+      redis-cache:
+        condition: service_healthy
+      redis-celery:
         condition: service_healthy
 
   beat:
@@ -98,8 +133,8 @@ services:
     command: ["celery", "-A", "ingestion.celery_app.celery_app", "beat", "--loglevel=INFO"]
     env_file: .env
     environment:
-      CELERY_BROKER_URL: redis://redis:6379/1
-      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      CELERY_BROKER_URL: redis://redis-celery:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
     depends_on:
-      redis:
+      redis-celery:
         condition: service_healthy

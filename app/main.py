@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
+import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -17,11 +18,11 @@ from slowapi.middleware import SlowAPIMiddleware
 from app import __version__
 from app.api.router import api_router
 from app.api.v1 import health
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.core.exceptions import install_exception_handlers
 from app.core.logging import configure_logging
-from app.core.rate_limit import limiter
-from app.db.session import engine
+from app.core.rate_limit import build_limiter
+from app.db.session import build_engine, build_sessionmaker
 from app.observability.metrics import PrometheusMiddleware, metrics_endpoint
 from app.observability.sentry import init_sentry
 from app.schemas.common import DISCLAIMER
@@ -31,19 +32,31 @@ log = structlog.get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
+    settings: Settings = app.state.settings
     configure_logging(settings.log_level, json_logs=settings.is_production)
     init_sentry(settings)
+    app.state.engine = build_engine(settings)
+    app.state.sessionmaker = build_sessionmaker(app.state.engine)
+    app.state.redis_cache = aioredis.from_url(
+        settings.redis_cache_url,
+        encoding="utf-8",
+        decode_responses=True,
+    )
+    app.state.limiter = build_limiter(settings)
     log.info("startup", env=settings.app_env, version=__version__)
     try:
         yield
     finally:
-        await engine.dispose()
+        await app.state.redis_cache.aclose()
+        await app.state.engine.dispose()
         log.info("shutdown")
 
 
-def create_app() -> FastAPI:
-    settings = get_settings()
+def create_app(
+    settings: Settings | None = None,
+    readiness_probes: Sequence[tuple[str, health.ReadinessProbe]] | None = None,
+) -> FastAPI:
+    settings = settings or get_settings()
     app = FastAPI(
         title=settings.project_name,
         version=__version__,
@@ -51,9 +64,11 @@ def create_app() -> FastAPI:
         description=f"{DISCLAIMER}\n\nSee STOCK_API_MASTER_PLAN.md for scope and doctrine.",
         lifespan=lifespan,
     )
+    app.state.settings = settings
+    if readiness_probes is not None:
+        app.state.readiness_probes = tuple(readiness_probes)
 
     # --- rate limiting (slowapi) ---
-    app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, cast(Any, _rate_limit_exceeded_handler))
     app.add_middleware(SlowAPIMiddleware)
 

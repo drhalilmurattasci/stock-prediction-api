@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from fastapi import Request
+from fastapi.testclient import TestClient
+
+from app.config import Settings
+from app.main import create_app
+
 
 def test_healthz_ok(client):
     resp = client.get("/healthz")
@@ -16,6 +22,56 @@ def test_metrics_exposed(client):
     resp = client.get("/metrics")
     assert resp.status_code == 200
     assert "http_requests_total" in resp.text
+
+
+def test_readyz_uses_injected_app_state_probes():
+    async def ok_probe(_request: Request) -> None:
+        return None
+
+    app = create_app(
+        Settings(app_env="test", rate_limit_enabled=False),
+        readiness_probes=(("database", ok_probe), ("redis", ok_probe)),
+    )
+    with TestClient(app) as test_client:
+        resp = test_client.get("/readyz")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "status": "ok",
+        "checks": [
+            {"name": "database", "ok": True, "detail": None},
+            {"name": "redis", "ok": True, "detail": None},
+        ],
+    }
+
+
+def test_readyz_reports_degraded_probe():
+    async def ok_probe(_request: Request) -> None:
+        return None
+
+    async def failing_probe(_request: Request) -> None:
+        raise RuntimeError("redis unavailable")
+
+    app = create_app(
+        Settings(app_env="test", rate_limit_enabled=False),
+        readiness_probes=(("database", ok_probe), ("redis", failing_probe)),
+    )
+    with TestClient(app) as test_client:
+        resp = test_client.get("/readyz")
+
+    assert resp.status_code == 503
+    assert resp.json()["status"] == "degraded"
+    assert resp.json()["checks"][1] == {
+        "name": "redis",
+        "ok": False,
+        "detail": "redis unavailable",
+    }
+
+
+def test_test_factory_disables_default_rate_limit(client):
+    for _ in range(130):
+        resp = client.get("/healthz")
+    assert resp.status_code == 200
 
 
 def test_metrics_use_route_templates_not_raw_paths(client):

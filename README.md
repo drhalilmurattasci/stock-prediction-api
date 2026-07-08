@@ -13,7 +13,7 @@ A REST/WebSocket API that ingests market data, computes structured analysis (tre
 ```bash
 cp .env.example .env          # fill in vendor keys
 uv sync --frozen --extra dev  # install core + dev deps from uv.lock
-docker compose up -d          # infra: timescaledb, redis, mlflow
+docker compose up -d          # infra: timescaledb, redis-cache, redis-celery, mlflow
 uv run alembic upgrade head   # apply migrations
 make api                      # uvicorn app.main:app --reload  ->  http://localhost:8000/docs
 ```
@@ -30,7 +30,7 @@ See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Run the workers wi
 ## Tech stack (committed)
 
 - **Core:** Python 3.12 · FastAPI · Pydantic v2 · httpx + tenacity
-- **Data:** TimescaleDB / PostgreSQL · Redis
+- **Data:** TimescaleDB / PostgreSQL · Redis cache + dedicated Redis Celery broker
 - **Orchestration:** Celery + Beat (Redis broker)
 - **Modeling:** Chronos-2 · StatsForecast · LightGBM · statsmodels / scikit-learn
 - **ML lifecycle:** MLflow · Feast *(optional, later)* · BentoML *(scaling escape hatch)*

@@ -16,7 +16,7 @@
 | Env/pkg mgr | **uv** | winget | native |
 | Containers | **Docker Desktop** + WSL2 | winget + GUI | native host |
 | Database | **TimescaleDB** (PostgreSQL 17) | Docker image | container |
-| Cache/broker | **Redis 7** | Docker image | container |
+| Cache/limits + broker | **Redis 7** (split instances) | Docker image | container |
 | Orchestration | **Celery + Beat** (Redis broker) | uv pip | native process |
 | ML tracking | **MLflow** | Docker image | container |
 | API + ML libs | FastAPI, Pydantic, SQLAlchemy, pandas, torch, LightGBM, StatsForecast, Chronos | uv pip | native venv |
@@ -236,18 +236,22 @@ POSTGRES_DB=stockapi
 # Async driver (asyncpg) — the app uses full async I/O end to end.
 # Alembic derives a sync (psycopg) URL from this automatically.
 DATABASE_URL=postgresql+asyncpg://stockapi:change_me_strong@localhost:5432/stockapi
+DATABASE_POOL_SIZE=5
+DATABASE_MAX_OVERFLOW=5
+DATABASE_POOL_TIMEOUT=30
 
-# ---- Redis (cache) ----
-REDIS_URL=redis://localhost:6379/0
+# ---- Redis (cache + rate-limit counters) ----
+REDIS_CACHE_URL=redis://localhost:6379/0
 
 # ---- Celery (task queue + Beat scheduler) ----
-CELERY_BROKER_URL=redis://localhost:6379/1
-CELERY_RESULT_BACKEND=redis://localhost:6379/2
+CELERY_BROKER_URL=redis://localhost:6380/0
+CELERY_RESULT_BACKEND=redis://localhost:6380/1
 
 # ---- Rate limiting ----
-# memory:// is fine for a single worker in dev; use redis://localhost:6379/3 so
+# memory:// is fine for a single worker in dev; use redis://localhost:6379/1 so
 # limits are shared across workers in production.
 RATE_LIMIT_STORAGE_URI=memory://
+RATE_LIMIT_ENABLED=true
 
 # ---- Services ----
 MLFLOW_TRACKING_URI=http://localhost:5000
@@ -316,14 +320,44 @@ services:
       timeout: 5s
       retries: 5
 
-  redis:
+  redis-cache:
     image: redis:7-alpine
-    container_name: stockapi-redis
-    command: ["redis-server", "--appendonly", "yes"]
+    container_name: stockapi-redis-cache
+    command:
+      [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--maxmemory",
+        "256mb",
+        "--maxmemory-policy",
+        "allkeys-lru",
+      ]
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-celery:
+    image: redis:7-alpine
+    container_name: stockapi-redis-celery
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
+    ports:
+      - "6380:6379"
     volumes:
-      - ./data/redis:/data
+      - ./data/redis-celery:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -426,7 +460,8 @@ docker compose logs -f mlflow
 | Docker engine | `docker version` | client + server versions |
 | TimescaleDB up | `docker exec stockapi-timescaledb pg_isready -U stockapi` | `accepting connections` |
 | Timescale ext | `docker exec stockapi-timescaledb psql -U stockapi -d stockapi -c "SELECT extversion FROM pg_extension WHERE extname='timescaledb';"` | a version row |
-| Redis | `docker exec stockapi-redis redis-cli ping` | `PONG` |
+| Redis cache | `docker exec stockapi-redis-cache redis-cli ping` | `PONG` |
+| Redis Celery | `docker exec stockapi-redis-celery redis-cli ping` | `PONG` |
 | MLflow UI | open `http://localhost:5000` | MLflow dashboard |
 | Celery worker | `celery -A ingestion.celery_app.celery_app inspect ping` (after starting a worker) | `pong` from one node |
 | DB from Python | see snippet below | `db OK` |

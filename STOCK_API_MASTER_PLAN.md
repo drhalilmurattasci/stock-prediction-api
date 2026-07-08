@@ -137,7 +137,7 @@ The service is a Python 3.12 application built on **FastAPI** with full async I/
 
 - **TimescaleDB** (a Postgres extension) is the system of record for all OHLCV and time-series data. Bars live in hypertables partitioned by time (and space-partitioned by symbol where volume warrants), with continuous aggregates materializing 1m -> 5m -> 1h -> 1d rollups, native compression on older chunks, and retention policies. Using a Timescale-flavored Postgres rather than a separate TSDB means time-series and relational data share one engine, one backup story, and one SQL dialect.
 - **Postgres** (the same cluster) holds relational metadata: instruments, symbol mappings, corporate actions, users, API keys, model/run registry pointers, and prediction audit records.
-- **Redis** is the multi-purpose hot path: response and feature caching (with TTLs keyed by symbol/timeframe), the rate-limit token store, and the **Celery broker + result backend**. Pub/sub is available for fan-out of fresh-bar events.
+- **Redis is split by durability semantics:** `redis-cache` handles response/feature caching and rate-limit counters with LRU eviction and no persistence; `redis-celery` is dedicated to the Celery broker/result backend with AOF persistence and `noeviction`. Pub/sub remains available for fan-out of fresh-bar events, but cache eviction can never delete queued work.
 
 #### Ingestion / Orchestration
 
@@ -189,7 +189,7 @@ Two-tier auth: **API keys** for programmatic/customer access (hashed at rest, sc
 
 #### Packaging / CI-CD
 
-Everything is containerized with **Docker** and orchestrated locally and on the VPS via **docker-compose** (services: api, worker, beat, postgres/timescale, redis, mlflow, prometheus, grafana, reverse proxy). **GitHub Actions** runs lint (`ruff`), type-check (`mypy`), tests (`pytest`), builds and pushes images to a registry (GHCR), and deploys. **Kubernetes** is explicitly optional and deferred — adopted only when horizontal scale, multi-node GPU scheduling, or rolling-deploy guarantees outgrow compose.
+Everything is containerized with **Docker** and orchestrated locally and on the VPS via **docker-compose** (services: api, worker, beat, postgres/timescale, redis-cache, redis-celery, mlflow, prometheus, grafana, reverse proxy). **GitHub Actions** runs lint (`ruff`), type-check (`mypy`), tests (`pytest`), builds and pushes images to a registry (GHCR), and deploys. **Kubernetes** is explicitly optional and deferred — adopted only when horizontal scale, multi-node GPU scheduling, or rolling-deploy guarantees outgrow compose.
 
 #### Deployment
 
@@ -207,7 +207,7 @@ The **cloud path** (AWS / Azure / GCP) is the deliberate upgrade for what a sing
 | HTTP client | httpx (async) + tenacity | Async vendor pulls with pooling, timeouts, retries |
 | Time-series DB | TimescaleDB (Postgres) | OHLCV hypertables, continuous aggregates, compression, SQL |
 | Metadata DB | Postgres | Instruments, users, keys, registry pointers, audit |
-| Cache / broker | Redis | Response/feature cache, rate-limit store, Celery broker |
+| Cache / broker | Split Redis | `redis-cache` for response/feature cache + rate-limit counters; `redis-celery` for Celery broker/results |
 | Orchestration | Celery + Beat | Already needed for async jobs; one scheduler, not two |
 | Foundation forecasting | Chronos-2 (self-hosted) | Strong zero-shot probabilistic baseline, no per-symbol training |
 | Classical forecasting | StatsForecast, statsmodels | Fast, scalable ARIMA/ETS/Theta baselines |
@@ -791,7 +791,7 @@ Sources:
 #### Data Stores & Caching
 - **PostgreSQL** — robust open-source relational database and the system of record. · **Role in our stack:** stores symbols, users/API keys, model metadata, predictions, and reference data. · **Key features:** ACID transactions, rich JSONB support, window functions and CTEs, mature indexing (B-tree/GIN/BRIN) and replication.
 - **TimescaleDB** — PostgreSQL extension purpose-built for time-series at scale. · **Role in our stack:** stores OHLCV bars and tick/quote history as hypertables, serving fast range queries and pre-rolled aggregates to the API and feature pipeline. · **Key features:** hypertables with automatic time/space chunk partitioning and chunk pruning; continuous aggregates (self-refreshing materialized rollups like 1m→1h→1d); hypercore columnstore compression (~90–95% reduction on cold chunks) with transparent decompression; data-retention and tiering policies.
-- **Redis** — in-memory key-value store used for caching, messaging, and counters. · **Role in our stack:** caches hot quotes/indicator results, serves as the Celery broker/result backend, and holds slowapi rate-limit counters. · **Key features:** sub-millisecond reads with TTL expiry, pub/sub and list/stream primitives for queues, atomic `INCR`/`INCRBY` for limiters, optional persistence (RDB/AOF) and Lua scripting.
+- **Redis** — in-memory key-value store used for caching, messaging, and counters. · **Role in our stack:** split into two instances with different failure modes: `redis-cache` caches hot quotes/indicator results and holds slowapi rate-limit counters under LRU eviction; `redis-celery` is the durable Celery broker/result backend with AOF and `noeviction`. · **Key features:** sub-millisecond reads with TTL expiry, pub/sub and list/stream primitives for queues, atomic `INCR`/`INCRBY` for limiters, optional persistence (RDB/AOF) and Lua scripting.
 
 #### Ingestion & Orchestration
 - **Celery + Beat (committed)** — distributed task queue with a periodic scheduler. · **Role in our stack:** the single, committed orchestration system (see §4). Celery Beat runs scheduled ingestion (EOD fundamentals, intraday bar polling, news sweeps) while Celery workers run async jobs, heavy feature computation, backtests, and per-symbol prediction fan-out — all over the Redis broker already in the stack. · **Key features:** horizontal worker scaling, `beat` cron-style periodic tasks, retries/acks-late, rate-limit-aware backoff, idempotent upserts, and task routing/priorities. **Why over Prefect:** Celery already has to exist for off-request-thread compute, so we run one scheduler, not two.

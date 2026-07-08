@@ -10,10 +10,12 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.config import Settings
+from app.main import create_app
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def client() -> TestClient:
+    app = create_app(Settings(app_env="test", rate_limit_enabled=False))
     with TestClient(app) as test_client:
         yield test_client
