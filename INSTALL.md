@@ -19,7 +19,7 @@
 | Cache/broker | **Redis 7** | Docker image | container |
 | Orchestration | **Celery + Beat** (Redis broker) | uv pip | native process |
 | ML tracking | **MLflow** | Docker image | container |
-| API + ML libs | FastAPI, Pydantic, SQLAlchemy, pandas, torch, XGBoost, Darts, Chronos, vectorbt, … | uv pip | native venv |
+| API + ML libs | FastAPI, Pydantic, SQLAlchemy, pandas, torch, LightGBM, StatsForecast, Chronos | uv pip | native venv |
 
 **Estimated time:** 30–60 min (most of it Docker image pulls + Python wheel downloads). One reboot required (WSL2).
 
@@ -107,7 +107,7 @@ uv --version
 
 ## 4. Step 3 — Install project Python 3.12
 
-The system has Python 3.13, but several ML libraries (Darts, NeuralForecast, some torch builds) ship reliable wheels for **3.12**. Let `uv` manage an isolated 3.12 — it won’t touch your system Python.
+The system has Python 3.13, but the project pins **Python 3.12** for repeatable dependency resolution and ML wheel compatibility. Let `uv` manage an isolated 3.12 — it won’t touch your system Python.
 
 ```powershell
 uv python install 3.12
@@ -134,14 +134,13 @@ dependencies = [
   # --- API & web ---
   "fastapi>=0.115",
   "uvicorn[standard]>=0.34",
-  "gunicorn>=23.0",
   "pydantic>=2.9",
   "pydantic-settings>=2.6",
   "httpx>=0.28",
   "tenacity>=9.0",
   "slowapi>=0.1.9",
-  "python-jose[cryptography]>=3.3",
-  "passlib[bcrypt]>=1.7",
+  "PyJWT[crypto]>=2.10",
+  "bcrypt>=4.2",
   "python-dotenv>=1.0",
   # --- data layer ---
   "sqlalchemy>=2.0",
@@ -154,11 +153,10 @@ dependencies = [
   # --- analytics core ---
   "pandas>=2.2",
   "numpy>=1.26",
-  "pandas-ta>=0.3.14b",
   "scikit-learn>=1.5",
   "statsmodels>=0.14",
   # --- tracking client ---
-  "mlflow>=2.19",
+  "mlflow-skinny>=2.19",
   # --- observability ---
   "prometheus-client>=0.21",
   "sentry-sdk>=2.19",
@@ -171,15 +169,9 @@ dependencies = [
 [project.optional-dependencies]
 ml = [
   "torch>=2.5",                 # CPU build by default; see GPU note in Appendix
-  "xgboost>=2.1",
   "lightgbm>=4.5",
-  "catboost>=1.2",
   "statsforecast>=2.0",
-  "neuralforecast>=2.0",
-  "darts>=0.31",
-  "chronos-forecasting>=1.5",
-  "pmdarima>=2.0",
-  "vectorbt>=0.27",
+  "chronos-forecasting>=2.0",
 ]
 dev = [
   "pytest>=8.3",
@@ -342,10 +334,10 @@ services:
     image: python:3.12-slim
     container_name: stockapi-mlflow
     working_dir: /mlflow
-    # Local-dev deviation: sqlite backend + local artifact dir. Production uses a
-    # Postgres backend + S3-compatible artifact store (MinIO) per the master plan.
+    # Local-dev deviation: sqlite backend + local artifact dir. Production keeps
+    # filesystem artifacts with offsite backups until a managed object store is needed.
     command: >
-      bash -c "pip install --no-cache-dir mlflow>=2.19 &&
+      bash -c "pip install --no-cache-dir mlflow-skinny>=2.19 &&
                mlflow server --host 0.0.0.0 --port 5000
                --backend-store-uri sqlite:////mlflow/mlflow.db
                --artifacts-destination /mlflow/artifacts"
@@ -388,10 +380,10 @@ Copy-Item .env.example .env
 
 # Resolve + lock dependencies (writes uv.lock), then install core + dev into .venv
 uv lock
-uv sync --extra dev
+uv sync --frozen --extra dev
 
-# Add the heavy ML stack (torch, darts, chronos, etc.) — takes longer
-uv sync --extra dev --extra ml
+# Add the ML stack (torch, LightGBM, StatsForecast, Chronos-2) — takes longer
+uv sync --frozen --extra dev --extra ml
 
 # Activate the uv-managed venv (PowerShell)
 .\.venv\Scripts\Activate.ps1
@@ -401,11 +393,10 @@ uv sync --extra dev --extra ml
 ```powershell
 python --version                       # Python 3.12.x
 python -c "import fastapi, pandas, sqlalchemy, redis, celery, mlflow; print('core OK')"
-python -c "import torch, xgboost, darts, statsforecast; print('ml OK')"
+python -c "import torch, lightgbm, statsforecast; import chronos; print('ml OK')"
 ```
 
 > 🔧 If `Activate.ps1` is blocked: `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`, then retry.
-> 🔧 `pandas-ta` may warn about `pkg_resources`/`numpy` — harmless. If a hard error, see Troubleshooting.
 
 ---
 
@@ -497,7 +488,7 @@ deactivate                           # leave the venv
 | TimescaleDB extension missing | Confirm `scripts/db-init/01-extensions.sql` mounted; it only runs on a **fresh** volume — `docker compose down -v` then `up` to re-init (destroys local data). |
 | MLflow container slow first boot | Expected — it pip-installs MLflow on start. Subsequent boots reuse the layer cache. |
 | `torch` install huge / slow | Default is CPU build. For GPU see Appendix A. |
-| `TA-Lib` build error | TA-Lib is **optional** (we default to `pandas-ta`). See Appendix B to add it. |
+| `TA-Lib` build error | TA-Lib is **optional**. The default path is owned indicator functions with golden-value tests. |
 
 ---
 
@@ -529,7 +520,7 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 
 ## Appendix B — TA-Lib on Windows (optional)
 
-`pandas-ta` (pure Python) is the default and needs no extra steps. To add the faster C-backed **TA-Lib**:
+The default path is owned indicator functions over pandas/numpy. To add the faster C-backed **TA-Lib** for specific formulas:
 
 ```powershell
 # Prebuilt wheel (preferred on Windows — no C toolchain needed)
@@ -558,7 +549,7 @@ Image tags (`latest-pg17`) and `>=` ranges favor a smooth first install. **Befor
 - [ ] uv installed (`uv --version`)
 - [ ] Python 3.12 available to uv (`uv python list`)
 - [ ] Project files created (`pyproject.toml`, `.env`, `docker-compose.yml`, init SQL)
-- [ ] `uv sync --extra dev` (+ `--extra ml`) installed, import checks pass
+- [ ] `uv sync --frozen --extra dev` (+ `--extra ml`) installed, import checks pass
 - [ ] `docker compose up -d` → all services healthy
 - [ ] Smoke-test matrix all green (DB, Redis, MLflow)
 - [ ] `alembic upgrade head` → `uvicorn` serves `/docs`, `/healthz` returns 200

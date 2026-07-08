@@ -13,7 +13,13 @@ from celery import shared_task
 log = structlog.get_logger(__name__)
 
 
-@shared_task(name="ingestion.ingest_prices", bind=True, max_retries=3)
+@shared_task(
+    name="ingestion.ingest_prices",
+    bind=True,
+    max_retries=3,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def ingest_prices(self, symbols: list[str] | None = None) -> dict:
     log.info("ingest_prices.start", symbols=symbols)
     # TODO(P1): pull bars via a data_sources adapter, adjust, upsert idempotently.

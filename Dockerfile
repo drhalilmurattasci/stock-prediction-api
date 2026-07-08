@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # uv (fast, lockfile-driven installs)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /usr/local/bin/uv
 
 # --- dependency layer (cached until pyproject/uv.lock change) ---
 COPY pyproject.toml uv.lock ./
@@ -28,7 +28,7 @@ COPY migrations ./migrations
 
 EXPOSE 8000
 # Default command runs the API; worker/beat override this in docker-compose.
-CMD ["gunicorn", "app.main:app", \
-     "-k", "uvicorn.workers.UvicornWorker", \
-     "-w", "2", "-b", "0.0.0.0:8000", \
-     "--access-logfile", "-"]
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "2"]

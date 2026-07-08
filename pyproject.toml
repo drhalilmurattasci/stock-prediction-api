@@ -7,14 +7,13 @@ dependencies = [
   # --- API & web ---
   "fastapi>=0.115",
   "uvicorn[standard]>=0.34",
-  "gunicorn>=23.0",
   "pydantic>=2.9",
   "pydantic-settings>=2.6",
   "httpx>=0.28",
   "tenacity>=9.0",
   "slowapi>=0.1.9",
-  "python-jose[cryptography]>=3.3",
-  "passlib[bcrypt]>=1.7",
+  "PyJWT[crypto]>=2.10",
+  "bcrypt>=4.2",
   "python-dotenv>=1.0",
   # --- data layer ---
   "sqlalchemy>=2.0",
@@ -27,11 +26,10 @@ dependencies = [
   # --- analytics core ---
   "pandas>=2.2",
   "numpy>=1.26",
-  "pandas-ta>=0.3.14b",
   "scikit-learn>=1.5",
   "statsmodels>=0.14",
   # --- tracking client ---
-  "mlflow>=2.19",
+  "mlflow-skinny>=2.19",
   # --- observability ---
   "prometheus-client>=0.21",
   "sentry-sdk>=2.19",
@@ -44,15 +42,9 @@ dependencies = [
 [project.optional-dependencies]
 ml = [
   "torch>=2.5",
-  "xgboost>=2.1",
   "lightgbm>=4.5",
-  "catboost>=1.2",
   "statsforecast>=2.0",
-  "neuralforecast>=2.0",
-  "darts>=0.31",
-  "chronos-forecasting>=1.5",
-  "pmdarima>=2.0",
-  "vectorbt>=0.27",
+  "chronos-forecasting>=2.0",
 ]
 dev = [
   "pytest>=8.3",

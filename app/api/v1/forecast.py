@@ -7,18 +7,26 @@ routes intentionally return HTTP 501 until then.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, Path, Query
-from pydantic import AwareDatetime
+from fastapi.exceptions import RequestValidationError
+from pydantic import AwareDatetime, ValidationError
 
 from app.core.exceptions import NotImplementedYet
 from app.schemas.common import ErrorResponse
-from app.schemas.forecast import ForecastRequest, ForecastResponse, ForecastTarget
+from app.schemas.forecast import (
+    Coverage,
+    ForecastHorizonUnit,
+    ForecastModelSelector,
+    ForecastRequest,
+    ForecastResponse,
+    ForecastTarget,
+)
 
 router = APIRouter(prefix="/forecast", tags=["forecast"])
 
-ERROR_RESPONSES = {
+ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     501: {
         "model": ErrorResponse,
         "description": "Forecast execution is planned for Phase 3.",
@@ -46,6 +54,10 @@ async def get_forecast(
         int,
         Query(ge=1, le=252, description="Number of forecast steps to return."),
     ] = 5,
+    horizon_unit: Annotated[
+        ForecastHorizonUnit,
+        Query(description="Unit for each forecast horizon step."),
+    ] = "trading_day",
     target: Annotated[
         ForecastTarget,
         Query(description="Forecast target. Price targets use the response currency."),
@@ -63,27 +75,37 @@ async def get_forecast(
         ),
     ] = None,
     model: Annotated[
-        str,
+        ForecastModelSelector,
         Query(description="Model selector. 'auto' routes to the promoted champion."),
     ] = "auto",
     interval_coverages: Annotated[
-        list[float] | None,
+        list[Coverage] | None,
         Query(
             alias="coverage",
             description="Repeatable central interval coverage query param, e.g. coverage=0.8.",
         ),
     ] = None,
 ) -> ForecastResponse:
+    request_data = {
+        "symbol": symbol,
+        "horizon": horizon,
+        "horizon_unit": horizon_unit,
+        "target": target,
+        "as_of": as_of,
+        "snapshot_id": snapshot_id,
+        "model": model,
+    }
+    if interval_coverages is not None:
+        request_data["interval_coverages"] = interval_coverages
+    try:
+        request = ForecastRequest.model_validate(request_data)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
     raise NotImplementedYet(
-        f"/v1/forecast/{symbol.upper()} is planned for Phase 3.",
+        f"/v1/forecast/{request.symbol} is planned for Phase 3.",
         details={
             "contract": "ForecastResponse",
-            "horizon": horizon,
-            "target": target,
-            "as_of": as_of,
-            "snapshot_id": snapshot_id,
-            "model": model,
-            "interval_coverages": interval_coverages,
+            "request": request.model_dump(mode="json"),
         },
     )
 

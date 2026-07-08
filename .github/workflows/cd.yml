@@ -27,7 +27,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
 
   # TODO(P5): add a deploy job (SSH to Hostinger VPS -> docker compose pull &&
-  # docker compose --profile app up -d) once the VPS + secrets are provisioned.
+  # docker compose --profile app up -d, recording the deployed image digest into
+  # forecast provenance) once the VPS + secrets are provisioned.

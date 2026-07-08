@@ -12,7 +12,7 @@ A REST/WebSocket API that ingests market data, computes structured analysis (tre
 
 ```bash
 cp .env.example .env          # fill in vendor keys
-uv sync --extra dev           # install core + dev deps (uv lock committed)
+uv sync --frozen --extra dev  # install core + dev deps from uv.lock
 docker compose up -d          # infra: timescaledb, redis, mlflow
 uv run alembic upgrade head   # apply migrations
 make api                      # uvicorn app.main:app --reload  ->  http://localhost:8000/docs
@@ -32,9 +32,9 @@ See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Run the workers wi
 - **Core:** Python 3.12 · FastAPI · Pydantic v2 · httpx + tenacity
 - **Data:** TimescaleDB / PostgreSQL · Redis
 - **Orchestration:** Celery + Beat (Redis broker)
-- **Modeling:** Chronos-2 · Nixtla · Darts / PyTorch Forecasting · XGBoost / LightGBM · statsmodels
+- **Modeling:** Chronos-2 · StatsForecast · LightGBM · statsmodels / scikit-learn
 - **ML lifecycle:** MLflow · Feast *(optional, later)* · BentoML *(scaling escape hatch)*
-- **Backtesting:** vectorbt (bias-free discipline)
+- **Backtesting/evaluation:** owned walk-forward harness (bias-free discipline)
 - **Ops:** Docker · GitHub Actions · Prometheus + Grafana · Sentry
 
 **Data sources:** Polygon/Massive (prices) · FMP (fundamentals) · Finnhub (news/sentiment) · Sharadar (point-in-time fundamentals); Databento US Equities Mini as redistribution-safe upgrade.

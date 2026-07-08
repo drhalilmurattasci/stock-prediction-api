@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any, cast
 
 import structlog
 from fastapi import FastAPI, Request
@@ -53,7 +54,7 @@ def create_app() -> FastAPI:
 
     # --- rate limiting (slowapi) ---
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, cast(Any, _rate_limit_exceeded_handler))
     app.add_middleware(SlowAPIMiddleware)
 
     # --- metrics ---

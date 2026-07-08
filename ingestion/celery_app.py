@@ -31,8 +31,9 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
-    task_acks_late=True,
-    task_reject_on_worker_lost=True,
+    broker_transport_options={"visibility_timeout": 6 * 60 * 60},
+    result_backend_transport_options={"visibility_timeout": 6 * 60 * 60},
+    task_acks_late=False,
     task_track_started=True,
     worker_prefetch_multiplier=1,
     timezone="UTC",

@@ -77,7 +77,7 @@ class ForecastRequest(ForecastBaseModel):
         max_length=128,
         description="Pinned immutable data snapshot. Overrides as_of when provided.",
     )
-    model: ForecastModelSelector | str = Field(
+    model: ForecastModelSelector = Field(
         default="auto",
         description=(
             "Model selector. 'auto' routes to the promoted champion for the requested target."

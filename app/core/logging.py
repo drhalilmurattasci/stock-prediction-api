@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any
 
 import structlog
 
@@ -16,7 +17,7 @@ def configure_logging(level: str = "INFO", *, json_logs: bool = False) -> None:
     """
     log_level = getattr(logging, level.upper(), logging.INFO)
 
-    shared_processors = [
+    shared_processors: list[Any] = [
         structlog.contextvars.merge_contextvars,
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),

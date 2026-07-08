@@ -18,6 +18,16 @@ def test_metrics_exposed(client):
     assert "http_requests_total" in resp.text
 
 
+def test_metrics_use_route_templates_not_raw_paths(client):
+    client.get("/v1/forecast/AAPL")
+    client.get("/totally-random-scanner-path")
+    resp = client.get("/metrics")
+
+    assert 'path="/v1/forecast/{symbol}"' in resp.text
+    assert 'path="/totally-random-scanner-path"' not in resp.text
+    assert 'path="<unmatched>"' in resp.text
+
+
 def test_openapi_lists_surface(client):
     resp = client.get("/openapi.json")
     assert resp.status_code == 200
@@ -32,3 +42,13 @@ def test_placeholder_returns_501_envelope(client):
     resp = client.get("/v1/forecast/AAPL")
     assert resp.status_code == 501
     assert resp.json()["error"]["code"] == "not_implemented"
+
+
+def test_get_forecast_validates_against_request_contract(client):
+    resp = client.get("/v1/forecast/aapl?coverage=0.8&coverage=0.8")
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
+
+    resp = client.get("/v1/forecast/AAPL?model=experimental")
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_error"
