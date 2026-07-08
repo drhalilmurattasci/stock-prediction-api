@@ -487,7 +487,7 @@ uvicorn app.main:app --reload --port 8000
 # Liveness:     http://localhost:8000/healthz
 # Readiness:    http://localhost:8000/readyz    (checks DB + Redis)
 
-# In separate terminals (optional until Phase 1 ingestion tasks do real work):
+# In separate terminals (needed for scheduled Polygon price ingestion):
 celery -A ingestion.celery_app.celery_app worker --loglevel=INFO
 celery -A ingestion.celery_app.celery_app beat   --loglevel=INFO
 ```

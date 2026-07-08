@@ -6,7 +6,7 @@ A REST/WebSocket API that ingests market data, computes structured analysis (tre
 
 ## Status
 
-🚧 **Phase 0 — Foundations.** The FastAPI application spine is runnable: `/healthz`, `/readyz`, `/metrics`, `/v1` router surface (endpoints stubbed with `501` until later phases), structured logging with request IDs, error envelope, API-key auth + rate-limit wiring, Celery app + Beat schedule, and Alembic wired to an async engine. Data ingestion and forecasting land in Phases 1–3.
+🚧 **Phase 1 — Price ingestion.** The FastAPI application spine is runnable: `/healthz`, `/readyz`, `/metrics`, `/v1` router surface (endpoints stubbed with `501` until later phases), structured logging with request IDs, error envelope, API-key auth + rate-limit wiring, Celery app + Beat schedule, Alembic migrations, and a Polygon daily-bars ingest task writing to the `bars` hypertable with revision capture. Forecasting lands in Phase 3.
 
 ## Quickstart
 

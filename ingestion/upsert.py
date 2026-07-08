@@ -207,7 +207,7 @@ def build_existing_bars_select(rows: Iterable[BarUpsertRow]) -> Select[tuple[Bar
     if not row_list:
         raise ValueError("at least one bar row is required")
     key_expr = tuple_(*(Bar.__table__.c[column] for column in BAR_CONFLICT_KEY))
-    return select(Bar).where(key_expr.in_([row.conflict_key for row in row_list]))
+    return select(Bar).where(key_expr.in_([row.conflict_key for row in row_list])).with_for_update()
 
 
 def build_bar_upsert_statement(rows: Iterable[BarUpsertRow]) -> Insert:

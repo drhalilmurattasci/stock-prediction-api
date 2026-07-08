@@ -147,6 +147,10 @@ class MarketDataProvider(Protocol):
 
     name: str
 
+    async def __aenter__(self) -> MarketDataProvider: ...
+
+    async def __aexit__(self, *exc_info: object) -> None: ...
+
     async def get_daily_bars(
         self, symbol: str, start: date, end: date, *, adjusted: bool = False
     ) -> list[OHLCVBar]: ...
