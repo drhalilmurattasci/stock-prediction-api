@@ -10,8 +10,8 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from app.config import Settings
-from data_sources.base import OHLCVBar
-from ingestion.tasks.ingest_prices import ingest_prices_async
+from data_sources.base import OHLCVBar, SymbolNotFoundError
+from ingestion.tasks.ingest_prices import _latest_bar_ts_statement, ingest_prices_async
 from ingestion.upsert import BarUpsertPlan, build_bar_upserts, build_existing_bars_select
 
 TS = datetime(2026, 7, 6, tzinfo=UTC)
@@ -20,7 +20,14 @@ TS = datetime(2026, 7, 6, tzinfo=UTC)
 class FakeProvider:
     name = "fake"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        sessionmaker: FakeSessionmaker | None = None,
+        fail_symbols: set[str] | None = None,
+    ) -> None:
+        self._sessionmaker = sessionmaker
+        self._fail_symbols = fail_symbols or set()
         self.calls: list[tuple[str, date, date, bool]] = []
         self.closed = False
 
@@ -33,15 +40,24 @@ class FakeProvider:
     async def get_daily_bars(
         self, symbol: str, start: date, end: date, *, adjusted: bool = False
     ) -> list[OHLCVBar]:
+        if self._sessionmaker is not None:
+            assert self._sessionmaker.active_transactions == 0
         self.calls.append((symbol, start, end, adjusted))
+        if symbol in self._fail_symbols:
+            raise SymbolNotFoundError(f"{symbol} missing")
         return [_bar(symbol)]
 
 
 class FakeTransaction:
+    def __init__(self, session: FakeSession) -> None:
+        self._session = session
+
     async def __aenter__(self) -> None:
+        self._session.sessionmaker.active_transactions += 1
         return None
 
     async def __aexit__(self, *exc_info: object) -> None:
+        self._session.sessionmaker.active_transactions -= 1
         return None
 
 
@@ -54,7 +70,8 @@ class FakeScalarResult:
 
 
 class FakeSession:
-    def __init__(self, latest_ts: datetime | None = None) -> None:
+    def __init__(self, sessionmaker: FakeSessionmaker, latest_ts: datetime | None = None) -> None:
+        self.sessionmaker = sessionmaker
         self._latest_ts = latest_ts
         self.executed: list[tuple[str, dict[str, Any]]] = []
 
@@ -65,7 +82,7 @@ class FakeSession:
         return None
 
     def begin(self) -> FakeTransaction:
-        return FakeTransaction()
+        return FakeTransaction(self)
 
     async def execute(self, statement: Any, params: dict[str, Any] | None = None) -> Any:
         statement_text = str(statement)
@@ -79,9 +96,10 @@ class FakeSessionmaker:
     def __init__(self, latest_ts: datetime | None = None) -> None:
         self._latest_ts = latest_ts
         self.sessions: list[FakeSession] = []
+        self.active_transactions = 0
 
     def __call__(self) -> FakeSession:
-        session = FakeSession(self._latest_ts)
+        session = FakeSession(self, self._latest_ts)
         self.sessions.append(session)
         return session
 
@@ -102,10 +120,16 @@ def _bar(symbol: str) -> OHLCVBar:
     )
 
 
+async def _fake_upsert(session: Any, bars: Sequence[OHLCVBar]) -> BarUpsertPlan:
+    del session
+    rows = build_bar_upserts(bars)
+    return BarUpsertPlan(rows=rows, revisions=[])
+
+
 @pytest.mark.asyncio
 async def test_ingest_prices_fetches_locks_and_upserts_per_symbol():
-    provider = FakeProvider()
     sessionmaker = FakeSessionmaker()
+    provider = FakeProvider(sessionmaker=sessionmaker)
     upsert_calls: list[list[str]] = []
 
     async def fake_upsert(session: Any, bars: Sequence[OHLCVBar]) -> BarUpsertPlan:
@@ -134,22 +158,17 @@ async def test_ingest_prices_fetches_locks_and_upserts_per_symbol():
     assert result["status"] == "ok"
     assert result["symbols"] == ["AAPL", "MSFT"]
     assert result["rows_upserted"] == 2
-    assert len(sessionmaker.sessions) == 2
+    assert len(sessionmaker.sessions) == 4
     assert all(
         "pg_advisory_xact_lock" in session.executed[0][0] for session in sessionmaker.sessions
     )
 
 
 @pytest.mark.asyncio
-async def test_ingest_prices_uses_watermark_when_start_is_not_explicit():
-    provider = FakeProvider()
+async def test_ingest_prices_refetches_trailing_overlap_when_watermark_is_recent():
     latest_ts = datetime(2026, 7, 4, tzinfo=UTC)
     sessionmaker = FakeSessionmaker(latest_ts=latest_ts)
-
-    async def fake_upsert(session: Any, bars: Sequence[OHLCVBar]) -> BarUpsertPlan:
-        del session
-        rows = build_bar_upserts(bars)
-        return BarUpsertPlan(rows=rows, revisions=[])
+    provider = FakeProvider(sessionmaker=sessionmaker)
 
     result = await ingest_prices_async(
         symbols=["AAPL"],
@@ -157,31 +176,57 @@ async def test_ingest_prices_uses_watermark_when_start_is_not_explicit():
         settings=Settings(app_env="test", polygon_api_key="unused"),
         provider_factory=lambda _settings: provider,
         sessionmaker=sessionmaker,  # type: ignore[arg-type]
-        upsert_fn=fake_upsert,  # type: ignore[arg-type]
+        upsert_fn=_fake_upsert,  # type: ignore[arg-type]
     )
 
-    assert provider.calls == [("AAPL", date(2026, 7, 5), date(2026, 7, 6), False)]
+    assert provider.calls == [("AAPL", date(2026, 6, 29), date(2026, 7, 6), False)]
     assert result["requested_start"] == "2026-06-29"
     assert result["watermark_enabled"] is True
-    assert result["per_symbol"][0]["fetch_start"] == "2026-07-05"
+    assert result["per_symbol"][0]["fetch_start"] == "2026-06-29"
 
 
 @pytest.mark.asyncio
-async def test_ingest_prices_skips_symbol_when_watermark_is_current():
-    provider = FakeProvider()
+async def test_ingest_prices_fetches_from_next_missing_day_after_long_outage():
     sessionmaker = FakeSessionmaker(latest_ts=datetime(2026, 7, 6, tzinfo=UTC))
+    provider = FakeProvider(sessionmaker=sessionmaker)
 
     result = await ingest_prices_async(
         symbols=["AAPL"],
+        end=date(2026, 7, 20),
+        settings=Settings(app_env="test", polygon_api_key="unused"),
+        provider_factory=lambda _settings: provider,
+        sessionmaker=sessionmaker,  # type: ignore[arg-type]
+        upsert_fn=_fake_upsert,  # type: ignore[arg-type]
+    )
+
+    assert provider.calls == [("AAPL", date(2026, 7, 7), date(2026, 7, 20), False)]
+    assert result["per_symbol"][0]["fetch_start"] == "2026-07-07"
+
+
+@pytest.mark.asyncio
+async def test_ingest_prices_continues_after_one_symbol_failure():
+    provider = FakeProvider(fail_symbols={"BAD"})
+    sessionmaker = FakeSessionmaker()
+
+    result = await ingest_prices_async(
+        symbols=["AAPL", "BAD", "MSFT"],
+        start=date(2026, 7, 1),
         end=date(2026, 7, 6),
         settings=Settings(app_env="test", polygon_api_key="unused"),
         provider_factory=lambda _settings: provider,
         sessionmaker=sessionmaker,  # type: ignore[arg-type]
+        upsert_fn=_fake_upsert,  # type: ignore[arg-type]
     )
 
-    assert provider.calls == []
-    assert result["rows_upserted"] == 0
-    assert result["per_symbol"][0]["fetch_start"] is None
+    assert result["status"] == "degraded"
+    assert result["rows_upserted"] == 2
+    assert result["failures"] == 1
+    assert result["retryable_failures"] == 0
+    assert [(entry["symbol"], entry["status"]) for entry in result["per_symbol"]] == [
+        ("AAPL", "ok"),
+        ("BAD", "failed"),
+        ("MSFT", "ok"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -213,3 +258,13 @@ def test_existing_bar_select_locks_loaded_rows_for_update():
     sql = str(build_existing_bars_select([row]).compile(dialect=postgresql.dialect()))
 
     assert "FOR UPDATE" in sql
+
+
+def test_latest_bar_ts_statement_is_adjustment_basis_specific():
+    sql = str(
+        _latest_bar_ts_statement("AAPL", "polygon", "day", "raw").compile(
+            dialect=postgresql.dialect()
+        )
+    )
+
+    assert "bars.adjustment_basis" in sql
