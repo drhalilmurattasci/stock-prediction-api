@@ -32,7 +32,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["command", "result"],
+        "required": ["command", "result", "exit_code"],
         "properties": {
           "command": { "type": "string" },
           "result": { "type": "string" },

@@ -26,6 +26,8 @@ def test_plan_runs_read_only_and_reads_last_message(tmp_path: Path) -> None:
 
     assert result.ok
     assert result.text == "# TASK\n"
+    assert "--disable" in seen[0]
+    assert seen[0][seen[0].index("--disable") + 1] == "shell_tool"
     assert "--sandbox" in seen[0]
     assert seen[0][seen[0].index("--sandbox") + 1] == "read-only"
     assert "--output-schema" in seen[0]

@@ -38,6 +38,8 @@ class CodexAgent:
         argv = [
             *self.config.codex,
             "exec",
+            "--disable",
+            "shell_tool",
             "--cd",
             str(self.config.repo_root),
             "--sandbox",
