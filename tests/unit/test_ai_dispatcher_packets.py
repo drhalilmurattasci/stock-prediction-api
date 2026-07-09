@@ -40,6 +40,22 @@ def test_validate_accepts_filled_packet(tmp_path: Path) -> None:
     assert packets.validate_packet(path) == []
 
 
+def test_extract_packet_markdown_accepts_fenced_packet() -> None:
+    text = f"```markdown\n{VALID_PACKET}\n```"
+    assert (
+        packets.extract_packet_markdown(text, packet_type="TASK", dispatch_id="demo")
+        == f"{VALID_PACKET.strip()}\n"
+    )
+
+
+def test_extract_packet_markdown_strips_preamble() -> None:
+    text = f"Here is the packet:\n\n{VALID_PACKET}\n"
+    assert (
+        packets.extract_packet_markdown(text, packet_type="TASK", dispatch_id="demo")
+        == f"{VALID_PACKET.strip()}\n"
+    )
+
+
 def test_finalize_writes_sidecar_and_dry_run_does_not(tmp_path: Path) -> None:
     path = tmp_path / "demo_TASK_x.md"
     path.write_text(VALID_PACKET, encoding="utf-8")

@@ -29,6 +29,7 @@ PacketType = Literal["TASK", "EXEC", "CORRECT"]
 _REQUIRED_HEADER = ("DISPATCH_ID", "AUTHOR", "TIMESTAMP", "RELATED_FILES", "STATUS")
 _REQUIRED_FOOTER = ("HANDOFF_STATUS", "DISPATCH_ID", "NEXT_ROLE", "EXIT_CODE")
 _FIELD_RE = re.compile(r"^-[ \t]+([A-Z][A-Z0-9_]*):[ \t]*(.*)$", re.MULTILINE)
+_FENCE_RE = re.compile(r"```(?:markdown|md)?[ \t]*\r?\n(.*?)\r?\n```", re.DOTALL | re.I)
 _PLACEHOLDER_RE = re.compile(r"<[^>]+>|\bTODO\b|\bFIXME\b|\bTBD\b")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
 
@@ -59,6 +60,28 @@ def sidecar_path(packet_path: Path) -> Path:
 def parse_fields(text: str) -> dict[str, str]:
     """Parse ``- KEY: value`` lines into a dict (last write wins)."""
     return {m.group(1): m.group(2).strip() for m in _FIELD_RE.finditer(text)}
+
+
+def extract_packet_markdown(text: str, *, packet_type: PacketType, dispatch_id: str) -> str:
+    """Extract packet markdown from a model final message.
+
+    The planner is read-only and returns the completed TASK packet as text. In
+    practice models may wrap it in a markdown fence or add a short preamble; we
+    accept only content that contains the requested packet header and dispatch
+    id. Validation still decides whether the extracted packet is usable.
+    """
+    candidates = [match.group(1).strip() for match in _FENCE_RE.finditer(text)]
+    candidates.append(text.strip())
+    header = f"# {packet_type}"
+    for candidate in candidates:
+        start = candidate.find(header)
+        if start == -1:
+            continue
+        packet = candidate[start:].strip()
+        fields = parse_fields(packet)
+        if fields.get("DISPATCH_ID") == dispatch_id:
+            return f"{packet}\n"
+    return f"{text.strip()}\n"
 
 
 def scaffold_packet(

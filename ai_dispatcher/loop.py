@@ -108,6 +108,12 @@ class DispatchLoop:
             plan = self.planner.plan(self._plan_prompt(task, task_packet, revision))
             if not plan.ok:
                 return DispatchResult(task.task_id, "failed", f"plan failed: {plan.error}")
+            task_packet.write_text(
+                packets.extract_packet_markdown(
+                    plan.text, packet_type="TASK", dispatch_id=task.task_id
+                ),
+                encoding="utf-8",
+            )
             problems = packets.validate_packet(task_packet)
             if problems:
                 if revision < self.config.max_plan_revisions:
@@ -271,15 +277,16 @@ class DispatchLoop:
         note = (
             ""
             if revision == 0
-            else " The prior draft failed validation; fill every field concretely."
+            else " The prior draft failed validation; fill every field concretely this time."
         )
         return (
-            f"You are the PLANNER. Fill the TASK packet at `{rel}` for this task and edit "
-            f"NOTHING else.{note}\n\n"
+            f"You are the PLANNER. Return the complete markdown contents for the TASK packet "
+            f"`{rel}` for this task. Do not edit files or run commands.{note}\n\n"
             f"Task {task.task_id}: {task.title}\n\n{task.body}\n\n"
-            "Replace every `<...>` placeholder. RELATED_FILES must list the exact "
-            "repo-relative globs the executor MAY edit (keep it minimal). Set STATUS: ready "
-            "and the footer HANDOFF_STATUS: COMPLETE, NEXT_ROLE: EXECUTOR_AI, EXIT_CODE: 0."
+            "Return ONLY the packet markdown, with no prose before or after it. Replace every "
+            "`<...>` placeholder. RELATED_FILES must list the exact repo-relative paths or globs "
+            "the executor MAY edit (keep it minimal). Set STATUS: ready and the footer "
+            "HANDOFF_STATUS: COMPLETE, NEXT_ROLE: EXECUTOR_AI, EXIT_CODE: 0."
         )
 
     def _gate_prompt(self, task_packet: Path) -> str:

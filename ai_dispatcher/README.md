@@ -11,7 +11,7 @@ the RGE AI-dispatch automation (`A:\rcad\rge`), adapted to this repo's toolchain
 task (armed in dispatch.tasks.md)
    │
    ▼
-[plan]     Codex fills a TASK packet (workspace-write, packet only)
+[plan]     Codex drafts TASK markdown (read-only); dispatcher writes the packet
    │
    ▼
 [gate]     Claude reviews the plan read-only ──► approve / needs_changes / block
@@ -68,7 +68,7 @@ ai_dispatcher/
   agents/
     base.py          AgentResult + tail-anchored marker extraction
     claude_agent.py  executor + plan-gate (claude -p --output-format json)
-    codex_agent.py   planner + controller (codex exec --output-schema; no escalation)
+    codex_agent.py   read-only planner + controller (codex exec; no escalation)
   packets.py         handoff packets (TASK/EXEC/CORRECT) + .meta.json sidecars
   scope_guard.py     git-status snapshot + glob-based out-of-scope detection
   verify.py          CI-parity gate, step-count enforced

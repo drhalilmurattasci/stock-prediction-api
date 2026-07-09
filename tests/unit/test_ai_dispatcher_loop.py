@@ -12,7 +12,6 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from ai_dispatcher import packets
 from ai_dispatcher.agents.base import AgentResult
 from ai_dispatcher.config import default_config
 from ai_dispatcher.loop import DispatchLoop
@@ -44,18 +43,7 @@ class FakePlanner:
         self.glob = glob
 
     def plan(self, _prompt: str) -> AgentResult:
-        packet = packets.latest_packet(
-            self.config.handoffs_dir, dispatch_id=self._current_id(), packet_type="TASK"
-        )
-        assert packet is not None
-        packet.write_text(
-            _VALID_TASK.format(tid=self._current_id(), glob=self.glob), encoding="utf-8"
-        )
-        return AgentResult(ok=True, text="planned")
-
-    def _current_id(self) -> str:
-        newest = max(self.config.handoffs_dir.glob("*_TASK_*.md"), key=lambda p: p.stat().st_mtime)
-        return newest.name.split("_TASK_", 1)[0]
+        return AgentResult(ok=True, text=_VALID_TASK.format(tid="demo", glob=self.glob))
 
 
 class FakeExecutor:

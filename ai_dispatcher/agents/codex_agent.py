@@ -1,4 +1,4 @@
-"""Codex CLI adapter — the planner (fills the TASK packet) and the controller.
+"""Codex CLI adapter — the planner (drafts the TASK packet) and the controller.
 
 The controller runs read-only with structured JSON output (``--output-schema``
 + ``--output-last-message``). Crucially, unlike RGE, an ACL/sandbox failure is
@@ -24,7 +24,12 @@ _ACL_MARKERS = ("permission denied", "access is denied", "sandbox", "operation n
 
 @dataclass(frozen=True)
 class CodexAgent:
-    """Runs Codex for planning (workspace-write) and control (read-only)."""
+    """Runs Codex for planning and control.
+
+    Both are read-only model calls. The dispatcher writes the planner's final
+    TASK markdown into the scaffolded packet itself, which avoids depending on
+    Codex's write sandbox and ensures the planner can never edit product files.
+    """
 
     config: DispatcherConfig
     runner: Runner = run_command
@@ -48,8 +53,11 @@ class CodexAgent:
         return argv
 
     def plan(self, prompt: str) -> AgentResult:
-        """Fill the scaffolded TASK packet (workspace-write, packet only)."""
-        argv = self._argv("workspace-write", schema=None, out_message=None)
+        """Draft the TASK packet content as a read-only final message."""
+        out_message = self.config.ai_dir / "codex-plan-last-message.md"
+        out_message.parent.mkdir(parents=True, exist_ok=True)
+        out_message.unlink(missing_ok=True)
+        argv = self._argv("read-only", schema=None, out_message=out_message)
         outcome = self.runner(
             argv,
             timeout_s=self.config.model_timeout_s,
@@ -61,7 +69,8 @@ class CodexAgent:
             return AgentResult(
                 ok=False, text=outcome.stdout, raw=outcome.stdout, error="codex plan failed"
             )
-        return AgentResult(ok=True, text=outcome.stdout, raw=outcome.stdout)
+        text = out_message.read_text(encoding="utf-8") if out_message.exists() else outcome.stdout
+        return AgentResult(ok=True, text=text, raw=outcome.stdout)
 
     def control(
         self, prompt: str, *, out_message: Path
