@@ -153,15 +153,23 @@ class DispatchLoop:
                 )
             exec_status = execution.markers.get("EXEC_STATUS", "").lower()
             if exec_status != "executed":
-                # Missing / blocked / failed are all terminal: we never proceed
-                # without an explicit execution confirmation.
-                return DispatchResult(
-                    task.task_id,
-                    "blocked",
-                    f"executor reported {exec_status or 'no status'}",
-                    rounds=rnd,
-                )
-
+                exec_packet = None
+                if not exec_status:
+                    exec_packet = self._latest_valid_exec_packet(task.task_id)
+                if exec_packet is not None:
+                    packets.finalize_packet(exec_packet, packet_type="EXEC")
+                    self.log.append(
+                        f"executor status recovered from EXEC packet: {exec_packet.name}"
+                    )
+                else:
+                    # Missing / blocked / failed are all terminal unless the
+                    # executor wrote a valid EXEC packet for this dispatch.
+                    return DispatchResult(
+                        task.task_id,
+                        "blocked",
+                        f"executor reported {exec_status or 'no status'}",
+                        rounds=rnd,
+                    )
             # Preflight guaranteed a clean base, so the FULL current dirty set is
             # this dispatch's cumulative change (planning + every round). Scope-
             # check and publish-cover the whole set — never a per-round delta.
@@ -267,6 +275,19 @@ class DispatchLoop:
         globs = parse_scope_globs(fields.get("RELATED_FILES", ""))
         globs.append(f"{self.config.handoffs_dirname}/**")
         return globs
+
+    def _latest_valid_exec_packet(self, dispatch_id: str) -> Path | None:
+        packet = packets.latest_packet(
+            self.config.handoffs_dir, dispatch_id=dispatch_id, packet_type="EXEC"
+        )
+        if packet is None or packets.validate_packet(packet):
+            return None
+        fields = packets.parse_fields(packet.read_text(encoding="utf-8"))
+        if fields.get("EXIT_CODE") != "0":
+            return None
+        if fields.get("HANDOFF_STATUS", "").upper() != "COMPLETE":
+            return None
+        return packet
 
     def _write_correction(self, task: Task, run_dir: Path, rnd: int, reason: str) -> Path:
         packet = packets.scaffold_packet(

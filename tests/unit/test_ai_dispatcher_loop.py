@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from ai_dispatcher import packets
 from ai_dispatcher.agents.base import AgentResult
 from ai_dispatcher.config import default_config
 from ai_dispatcher.loop import DispatchLoop
@@ -211,6 +212,56 @@ def test_missing_exec_status_is_terminal(tmp_path: Path) -> None:
     )
     result = loop.run(TASK)
     assert result.status == "blocked"
+
+
+def test_missing_exec_status_recovers_from_valid_exec_packet(tmp_path: Path) -> None:
+    config = default_config(tmp_path)
+
+    class PacketOnlyExecutor(FakeExecutor):
+        def execute(self, _prompt: str) -> AgentResult:
+            packet = packets.scaffold_packet(
+                config.handoffs_dir,
+                dispatch_id="demo",
+                packet_type="EXEC",
+                author="executor:claude",
+            )
+            packet.write_text(
+                """# EXEC - demo
+
+- DISPATCH_ID: demo
+- AUTHOR: executor:claude
+- TIMESTAMP: 2026-07-09_10-00-00+0300
+- RELATED_FILES: `docs/**`
+- STATUS: complete
+
+## Summary
+
+done
+
+- HANDOFF_STATUS: COMPLETE
+- DISPATCH_ID: demo
+- NEXT_ROLE: CONTROLLER_AI
+- EXIT_CODE: 0
+""",
+                encoding="utf-8",
+            )
+            return AgentResult(ok=True, text="", markers={})
+
+    loop = DispatchLoop(
+        config,
+        planner=FakePlanner(config),  # type: ignore[arg-type]
+        executor=PacketOnlyExecutor(),  # type: ignore[arg-type]
+        controller=FakeController(["pass"]),  # type: ignore[arg-type]
+        git=FakeGit(["", " M docs/x.md"]),
+        verify_runner=FakeVerify(),
+    )
+
+    result = loop.run(TASK)
+
+    assert result.status == "passed"
+    exec_packet = packets.latest_packet(config.handoffs_dir, dispatch_id="demo", packet_type="EXEC")
+    assert exec_packet is not None
+    assert packets.is_finalized(exec_packet)
 
 
 def test_trimmed_verify_gate_is_not_publishable(tmp_path: Path) -> None:
