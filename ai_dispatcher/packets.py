@@ -32,6 +32,7 @@ _FIELD_RE = re.compile(r"^-[ \t]+([A-Z][A-Z0-9_]*):[ \t]*(.*)$", re.MULTILINE)
 _FENCE_RE = re.compile(r"```(?:markdown|md)?[ \t]*\r?\n(.*?)\r?\n```", re.DOTALL | re.I)
 _PLACEHOLDER_RE = re.compile(r"<[^>]+>|\bTODO\b|\bFIXME\b|\bTBD\b")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+_RELATED_FILE_DELIMITER_RE = re.compile(r"[`,\s]")
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,11 @@ def sidecar_path(packet_path: Path) -> Path:
 def parse_fields(text: str) -> dict[str, str]:
     """Parse ``- KEY: value`` lines into a dict (last write wins)."""
     return {m.group(1): m.group(2).strip() for m in _FIELD_RE.finditer(text)}
+
+
+def _escape_packet_field_lines(text: str) -> str:
+    """Keep free text from being parsed as packet header/footer fields."""
+    return "\n".join(f"> {line}" if _FIELD_RE.match(line) else line for line in text.splitlines())
 
 
 def extract_packet_markdown(text: str, *, packet_type: PacketType, dispatch_id: str) -> str:
@@ -108,10 +114,14 @@ def render_task_packet_from_plan_json(plan_text: str, *, scaffold_path: Path) ->
     related_files = [str(item).strip() for item in related]
     if any(not item for item in related_files):
         raise ValueError("planner JSON related_files cannot contain empty values")
+    if any(_RELATED_FILE_DELIMITER_RE.search(item) for item in related_files):
+        raise ValueError("planner JSON related_files entries must be single scope tokens")
     goal = str(data.get("goal", "")).strip()
     if not goal:
         raise ValueError("planner JSON goal cannot be empty")
     notes = str(data.get("notes", "")).strip() or "No additional notes."
+    goal = _escape_packet_field_lines(goal)
+    notes = _escape_packet_field_lines(notes)
     related_inline = ", ".join(f"`{item}`" for item in related_files)
     author = scaffold_fields.get("AUTHOR", "planner:codex")
     timestamp = scaffold_fields.get("TIMESTAMP", _timestamp())

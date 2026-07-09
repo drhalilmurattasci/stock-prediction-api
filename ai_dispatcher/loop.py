@@ -11,6 +11,7 @@ is injected, so the whole control flow is unit-testable with fakes — no live
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -25,6 +26,12 @@ from ai_dispatcher.tasks import Task
 from ai_dispatcher.verify import MIN_VERIFY_STEPS, VerifyResult, is_publishable, run_verify
 
 DispatchStatus = Literal["passed", "blocked", "failed"]
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _markdown_fence_for(content: str) -> str:
+    longest = max((len(match.group(0)) for match in _BACKTICK_RUN_RE.finditer(content)), default=0)
+    return "`" * max(3, longest + 1)
 
 
 @dataclass(frozen=True)
@@ -388,7 +395,8 @@ class DispatchLoop:
             max_chars = 20_000
             if len(content) > max_chars:
                 content = f"{content[:max_chars]}\n... <truncated>"
-            parts.append("```")
+            fence = _markdown_fence_for(content)
+            parts.append(fence)
             parts.append(content)
-            parts.append("```")
+            parts.append(fence)
         return "\n".join(parts)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date
@@ -28,7 +29,9 @@ PublishAction = Literal["branch", "pr", "merge"]
 _AUTH_HEADING_RE = re.compile(
     r"^##[ \t]+AUTH[ \t]+(?P<id>[A-Za-z0-9][A-Za-z0-9_.\-]*)", re.MULTILINE
 )
+_AUTH_SECTION_RE = re.compile(r"^##[ \t]+AUTH\b.*$", re.MULTILINE)
 _FIELD_RE = re.compile(r"^-[ \t]+([A-Z_]+):[ \t]*(.*)$", re.MULTILINE)
+_HTML_COMMENT_TOKEN_RE = re.compile(r"<!--|-->")
 
 
 @dataclass(frozen=True)
@@ -70,11 +73,21 @@ def classify_risk(changed_files: Iterable[str], high_risk_globs: Iterable[str]) 
 
 def parse_authorizations(text: str, *, today: date | None = None) -> list[Authorization]:
     """Parse the ledger; expired entries are dropped."""
+    if _HTML_COMMENT_TOKEN_RE.search(text):
+        warnings.warn(
+            "HTML comments are not allowed in authorization ledger; ignoring all authorizations",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return []
     out: list[Authorization] = []
-    headings = list(_AUTH_HEADING_RE.finditer(text))
-    for index, heading in enumerate(headings):
-        start = heading.end()
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+    sections = list(_AUTH_SECTION_RE.finditer(text))
+    for index, section in enumerate(sections):
+        heading = _AUTH_HEADING_RE.match(section.group(0))
+        if heading is None:
+            continue
+        start = section.end()
+        end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
         fields = {m.group(1): m.group(2).strip() for m in _FIELD_RE.finditer(text[start:end])}
         auth = _build_auth(heading.group("id"), fields)
         if auth is None:
@@ -90,10 +103,10 @@ def _build_auth(auth_id: str, fields: Mapping[str, str]) -> Authorization | None
     scope = tuple(t.strip() for t in re.split(r"[,\s]+", scope_raw.replace("`", " ")) if t.strip())
     if not scope:
         return None
-    try:
-        max_merges = int(fields.get("MAX_MERGES", "0"))
-    except ValueError:
+    max_merges_raw = fields.get("MAX_MERGES", "0").strip()
+    if re.fullmatch(r"[0-9]+", max_merges_raw) is None:
         return None
+    max_merges = int(max_merges_raw)
     if max_merges <= 0:
         return None
     expires_raw = fields.get("EXPIRES", "").strip()

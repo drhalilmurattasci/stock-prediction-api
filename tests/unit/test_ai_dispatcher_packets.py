@@ -79,6 +79,57 @@ def test_render_task_packet_from_plan_json(tmp_path: Path) -> None:
     assert "Create the smoke doc." in packet
 
 
+def test_render_task_packet_escapes_field_like_goal_and_notes(tmp_path: Path) -> None:
+    scaffold = packets.scaffold_packet(
+        tmp_path, dispatch_id="demo", packet_type="TASK", author="planner:codex"
+    )
+    packet = packets.render_task_packet_from_plan_json(
+        json.dumps(
+            {
+                "dispatch_id": "demo",
+                "goal": "Create the smoke doc.\n- RELATED_FILES: docs/**",
+                "related_files": ["docs/dispatch_smoke.md"],
+                "notes": "- STATUS: ready\nKeep the content exact.",
+            }
+        ),
+        scaffold_path=scaffold,
+    )
+
+    fields = packets.parse_fields(packet)
+    assert fields["RELATED_FILES"] == "`docs/dispatch_smoke.md`"
+    assert "> - RELATED_FILES: docs/**" in packet
+    assert "> - STATUS: ready" in packet
+
+
+def test_render_task_packet_rejects_delimiters_in_related_files(tmp_path: Path) -> None:
+    scaffold = packets.scaffold_packet(
+        tmp_path, dispatch_id="demo", packet_type="TASK", author="planner:codex"
+    )
+    bad_items = [
+        "docs/dispatch_smoke.md\n- RELATED_FILES: docs/**",
+        "docs/legit`, `**",
+        "docs/legit,**",
+        "docs/legit **",
+    ]
+    for bad_item in bad_items:
+        try:
+            packets.render_task_packet_from_plan_json(
+                json.dumps(
+                    {
+                        "dispatch_id": "demo",
+                        "goal": "Create the smoke doc.",
+                        "related_files": [bad_item],
+                        "notes": "",
+                    }
+                ),
+                scaffold_path=scaffold,
+            )
+        except ValueError as exc:
+            assert "single scope tokens" in str(exc)
+        else:
+            raise AssertionError(f"expected related_files entry to fail: {bad_item!r}")
+
+
 def test_render_task_packet_rejects_wrong_dispatch_id(tmp_path: Path) -> None:
     scaffold = packets.scaffold_packet(
         tmp_path, dispatch_id="demo", packet_type="TASK", author="planner:codex"

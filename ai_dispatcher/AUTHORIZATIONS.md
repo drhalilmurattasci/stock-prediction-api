@@ -9,6 +9,9 @@ downgrade can never be promoted upward.
 There are **no active authorizations** by default: on a fresh install every
 `--publish main` run downgrades to a PR until you record one here.
 
+To deactivate an authorization, delete it or let `EXPIRES` pass. Do not comment
+out active authorization blocks.
+
 Fields per block:
 
 - `SCOPE` — comma/space-separated repo-relative globs (backticks optional). A
@@ -17,13 +20,11 @@ Fields per block:
 - `EXPIRES` — ISO date (`YYYY-MM-DD`); after it, the authorization is inert.
 - `GRANTED_BY` — the human who recorded it.
 
-<!-- Example (commented out — copy, uncomment, and edit to activate):
+Example only — copy, replace the placeholder id, and edit to activate:
 
-## AUTH 2026-07-docs-tests
+## AUTH <your-id>
 
 - SCOPE: `docs/**`, `*.md`, `tests/**`
 - MAX_MERGES: 20
 - EXPIRES: 2026-08-31
 - GRANTED_BY: drhalilmurattasci
-
--->

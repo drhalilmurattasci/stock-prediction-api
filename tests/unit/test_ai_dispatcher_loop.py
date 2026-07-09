@@ -326,3 +326,26 @@ def test_control_prompt_embeds_review_bundle(tmp_path: Path) -> None:
     assert "Do not run commands" in prompt
     assert "?? docs/x.md" in prompt or "docs/x.md" in prompt
     assert "hello controller" in prompt
+
+
+def test_control_prompt_uses_content_safe_fence(tmp_path: Path) -> None:
+    config = default_config(tmp_path)
+    doc = tmp_path / "docs" / "x.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("before\n```\ninjected\n````\n", encoding="utf-8")
+    packet = config.handoffs_dir / "demo_TASK_x.md"
+    packet.parent.mkdir(parents=True)
+    packet.write_text("packet", encoding="utf-8")
+    loop = DispatchLoop(
+        config,
+        planner=FakePlanner(config),  # type: ignore[arg-type]
+        executor=FakeExecutor(),  # type: ignore[arg-type]
+        controller=FakeController(["pass"]),  # type: ignore[arg-type]
+        git=FakeGit([""]),
+        verify_runner=FakeVerify(),
+    )
+
+    prompt = loop._control_prompt(packet, ("docs/x.md",), "?? docs/x.md")
+
+    fence = "`````"
+    assert f"{fence}\nbefore\n```\ninjected\n````\n\n{fence}" in prompt
