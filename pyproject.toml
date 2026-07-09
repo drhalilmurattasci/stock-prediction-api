@@ -60,7 +60,7 @@ package = false
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["app", "data_sources", "ingestion", "ml", "tests"]
+src = ["app", "ai_dispatcher", "data_sources", "ingestion", "ml", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "C4", "SIM"]
@@ -80,7 +80,7 @@ extend-immutable-calls = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "data_sources", "ingestion", "ml", "tests"]
+known-first-party = ["app", "ai_dispatcher", "data_sources", "ingestion", "ml", "tests"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -89,7 +89,7 @@ ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 check_untyped_defs = true
-files = ["app", "data_sources", "ingestion", "ml"]
+files = ["app", "ai_dispatcher", "data_sources", "ingestion", "ml"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

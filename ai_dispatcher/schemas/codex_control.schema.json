@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ai_dispatcher control review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "summary",
+    "changed_files",
+    "required_fixes",
+    "verification",
+    "commit_readiness"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["pass", "needs_changes", "block"]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "required_fixes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "result"],
+        "properties": {
+          "command": { "type": "string" },
+          "result": { "type": "string" },
+          "exit_code": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "commit_readiness": {
+      "type": "string",
+      "enum": ["ready_for_publish", "not_ready", "no_commit_needed"]
+    }
+  }
+}

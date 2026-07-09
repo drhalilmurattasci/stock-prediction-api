@@ -17,6 +17,12 @@ data/
 mlruns/
 .mlflow/
 
+# ai_dispatcher run state (per-run scratch, sentinels, merge log)
+.ai_dispatch/
+# ai_dispatcher handoff packets are run-local audit artifacts, not committed
+# (keeps the repo lean and keeps packet paths out of the publish change-set)
+ai_dispatcher/handoffs/
+
 # Editors / OS
 .vscode/
 .idea/
