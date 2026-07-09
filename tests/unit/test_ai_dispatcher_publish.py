@@ -282,3 +282,44 @@ def test_publisher_refuses_to_commit_unauthorized_files(tmp_path: Path) -> None:
     )
     assert not outcome.ok
     assert "unauthorized" in outcome.detail
+
+
+def test_publisher_fails_closed_on_unexpected_action(tmp_path: Path) -> None:
+    # H1: _merge_to_main (the only path that pushes origin/main) must be reached
+    # ONLY by an explicit "merge" action. An unexpected/future action must not
+    # fall through to a push — it fails closed with no remote effect.
+    from ai_dispatcher.subprocess_utils import CommandResult
+
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv: Any, **_: Any) -> CommandResult:
+        argv_t = tuple(argv)
+        calls.append(argv_t)
+        stdout = "docs/a.md\n" if ("diff" in argv_t and "--cached" in argv_t) else ""
+        return CommandResult(argv=argv_t, exit_code=0, stdout=stdout, stderr="", duration_s=0.0)
+
+    def run(action: str) -> publish.PublishOutcome:
+        calls.clear()
+        publisher = publish.Publisher(default_config(tmp_path), runner=runner)
+        return publisher.publish(
+            publish.PublishDecision(action, "reason", "docs-auth"),  # type: ignore[arg-type]
+            branch="ai-dispatch/demo",
+            commit_message="msg",
+            title="t",
+            body="b",
+            changed_files=["docs/a.md"],
+        )
+
+    push_main = ("git", "push", "origin", "main")
+
+    # Positive control: a genuine "merge" decision DOES reach the push-to-main path.
+    merged = run("merge")
+    assert merged.ok
+    assert push_main in calls
+
+    # H1: an unrecognized action must NOT push to main and must fail closed.
+    bogus = run("release")  # a hypothetical future/typo'd action publish() doesn't handle
+    assert not bogus.ok
+    assert "unknown publish action" in bogus.detail
+    assert push_main not in calls
+    assert not any("--ff-only" in c for c in calls)

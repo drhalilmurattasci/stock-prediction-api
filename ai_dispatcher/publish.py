@@ -283,7 +283,15 @@ class Publisher:
             return PublishOutcome("branch", True, f"committed on {branch} (local only)")
         if decision.action == "pr":
             return self._open_pr(branch, title, body)
-        return self._merge_to_main(branch)
+        if decision.action == "merge":
+            return self._merge_to_main(branch)
+        # Fail closed: _merge_to_main (the only path that touches origin/main) is
+        # reached ONLY by an explicit "merge" action. An unexpected action — a
+        # future decision value or a bug constructing the decision — must never
+        # fall through to a push; refuse loudly instead of defaulting to merge.
+        return PublishOutcome(
+            decision.action, False, f"unknown publish action {decision.action!r}; refused to merge"
+        )
 
     def _create_branch(self, branch: str) -> CommandResult:
         # Carry the (uncommitted) working-tree changes onto a fresh branch cut
