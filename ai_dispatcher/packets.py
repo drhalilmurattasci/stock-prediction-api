@@ -84,6 +84,66 @@ def extract_packet_markdown(text: str, *, packet_type: PacketType, dispatch_id: 
     return f"{text.strip()}\n"
 
 
+def render_task_packet_from_plan_json(plan_text: str, *, scaffold_path: Path) -> str:
+    """Render canonical TASK markdown from planner JSON.
+
+    Codex planning uses ``--output-schema`` so the model decides bounded intent
+    and scope, while this code owns the wire format. That prevents live model
+    drift from breaking packet headers/footers.
+    """
+    try:
+        data = json.loads(plan_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid planner JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("planner JSON must be an object")
+
+    scaffold_fields = parse_fields(scaffold_path.read_text(encoding="utf-8"))
+    dispatch_id = str(data.get("dispatch_id", "")).strip()
+    if dispatch_id != scaffold_fields.get("DISPATCH_ID"):
+        raise ValueError("planner JSON dispatch_id does not match scaffold")
+    related = data.get("related_files")
+    if not isinstance(related, list) or not related:
+        raise ValueError("planner JSON related_files must be a non-empty list")
+    related_files = [str(item).strip() for item in related]
+    if any(not item for item in related_files):
+        raise ValueError("planner JSON related_files cannot contain empty values")
+    goal = str(data.get("goal", "")).strip()
+    if not goal:
+        raise ValueError("planner JSON goal cannot be empty")
+    notes = str(data.get("notes", "")).strip() or "No additional notes."
+    related_inline = ", ".join(f"`{item}`" for item in related_files)
+    author = scaffold_fields.get("AUTHOR", "planner:codex")
+    timestamp = scaffold_fields.get("TIMESTAMP", _timestamp())
+    return f"""# TASK — {dispatch_id}
+
+- DISPATCH_ID: {dispatch_id}
+- AUTHOR: {author}
+- TIMESTAMP: {timestamp}
+- RELATED_FILES: {related_inline}
+- STATUS: ready
+
+## Goal
+
+{goal}
+
+## Scope
+
+MAY edit: {related_inline}
+MUST NOT edit: any file outside the RELATED_FILES list.
+
+## Notes
+
+{notes}
+
+<!-- machine-footer: filled on completion -->
+- HANDOFF_STATUS: COMPLETE
+- DISPATCH_ID: {dispatch_id}
+- NEXT_ROLE: EXECUTOR_AI
+- EXIT_CODE: 0
+"""
+
+
 def scaffold_packet(
     handoffs_dir: Path,
     *,

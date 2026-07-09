@@ -108,10 +108,16 @@ class DispatchLoop:
             plan = self.planner.plan(self._plan_prompt(task, task_packet, revision))
             if not plan.ok:
                 return DispatchResult(task.task_id, "failed", f"plan failed: {plan.error}")
-            task_packet.write_text(
-                packets.extract_packet_markdown(
+            try:
+                packet_text = packets.render_task_packet_from_plan_json(
+                    plan.text, scaffold_path=task_packet
+                )
+            except ValueError:
+                packet_text = packets.extract_packet_markdown(
                     plan.text, packet_type="TASK", dispatch_id=task.task_id
-                ),
+                )
+            task_packet.write_text(
+                packet_text,
                 encoding="utf-8",
             )
             problems = packets.validate_packet(task_packet)
@@ -280,13 +286,13 @@ class DispatchLoop:
             else " The prior draft failed validation; fill every field concretely this time."
         )
         return (
-            f"You are the PLANNER. Return the complete markdown contents for the TASK packet "
-            f"`{rel}` for this task. Do not edit files or run commands.{note}\n\n"
+            f"You are the PLANNER. Return ONLY the JSON object required by the output schema "
+            f"for TASK packet `{rel}`. Do not edit files or run commands.{note}\n\n"
             f"Task {task.task_id}: {task.title}\n\n{task.body}\n\n"
-            "Return ONLY the packet markdown, with no prose before or after it. Replace every "
-            "`<...>` placeholder. RELATED_FILES must list the exact repo-relative paths or globs "
-            "the executor MAY edit (keep it minimal). Set STATUS: ready and the footer "
-            "HANDOFF_STATUS: COMPLETE, NEXT_ROLE: EXECUTOR_AI, EXIT_CODE: 0."
+            "The `dispatch_id` must exactly match the task id. `related_files` must list the "
+            "exact repo-relative paths or globs the executor MAY edit; keep it minimal. `goal` "
+            "should be one concise paragraph. `notes` should include any acceptance criteria "
+            "the executor and controller need."
         )
 
     def _gate_prompt(self, task_packet: Path) -> str:

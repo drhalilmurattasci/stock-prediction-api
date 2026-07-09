@@ -117,6 +117,10 @@ class DispatcherConfig:
         return self.repo_root / self.handoffs_dirname
 
     @property
+    def plan_schema_path(self) -> Path:
+        return self.repo_root / "ai_dispatcher" / "schemas" / "codex_plan.schema.json"
+
+    @property
     def control_schema_path(self) -> Path:
         return self.repo_root / "ai_dispatcher" / "schemas" / "codex_control.schema.json"
 

@@ -8,6 +8,7 @@ enough to drive the flow, not a faithful git simulation.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,17 @@ class FakePlanner:
         self.glob = glob
 
     def plan(self, _prompt: str) -> AgentResult:
-        return AgentResult(ok=True, text=_VALID_TASK.format(tid="demo", glob=self.glob))
+        return AgentResult(
+            ok=True,
+            text=json.dumps(
+                {
+                    "dispatch_id": "demo",
+                    "goal": "do it",
+                    "related_files": [self.glob],
+                    "notes": "No additional notes.",
+                }
+            ),
+        )
 
 
 class FakeExecutor:

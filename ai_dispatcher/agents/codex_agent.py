@@ -57,7 +57,7 @@ class CodexAgent:
         out_message = self.config.ai_dir / "codex-plan-last-message.md"
         out_message.parent.mkdir(parents=True, exist_ok=True)
         out_message.unlink(missing_ok=True)
-        argv = self._argv("read-only", schema=None, out_message=out_message)
+        argv = self._argv("read-only", schema=self.config.plan_schema_path, out_message=out_message)
         outcome = self.runner(
             argv,
             timeout_s=self.config.model_timeout_s,

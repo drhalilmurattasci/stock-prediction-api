@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from ai_dispatcher import packets
@@ -54,6 +55,50 @@ def test_extract_packet_markdown_strips_preamble() -> None:
         packets.extract_packet_markdown(text, packet_type="TASK", dispatch_id="demo")
         == f"{VALID_PACKET.strip()}\n"
     )
+
+
+def test_render_task_packet_from_plan_json(tmp_path: Path) -> None:
+    scaffold = packets.scaffold_packet(
+        tmp_path, dispatch_id="demo", packet_type="TASK", author="planner:codex"
+    )
+    packet = packets.render_task_packet_from_plan_json(
+        json.dumps(
+            {
+                "dispatch_id": "demo",
+                "goal": "Create the smoke doc.",
+                "related_files": ["docs/dispatch_smoke.md"],
+                "notes": "Keep the content exact.",
+            }
+        ),
+        scaffold_path=scaffold,
+    )
+    scaffold.write_text(packet, encoding="utf-8")
+
+    assert packets.validate_packet(scaffold) == []
+    assert "- RELATED_FILES: `docs/dispatch_smoke.md`" in packet
+    assert "Create the smoke doc." in packet
+
+
+def test_render_task_packet_rejects_wrong_dispatch_id(tmp_path: Path) -> None:
+    scaffold = packets.scaffold_packet(
+        tmp_path, dispatch_id="demo", packet_type="TASK", author="planner:codex"
+    )
+    try:
+        packets.render_task_packet_from_plan_json(
+            json.dumps(
+                {
+                    "dispatch_id": "other",
+                    "goal": "Create the smoke doc.",
+                    "related_files": ["docs/dispatch_smoke.md"],
+                    "notes": "",
+                }
+            ),
+            scaffold_path=scaffold,
+        )
+    except ValueError as exc:
+        assert "dispatch_id" in str(exc)
+    else:
+        raise AssertionError("expected mismatched dispatch id to fail")
 
 
 def test_finalize_writes_sidecar_and_dry_run_does_not(tmp_path: Path) -> None:

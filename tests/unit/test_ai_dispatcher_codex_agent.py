@@ -28,3 +28,9 @@ def test_plan_runs_read_only_and_reads_last_message(tmp_path: Path) -> None:
     assert result.text == "# TASK\n"
     assert "--sandbox" in seen[0]
     assert seen[0][seen[0].index("--sandbox") + 1] == "read-only"
+    assert "--output-schema" in seen[0]
+    assert seen[0][seen[0].index("--output-schema") + 1].endswith(
+        "ai_dispatcher\\schemas\\codex_plan.schema.json"
+    ) or seen[0][seen[0].index("--output-schema") + 1].endswith(
+        "ai_dispatcher/schemas/codex_plan.schema.json"
+    )
