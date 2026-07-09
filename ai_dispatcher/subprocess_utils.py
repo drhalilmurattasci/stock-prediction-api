@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -55,13 +56,28 @@ class CommandResult:
 Runner = Callable[..., CommandResult]
 
 
+def _resolve_executable(name: str) -> str:
+    """Resolve a bare command name to its full path via PATH/PATHEXT.
+
+    On Windows, ``CreateProcess`` (used by ``Popen`` with a list arg) does NOT
+    do PATHEXT resolution, so a bare ``"codex"`` cannot find a ``codex.CMD``
+    npm/scoop shim and fails with ``WinError 2``. ``shutil.which`` finds it, and
+    a full ``.cmd``/``.bat`` path *does* run under ``CreateProcess``. On POSIX
+    this simply returns the resolved binary path. Falls back to the original
+    name (so the error is a clear "not found") when nothing resolves.
+    """
+    resolved = shutil.which(name)
+    return resolved if resolved is not None else name
+
+
 def _spawn(
     argv: Sequence[str], *, cwd: str | None, env: Mapping[str, str] | None
 ) -> subprocess.Popen[str]:
     env_arg = dict(env) if env is not None else None
+    command = [_resolve_executable(argv[0]), *argv[1:]] if argv else list(argv)
     if sys.platform == "win32":
         return subprocess.Popen(
-            list(argv),
+            command,
             cwd=cwd,
             env=env_arg,
             stdin=subprocess.PIPE,
@@ -72,7 +88,7 @@ def _spawn(
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
     return subprocess.Popen(
-        list(argv),
+        command,
         cwd=cwd,
         env=env_arg,
         stdin=subprocess.PIPE,
