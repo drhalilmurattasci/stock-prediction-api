@@ -34,3 +34,12 @@ retry and raise branches with a bound-task stub. MAY edit:
 
 Example of a low-risk, auto-merge-eligible task (touches only docs). Left
 unarmed; arm it and add a matching authorization to try the full path.
+
+## dispatch-smoke-doc: Create a dispatcher smoke-test note
+
+- STATUS: armed
+
+Create `docs/dispatch_smoke.md` with exactly one short line:
+`Dispatcher smoke test passed.`
+
+Do not edit any other files. MAY edit: `docs/dispatch_smoke.md`.
