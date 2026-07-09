@@ -16,9 +16,14 @@ _STATUS_LINE_RE = re.compile(r"^..\s(?P<path>.+)$")
 
 def _glob_to_regex(glob: str) -> re.Pattern[str]:
     escaped = re.escape(glob.replace("\\", "/"))
-    # order matters: collapse ``**`` before single ``*``
-    pattern = escaped.replace(r"\*\*", ".*").replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
-    return re.compile(f"^{pattern}$")
+    # order matters: collapse ``**`` before single ``*``. Exclude newlines from
+    # every wildcard class and anchor with \A..\Z (not ^..$, which would match
+    # around a trailing newline) so a path containing a newline cannot be
+    # over-matched — defense-in-depth beyond the git-status pipeline's escaping.
+    pattern = (
+        escaped.replace(r"\*\*", r"[^\n]*").replace(r"\*", r"[^/\n]*").replace(r"\?", r"[^/\n]")
+    )
+    return re.compile(rf"\A{pattern}\Z")
 
 
 def matches_any(path: str, globs: Iterable[str]) -> bool:

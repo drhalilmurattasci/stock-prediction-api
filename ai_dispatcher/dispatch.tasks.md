@@ -10,7 +10,7 @@ entries to `ai_dispatcher/dispatch.tasks.archive.md`).
 
 Arm a task by setting its `- STATUS:` to `armed`. Nothing runs autonomously
 until you arm it **and** (for auto-merge to `main`) record an authorization in
-`ai_dispatcher/AUTHORIZATIONS.md`.
+`ai_dispatcher/authorizations.json`.
 
 <!-- Task ids become branch names (ai-dispatch/<id>) and dispatch run dirs, so
 keep them short and filesystem-safe: letters, digits, dot, dash, underscore. -->

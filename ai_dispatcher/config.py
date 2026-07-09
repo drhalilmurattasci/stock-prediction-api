@@ -130,7 +130,7 @@ class DispatcherConfig:
 
     @property
     def authorizations_file(self) -> Path:
-        return self.repo_root / "ai_dispatcher" / "AUTHORIZATIONS.md"
+        return self.repo_root / "ai_dispatcher" / "authorizations.json"
 
     @property
     def halt_sentinel(self) -> Path:

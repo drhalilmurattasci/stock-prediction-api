@@ -1,30 +1,60 @@
-# ai_dispatcher — auto-merge authorization ledger
+# ai_dispatcher — auto-merge authorizations
 
-Append-only. Each `## AUTH <id>` block authorizes the dispatcher to auto-merge
-verified changes to `main` **only** when every changed file falls within the
-declared `SCOPE`, up to `MAX_MERGES` merges, until `EXPIRES`. A change not fully
-covered by a live authorization is downgraded to a PR for human review — the
-downgrade can never be promoted upward.
+Authorizations live in **`ai_dispatcher/authorizations.json`** (strict JSON), not
+in this file. This document only explains the format.
 
-There are **no active authorizations** by default: on a fresh install every
-`--publish main` run downgrades to a PR until you record one here.
+An auto-merge to `main` happens **only** when a recorded, non-expired,
+non-exhausted authorization covers **every** changed file. Anything else
+downgrades to a PR for human review — the downgrade can never be promoted
+upward. On a fresh install the store is empty (`{"authorizations": []}`), so
+every `--publish main` run downgrades to a PR until you record one.
 
-To deactivate an authorization, delete it or let `EXPIRES` pass. Do not comment
-out active authorization blocks.
+## Why JSON, not markdown
 
-Fields per block:
+An earlier free-form markdown ledger repeatedly failed **open** across audits — a
+commented-out example parsed as live, embedded/bookended HTML comments
+resurrected disabled blocks, and duplicate/missing fields silently broadened
+scope or removed expiry. Strict JSON removes that entire attack surface: a real
+parser, mandatory strictly-typed fields, no comments, no prose, no duplicate
+keys. **Every deviation fails closed (zero authorizations).**
 
-- `SCOPE` — comma/space-separated repo-relative globs (backticks optional). A
-  change auto-merges only if EVERY changed file matches one of these.
-- `MAX_MERGES` — hard cap on auto-merges charged to this authorization.
-- `EXPIRES` — ISO date (`YYYY-MM-DD`); after it, the authorization is inert.
-- `GRANTED_BY` — the human who recorded it.
+## Format
 
-Example only — copy, replace the placeholder id, and edit to activate:
+```json
+{
+  "authorizations": [
+    {
+      "id": "docs-q3",
+      "scope": ["docs/**", "*.md"],
+      "max_merges": 20,
+      "expires": "2026-08-31",
+      "granted_by": "drhalilmurattasci"
+    }
+  ]
+}
+```
 
-## AUTH <your-id>
+Every field is **mandatory** and strictly validated. A missing/extra field,
+wrong type, duplicate key, bad date, or malformed entry invalidates the whole
+store — fail closed to zero authorizations:
 
-- SCOPE: `docs/**`, `*.md`, `tests/**`
-- MAX_MERGES: 20
-- EXPIRES: 2026-08-31
-- GRANTED_BY: drhalilmurattasci
+- `id` — short token matching `[A-Za-z0-9][A-Za-z0-9_.-]*`; becomes part of the
+  audit trail.
+- `scope` — non-empty list of repo-relative globs. A change auto-merges only if
+  **every** changed file matches one of these. Glob items may not contain
+  spaces, commas, backticks, or quotes.
+- `max_merges` — positive integer; hard cap on auto-merges charged to this
+  authorization.
+- `expires` — **mandatory** ISO date (`YYYY-MM-DD`); after it, the authorization
+  is inert. There is no "never expires" — omitting or mistyping the key drops the
+  entry.
+- `granted_by` — the human who recorded it (non-empty string).
+
+## Deactivating an authorization
+
+**Delete its entry** or let `expires` pass. There is no comment-out mechanism —
+that ambiguity is exactly what kept failing open.
+
+Note: `ai_dispatcher/**` and `.github/**` never auto-merge even with a covering
+authorization (they always downgrade to a PR), so the dispatcher can never
+auto-merge changes to its own safety logic or CI.

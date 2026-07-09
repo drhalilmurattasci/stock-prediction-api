@@ -1,4 +1,4 @@
-"""Publish layer: risk tiers, authorization ledger, and the merge/PR actions.
+"""Publish layer: risk tiers, authorization store, and the merge/PR actions.
 
 Publishing is deliberately separate from the loop (which never commits). The
 decision is fail-closed: an auto-merge to ``main`` happens only when a recorded,
@@ -26,12 +26,16 @@ RiskTier = Literal["low", "high"]
 PublishMode = Literal["branch", "pr", "main"]
 PublishAction = Literal["branch", "pr", "merge"]
 
-_AUTH_HEADING_RE = re.compile(
-    r"^##[ \t]+AUTH[ \t]+(?P<id>[A-Za-z0-9][A-Za-z0-9_.\-]*)", re.MULTILINE
-)
-_AUTH_SECTION_RE = re.compile(r"^##[ \t]+AUTH\b.*$", re.MULTILINE)
-_FIELD_RE = re.compile(r"^-[ \t]+([A-Z_]+):[ \t]*(.*)$", re.MULTILINE)
-_HTML_COMMENT_TOKEN_RE = re.compile(r"<!--|-->")
+#: A short, filesystem/branch-safe authorization id.
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]*")
+#: The only accepted date spelling for an authorization expiry.
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+#: Non-whitespace characters a single scope glob may never contain.
+_SCOPE_FORBIDDEN = frozenset("`,'\"")
+#: The exact key set the root JSON object must carry.
+_ROOT_KEYS = frozenset({"authorizations"})
+#: The exact key set every authorization entry must carry — no more, no less.
+_AUTH_KEYS = frozenset({"id", "scope", "max_merges", "expires", "granted_by"})
 
 
 @dataclass(frozen=True)
@@ -39,7 +43,7 @@ class Authorization:
     auth_id: str
     scope_globs: tuple[str, ...]
     max_merges: int
-    expires: date | None
+    expires: date
     granted_by: str
 
     def covers(self, changed_files: Sequence[str]) -> bool:
@@ -47,7 +51,7 @@ class Authorization:
         return bool(changed_files) and all(matches_any(f, self.scope_globs) for f in changed_files)
 
     def expired(self, today: date) -> bool:
-        return self.expires is not None and today > self.expires
+        return today > self.expires
 
 
 @dataclass(frozen=True)
@@ -71,55 +75,107 @@ def classify_risk(changed_files: Iterable[str], high_risk_globs: Iterable[str]) 
     return "high" if any(matches_any(f, globs) for f in changed_files) else "low"
 
 
+class _DuplicateKeyError(ValueError):
+    """A JSON object carried a duplicate key — rejected rather than last-wins."""
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKeyError(f"duplicate key: {key!r}")
+        result[key] = value
+    return result
+
+
 def parse_authorizations(text: str, *, today: date | None = None) -> list[Authorization]:
-    """Parse the ledger; expired entries are dropped."""
-    if _HTML_COMMENT_TOKEN_RE.search(text):
+    """Parse the strict-JSON authorization store; anything malformed fails closed.
+
+    The document is ``{"authorizations": [{id, scope[], max_merges, expires,
+    granted_by}, ...]}``. Every field is mandatory and strictly typed. A missing
+    or extra field, a wrong type, a duplicate JSON key, a non-ISO ``expires``, or
+    an unparseable file yields ZERO authorizations — never a partial, broadened,
+    or never-expiring one. To disable an authorization, delete its entry or let
+    ``expires`` pass. This structured format replaces the former free-form
+    markdown ledger, which repeatedly failed *open* (comment and field-parsing
+    ambiguities); JSON removes that entire attack surface.
+    """
+    try:
+        doc = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except (json.JSONDecodeError, _DuplicateKeyError) as exc:
         warnings.warn(
-            "HTML comments are not allowed in authorization ledger; ignoring all authorizations",
+            f"authorization store is not valid strict JSON; ignoring all authorizations ({exc})",
             RuntimeWarning,
             stacklevel=2,
         )
         return []
+    if (
+        not isinstance(doc, dict)
+        or frozenset(doc) != _ROOT_KEYS
+        or not isinstance(doc.get("authorizations"), list)
+    ):
+        return []
+    # Never let the expiry filter be silently skipped: default to the real
+    # today so a caller that forgets ``today`` cannot resurrect expired grants.
+    if today is None:
+        today = date.today()
     out: list[Authorization] = []
-    sections = list(_AUTH_SECTION_RE.finditer(text))
-    for index, section in enumerate(sections):
-        heading = _AUTH_HEADING_RE.match(section.group(0))
-        if heading is None:
-            continue
-        start = section.end()
-        end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
-        fields = {m.group(1): m.group(2).strip() for m in _FIELD_RE.finditer(text[start:end])}
-        auth = _build_auth(heading.group("id"), fields)
+    for entry in doc["authorizations"]:
+        auth = _build_auth(entry)
         if auth is None:
-            continue
-        if today is not None and auth.expired(today):
+            warnings.warn(
+                "authorization store contains an invalid entry; ignoring all authorizations",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return []
+        if auth.expired(today):
             continue
         out.append(auth)
     return out
 
 
-def _build_auth(auth_id: str, fields: Mapping[str, str]) -> Authorization | None:
-    scope_raw = fields.get("SCOPE", "")
-    scope = tuple(t.strip() for t in re.split(r"[,\s]+", scope_raw.replace("`", " ")) if t.strip())
-    if not scope:
+def _build_auth(entry: object) -> Authorization | None:
+    """Validate one JSON authorization entry; return None (fail closed) if invalid."""
+    if not isinstance(entry, dict) or frozenset(entry) != _AUTH_KEYS:
+        return None  # unknown or missing keys -> fail closed
+    auth_id = entry["id"]
+    if not isinstance(auth_id, str) or _ID_RE.fullmatch(auth_id) is None:
         return None
-    max_merges_raw = fields.get("MAX_MERGES", "0").strip()
-    if re.fullmatch(r"[0-9]+", max_merges_raw) is None:
+    scope = entry["scope"]
+    if not isinstance(scope, list) or not scope:
         return None
-    max_merges = int(max_merges_raw)
-    if max_merges <= 0:
+    scope_globs: list[str] = []
+    for item in scope:
+        if not isinstance(item, str):
+            return None
+        glob = item.strip()
+        if not glob or _SCOPE_FORBIDDEN & set(glob) or any(ch.isspace() for ch in glob):
+            return None
+        # ``**`` may only occupy a whole path segment; otherwise e.g. ``docs**``
+        # compiles to ``docs.*`` and matches ``docstore/...`` across directories.
+        if any("**" in segment and segment != "**" for segment in glob.split("/")):
+            return None
+        scope_globs.append(glob)
+    max_merges = entry["max_merges"]
+    if isinstance(max_merges, bool) or not isinstance(max_merges, int) or max_merges <= 0:
         return None
-    expires_raw = fields.get("EXPIRES", "").strip()
+    expires_raw = entry["expires"]
+    if not isinstance(expires_raw, str) or _DATE_RE.fullmatch(expires_raw) is None:
+        return None
     try:
-        expires = date.fromisoformat(expires_raw) if expires_raw else None
+        expires = date.fromisoformat(expires_raw)
     except ValueError:
+        return None
+    granted_by = entry["granted_by"]
+    if not isinstance(granted_by, str) or not granted_by.strip():
         return None
     return Authorization(
         auth_id=auth_id,
-        scope_globs=scope,
+        scope_globs=tuple(scope_globs),
         max_merges=max_merges,
         expires=expires,
-        granted_by=fields.get("GRANTED_BY", "unknown"),
+        granted_by=granted_by.strip(),
     )
 
 

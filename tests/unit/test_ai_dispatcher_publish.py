@@ -1,38 +1,40 @@
-"""Publish-decision, authorization-ledger, and merge-count tests."""
+"""Publish-decision, authorization-store (strict JSON), and merge-count tests."""
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from ai_dispatcher import publish
 from ai_dispatcher.config import DEFAULT_HIGH_RISK_GLOBS, default_config
 
-LEDGER = """# ledger
-
-## AUTH docs-auth
-
-- SCOPE: `docs/**`, `*.md`
-- MAX_MERGES: 5
-- EXPIRES: 2026-12-31
-- GRANTED_BY: me
-
-## AUTH expired-auth
-
-- SCOPE: `app/**`
-- MAX_MERGES: 5
-- EXPIRES: 2020-01-01
-- GRANTED_BY: me
-
-## AUTH no-scope-auth
-
-- MAX_MERGES: 5
-- EXPIRES: 2026-12-31
-"""
-
 TODAY = date(2026, 7, 9)
+
+
+def _auth(**over: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "id": "docs-auth",
+        "scope": ["docs/**", "*.md"],
+        "max_merges": 5,
+        "expires": "2026-12-31",
+        "granted_by": "me",
+    }
+    base.update(over)
+    return base
+
+
+def _ledger(*entries: dict[str, Any]) -> str:
+    return json.dumps({"authorizations": list(entries)})
+
+
+LEDGER = _ledger(
+    _auth(),  # docs-auth (valid)
+    _auth(id="expired-auth", scope=["app/**"], expires="2020-01-01"),  # expired -> dropped
+)
 
 
 def test_classify_risk() -> None:
@@ -40,208 +42,112 @@ def test_classify_risk() -> None:
     assert publish.classify_risk(["docs/x.md"], DEFAULT_HIGH_RISK_GLOBS) == "low"
 
 
-def test_parse_authorizations_drops_expired_and_invalid() -> None:
+def test_parse_drops_expired_and_keeps_valid() -> None:
     auths = publish.parse_authorizations(LEDGER, today=TODAY)
     assert [a.auth_id for a in auths] == ["docs-auth"]
     assert auths[0].scope_globs == ("docs/**", "*.md")
     assert auths[0].max_merges == 5
-
-
-def test_parse_authorizations_fails_closed_on_any_html_comment_markers() -> None:
-    ledger = """# ledger
-
-There are no active authorizations.
-
-<!-- Example block:
-
-## AUTH 2026-07-docs-tests
-
-- SCOPE: `docs/**`, `*.md`, `tests/**`
-- MAX_MERGES: 20
-- EXPIRES: 2026-08-31
-- GRANTED_BY: drhalilmurattasci
-
--->
-"""
-
-    with pytest.warns(RuntimeWarning, match="HTML comments are not allowed"):
-        assert publish.parse_authorizations(ledger, today=TODAY) == []
-
-
-def test_parse_authorizations_ignores_trailing_unclosed_comment() -> None:
-    ledger = """# ledger
-
-<!-- Example accidentally left unclosed:
-
-## AUTH phantom-root
-
-- SCOPE: `**`
-- MAX_MERGES: 99
-- EXPIRES: 2026-12-31
-- GRANTED_BY: example
-"""
-
-    with pytest.warns(RuntimeWarning, match="HTML comments are not allowed"):
-        assert publish.parse_authorizations(ledger, today=TODAY) == []
-
-
-def test_parse_authorizations_fails_closed_on_bookend_comments() -> None:
-    ledger = """# ledger
-
-<!-- disabled; delete wrappers to re-enable -->
-
-## AUTH prod-wide
-
-- SCOPE: `**`
-- MAX_MERGES: 99
-- EXPIRES: 2026-12-31
-- GRANTED_BY: example
-
-<!-- end disabled -->
-"""
-
-    with pytest.warns(RuntimeWarning, match="HTML comments are not allowed"):
-        assert publish.parse_authorizations(ledger, today=TODAY) == []
-
-
-def test_parse_authorizations_fails_closed_when_real_auth_has_comment_elsewhere() -> None:
-    ledger = """# ledger
-
-## AUTH real
-
-- SCOPE: `docs/**`
-- MAX_MERGES: 1
-- EXPIRES: 2026-12-31
-- GRANTED_BY: me
-
-<!-- operator note -->
-"""
-
-    with pytest.warns(RuntimeWarning, match="HTML comments are not allowed"):
-        assert publish.parse_authorizations(ledger, today=TODAY) == []
-
-
-def test_parse_authorizations_fails_closed_on_residual_comment_closer_in_prose() -> None:
-    ledger = """# ledger
-
-<!-- temporarily disabled (remove up to the --> to re-enable)
-
-## AUTH ghost
-
-- SCOPE: `**`
-- MAX_MERGES: 99
-- EXPIRES: 2026-12-31
-- GRANTED_BY: example
-
--->
-"""
-
-    with pytest.warns(RuntimeWarning, match="HTML comments are not allowed"):
-        assert publish.parse_authorizations(ledger, today=TODAY) == []
-
-
-def test_parse_authorizations_fails_closed_on_residual_comment_closer_in_field() -> None:
-    ledger = """# ledger
-
-<!-- disabled auth
-
-- NOTES: remove --> after review
-
-## AUTH ghost2
-
-- SCOPE: `**`
-- MAX_MERGES: 99
-- EXPIRES: 2026-12-31
-- GRANTED_BY: example
-
--->
-"""
-
-    with pytest.warns(RuntimeWarning, match="HTML comments are not allowed"):
-        assert publish.parse_authorizations(ledger, today=TODAY) == []
-
-
-def test_parse_authorizations_allows_real_auth_with_unparseable_example_section() -> None:
-    ledger = """# ledger
-
-## AUTH real
-
-- SCOPE: `docs/**`
-- MAX_MERGES: 1
-- EXPIRES: 2026-12-31
-- GRANTED_BY: me
-
-Example template:
-
-## AUTH <your-id>
-
-- SCOPE: `**`
-- MAX_MERGES: 99
-- EXPIRES: 2026-12-31
-- GRANTED_BY: example
-"""
-
-    auths = publish.parse_authorizations(ledger, today=TODAY)
-
-    assert [auth.auth_id for auth in auths] == ["real"]
-    assert auths[0].scope_globs == ("docs/**",)
-
-
-def test_parse_authorizations_ignores_unparseable_example_without_comments() -> None:
-    ledger = """# ledger
-
-Example template:
-
-## AUTH <your-id>
-
-- SCOPE: `**`
-- MAX_MERGES: 99
-- EXPIRES: 2026-12-31
-- GRANTED_BY: example
-"""
-
-    assert publish.parse_authorizations(ledger, today=TODAY) == []
-
-
-def test_parse_authorizations_rejects_non_digit_max_merges() -> None:
-    ledger = """# ledger
-
-## AUTH underscore
-
-- SCOPE: `docs/**`
-- MAX_MERGES: 1_000
-- EXPIRES: 2026-12-31
-- GRANTED_BY: me
-
-## AUTH plus
-
-- SCOPE: `docs/**`
-- MAX_MERGES: +7
-- EXPIRES: 2026-12-31
-- GRANTED_BY: me
-
-## AUTH valid
-
-- SCOPE: `docs/**`
-- MAX_MERGES: 7
-- EXPIRES: 2026-12-31
-- GRANTED_BY: me
-"""
-
-    assert [auth.auth_id for auth in publish.parse_authorizations(ledger, today=TODAY)] == ["valid"]
-
-
-def test_parse_authorizations_accepts_crlf_active_auth() -> None:
-    ledger = (
-        "# ledger\r\n\r\n"
-        "## AUTH crlf\r\n\r\n"
-        "- SCOPE: `docs/**`\r\n"
-        "- MAX_MERGES: 1\r\n"
-        "- EXPIRES: 2026-12-31\r\n"
-        "- GRANTED_BY: me\r\n"
+    assert auths[0].expires == date(2026, 12, 31)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        _auth(scope="docs/**"),  # scope not a list
+        _auth(scope=[]),  # empty scope
+        _auth(scope=["docs/**", 5]),  # non-str glob
+        _auth(scope=["a, b"]),  # comma delimiter smuggling
+        _auth(scope=["a b"]),  # whitespace in glob
+        _auth(scope=["a\u00a0b"]),  # non-ASCII whitespace in glob
+        _auth(scope=["`x`"]),  # backtick smuggling
+        _auth(max_merges=0),  # non-positive
+        _auth(max_merges=-1),
+        _auth(max_merges=True),  # bool is not a valid int cap
+        _auth(max_merges="5"),  # str, not int
+        _auth(expires="not-a-date"),  # bad date value
+        _auth(expires=20260101),  # non-str
+        _auth(id="bad id"),  # invalid id token
+        {
+            "id": "x",
+            "scope": ["docs/**"],
+            "max_merges": 5,
+            "expires": "2026-12-31",
+        },  # missing granted_by
+        {**_auth(), "extra": 1},  # unknown extra key
+    ],
+)
+def test_parse_fails_closed_on_malformed_entry(bad: dict[str, Any]) -> None:
+    with pytest.warns(RuntimeWarning, match="invalid entry"):
+        assert publish.parse_authorizations(_ledger(bad), today=TODAY) == []
+
+
+def test_parse_fails_closed_for_whole_store_when_any_entry_is_malformed() -> None:
+    with pytest.warns(RuntimeWarning, match="invalid entry"):
+        assert (
+            publish.parse_authorizations(_ledger(_auth(), _auth(scope=["bad scope"])), today=TODAY)
+            == []
+        )
+
+
+def test_missing_expires_is_not_never_expires() -> None:
+    # The markdown bug: a missing/mistyped EXPIRES defaulted to None -> "never
+    # expires". In JSON, expires is mandatory, so its absence drops the entry.
+    entry = {"id": "x", "scope": ["app/**"], "max_merges": 5, "granted_by": "me"}
+    with pytest.warns(RuntimeWarning, match="invalid entry"):
+        assert publish.parse_authorizations(_ledger(entry), today=TODAY) == []
+
+
+def test_duplicate_json_key_fails_closed() -> None:
+    # Two "scope" keys must not last-wins-broaden to '**'.
+    raw = (
+        '{"authorizations":[{"id":"x","scope":["docs/**"],"scope":["**"],'
+        '"max_merges":1,"expires":"2026-12-31","granted_by":"me"}]}'
+    )
+    with pytest.warns(RuntimeWarning):
+        assert publish.parse_authorizations(raw, today=TODAY) == []
+
+
+def test_invalid_json_and_wrong_shape_fail_closed() -> None:
+    with pytest.warns(RuntimeWarning):
+        assert publish.parse_authorizations("not json {", today=TODAY) == []
+    assert publish.parse_authorizations("[]", today=TODAY) == []  # not an object
+    assert publish.parse_authorizations('{"authorizations": {}}', today=TODAY) == []  # not a list
+    assert (
+        publish.parse_authorizations(
+            json.dumps({"authorizations": [_auth()], "comment": "extra root key"}), today=TODAY
+        )
+        == []
     )
 
-    assert [auth.auth_id for auth in publish.parse_authorizations(ledger, today=TODAY)] == ["crlf"]
+
+def test_empty_store_has_no_authorizations() -> None:
+    assert publish.parse_authorizations('{"authorizations": []}', today=TODAY) == []
+
+
+def test_expiry_filter_applies_even_without_explicit_today() -> None:
+    # A caller that forgets ``today`` must NOT resurrect an expired grant; the
+    # filter defaults to the real today (2000 is always in the past).
+    entry = _auth(id="past", expires="2000-01-01")
+    assert publish.parse_authorizations(_ledger(entry)) == []
+
+
+@pytest.mark.parametrize("bad_date", ["20261231", "2026-W53-4", "2026-12-31T00:00:00"])
+def test_expires_must_be_yyyy_mm_dd(bad_date: str) -> None:
+    with pytest.warns(RuntimeWarning, match="invalid entry"):
+        assert publish.parse_authorizations(_ledger(_auth(expires=bad_date)), today=TODAY) == []
+
+
+@pytest.mark.parametrize("bad_scope", [["docs**"], ["**docs"], ["a/**b"], ["x**/y"]])
+def test_scope_double_star_must_occupy_a_full_segment(bad_scope: list[str]) -> None:
+    with pytest.warns(RuntimeWarning, match="invalid entry"):
+        assert publish.parse_authorizations(_ledger(_auth(scope=bad_scope)), today=TODAY) == []
+
+
+def test_scope_double_star_full_segment_forms_are_ok() -> None:
+    auths = publish.parse_authorizations(
+        _ledger(_auth(scope=["docs/**", "**/x", "**"])), today=TODAY
+    )
+    assert len(auths) == 1
 
 
 def test_decide_publish_branch_and_pr_modes() -> None:
@@ -307,18 +213,10 @@ def test_merge_counts_roundtrip(tmp_path: Path) -> None:
     assert publish.merge_counts(config) == {"docs-auth": 2}
 
 
-NEVER_LEDGER = """
-## AUTH self-auth
-
-- SCOPE: `ai_dispatcher/**`
-- MAX_MERGES: 5
-- EXPIRES: 2026-12-31
-- GRANTED_BY: me
-"""
-
-
 def test_never_automerge_forces_pr_even_with_covering_auth() -> None:
-    auths = publish.parse_authorizations(NEVER_LEDGER, today=TODAY)
+    auths = publish.parse_authorizations(
+        _ledger(_auth(id="self-auth", scope=["ai_dispatcher/**"])), today=TODAY
+    )
     decision = publish.decide_publish(
         "main",
         changed_files=["ai_dispatcher/loop.py"],
@@ -365,7 +263,7 @@ def test_only_dispatcher_artifacts_changed_is_a_noop() -> None:
 def test_publisher_refuses_to_commit_unauthorized_files(tmp_path: Path) -> None:
     from ai_dispatcher.subprocess_utils import CommandResult
 
-    def runner(argv, **_):
+    def runner(argv: Any, **_: Any) -> CommandResult:
         argv_t = tuple(argv)
         stdout = ""
         if "diff" in argv_t and "--cached" in argv_t:

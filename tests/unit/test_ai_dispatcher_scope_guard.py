@@ -14,6 +14,17 @@ def test_glob_matching_spans_and_bounds() -> None:
     assert not scope_guard.matches_any("ingestion/x.py", ["app/**"])
 
 
+def test_glob_does_not_over_match_across_newlines() -> None:
+    # defense-in-depth: a wildcard must not consume a newline, and the anchor
+    # must not match around a trailing newline.
+    assert not scope_guard.matches_any("secret.py\nallowed.md", ["*.md"])
+    assert not scope_guard.matches_any("app/x.py\nevil", ["app/**"])
+    assert not scope_guard.matches_any("docs/a.md\n", ["docs/**"])
+    # legit matches still hold
+    assert scope_guard.matches_any("docs/a.md", ["docs/**"])
+    assert scope_guard.matches_any("x.md", ["*.md"])
+
+
 def test_parse_status_porcelain_handles_rename_and_untracked() -> None:
     text = " M app/main.py\n?? ai_dispatcher/handoffs/x.md\nR  old.py -> new/name.py\n"
     paths = scope_guard.parse_status_porcelain(text)

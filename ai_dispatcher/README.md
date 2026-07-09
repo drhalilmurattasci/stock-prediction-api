@@ -75,11 +75,12 @@ ai_dispatcher/
   tasks.py           brief parsing + selection + size guard
   sentinels.py       kill switch, halt, consecutive-failure breaker, seatbelt
   loop.py            the state machine (never commits)
-  publish.py         risk tiers, authorization ledger, merge/PR actions
+  publish.py         risk tiers, authorization store, merge/PR actions
   cli.py             python -m ai_dispatcher <verify|validate-packet|select|loop>
   schemas/           codex_control.schema.json
   dispatch.tasks.md  the armed task brief
-  AUTHORIZATIONS.md  append-only auto-merge authorization ledger
+  authorizations.json  auto-merge authorization store (strict JSON, fail-closed)
+  AUTHORIZATIONS.md  documents the authorizations.json format
   handoffs/          run-local handoff packets (gitignored; created on first run)
 ```
 
@@ -107,7 +108,7 @@ python -m ai_dispatcher loop <task-id> --publish pr
 python -m ai_dispatcher loop <task-id> --publish main
 ```
 
-`--publish main` auto-merges only if `AUTHORIZATIONS.md` has a live entry
+`--publish main` auto-merges only if `authorizations.json` has a live entry
 covering every changed file; otherwise it downgrades to a PR.
 
 ## Requirements
