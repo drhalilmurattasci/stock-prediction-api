@@ -60,8 +60,11 @@ class DispatchLoop:
         result = self.git([*self.config.git, *args], timeout_s=120, cwd=self.config.repo_root)
         return result.stdout
 
+    def _git_status(self) -> str:
+        return self._git_out("status", "--porcelain=v1")
+
     def _status_paths(self) -> set[str]:
-        return parse_status_porcelain(self._git_out("status", "--porcelain=v1"))
+        return parse_status_porcelain(self._git_status())
 
     def _preflight(self) -> str | None:
         """Return a failure reason, or None if the base is clean and synced."""
@@ -162,7 +165,8 @@ class DispatchLoop:
             # Preflight guaranteed a clean base, so the FULL current dirty set is
             # this dispatch's cumulative change (planning + every round). Scope-
             # check and publish-cover the whole set — never a per-round delta.
-            changed = tuple(sorted(self._status_paths()))
+            status_text = self._git_status()
+            changed = tuple(sorted(parse_status_porcelain(status_text)))
             violations = tuple(out_of_scope(changed, allowed))
             if violations:
                 return DispatchResult(
@@ -204,7 +208,8 @@ class DispatchLoop:
 
             control_json = run_dir / f"control.round{rnd}.json"
             control, verdict = self.controller.control(
-                self._control_prompt(task_packet, changed), out_message=control_json
+                self._control_prompt(task_packet, changed, status_text),
+                out_message=control_json,
             )
             if not control.ok or verdict is None:
                 return DispatchResult(
@@ -313,14 +318,56 @@ class DispatchLoop:
             "EXEC_PACKET: <repo-relative path to the EXEC packet you wrote>"
         )
 
-    def _control_prompt(self, task_packet: Path, changed: tuple[str, ...]) -> str:
+    def _control_prompt(self, task_packet: Path, changed: tuple[str, ...], status_text: str) -> str:
         rel = task_packet.relative_to(self.config.repo_root)
         files = ", ".join(changed) or "(none)"
+        bundle = self._review_bundle(changed, status_text)
         return (
             f"You are the CONTROLLER (read-only, independent). Review the change made under "
-            f"TASK packet `{rel}`. Inspect it with `git diff HEAD` and `git status` for tracked "
-            "edits, and read any newly-added (untracked) files directly — plain `git diff` will "
-            f"be empty for added files. Changed files: {files}. Judge correctness, scope, and "
-            "whether it is ready to publish. Return ONLY the JSON object required by the control "
-            "schema."
+            f"TASK packet `{rel}`. Do not run commands, inspect the filesystem, or use tools; "
+            "the full review bundle is supplied below. Judge correctness, scope, and whether it "
+            "is ready to publish. Return ONLY the JSON object required by the control schema.\n\n"
+            f"Changed files: {files}\n\n"
+            f"{bundle}"
         )
+
+    def _review_bundle(self, changed: tuple[str, ...], status_text: str) -> str:
+        diff = ""
+        if changed:
+            diff_result = self.git(
+                [*self.config.git, "diff", "--no-ext-diff", "HEAD", "--", *changed],
+                cwd=self.config.repo_root,
+                timeout_s=60,
+            )
+            diff = (
+                diff_result.stdout if diff_result.ok else f"<git diff failed: {diff_result.stderr}>"
+            )
+
+        parts = [
+            "## git status --short",
+            status_text or "(clean)",
+            "",
+            "## git diff HEAD",
+            diff or "(none)",
+        ]
+        for rel in changed:
+            path = self.config.repo_root / rel
+            parts.extend(["", f"## file: {rel}"])
+            if not path.exists():
+                parts.append("(deleted or missing)")
+                continue
+            if not path.is_file():
+                parts.append("(not a regular file)")
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                parts.append(f"(could not read: {exc})")
+                continue
+            max_chars = 20_000
+            if len(content) > max_chars:
+                content = f"{content[:max_chars]}\n... <truncated>"
+            parts.append("```")
+            parts.append(content)
+            parts.append("```")
+        return "\n".join(parts)

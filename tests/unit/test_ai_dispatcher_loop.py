@@ -251,3 +251,27 @@ def test_control_pass_but_not_ready_does_not_pass(tmp_path: Path) -> None:
     )
     result = loop.run(TASK)
     assert result.status != "passed"
+
+
+def test_control_prompt_embeds_review_bundle(tmp_path: Path) -> None:
+    config = default_config(tmp_path)
+    doc = tmp_path / "docs" / "x.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("hello controller\n", encoding="utf-8")
+    packet = config.handoffs_dir / "demo_TASK_x.md"
+    packet.parent.mkdir(parents=True)
+    packet.write_text("packet", encoding="utf-8")
+    loop = DispatchLoop(
+        config,
+        planner=FakePlanner(config),  # type: ignore[arg-type]
+        executor=FakeExecutor(),  # type: ignore[arg-type]
+        controller=FakeController(["pass"]),  # type: ignore[arg-type]
+        git=FakeGit([""]),
+        verify_runner=FakeVerify(),
+    )
+
+    prompt = loop._control_prompt(packet, ("docs/x.md",), "?? docs/x.md")
+
+    assert "Do not run commands" in prompt
+    assert "?? docs/x.md" in prompt or "docs/x.md" in prompt
+    assert "hello controller" in prompt
