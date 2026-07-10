@@ -10,7 +10,12 @@ from typing import Any
 import pytest
 
 from ai_dispatcher import publish
-from ai_dispatcher.config import DEFAULT_HIGH_RISK_GLOBS, default_config
+from ai_dispatcher.config import (
+    DEFAULT_HIGH_RISK_GLOBS,
+    DEFAULT_NEVER_AUTOMERGE_GLOBS,
+    default_config,
+)
+from ai_dispatcher.scope_guard import matches_any
 
 TODAY = date(2026, 7, 9)
 
@@ -203,6 +208,73 @@ def test_decide_publish_main_merges_only_when_fully_covered() -> None:
         high_risk_globs=DEFAULT_HIGH_RISK_GLOBS,
     )
     assert exhausted.action == "pr"
+
+
+def test_step6_doc_smoke_authorization_acceptance_shape() -> None:
+    auth_id = "step6-doc-smoke"
+    changed = ["docs/step6_smoke.md"]
+    auths = publish.parse_authorizations(
+        _ledger(
+            _auth(
+                id=auth_id,
+                scope=["docs/step6_smoke.md"],
+                max_merges=1,
+                expires="2026-07-17",
+                granted_by="drhalilmurattasci",
+            )
+        ),
+        today=date(2026, 7, 10),
+    )
+
+    assert len(auths) == 1
+    assert auths[0].auth_id == auth_id
+    assert auths[0].scope_globs == ("docs/step6_smoke.md",)
+    assert auths[0].max_merges == 1
+    assert auths[0].expires == date(2026, 7, 17)
+    assert auths[0].granted_by == "drhalilmurattasci"
+    assert publish.classify_risk(changed, DEFAULT_HIGH_RISK_GLOBS) == "low"
+    assert not matches_any(changed[0], DEFAULT_NEVER_AUTOMERGE_GLOBS)
+
+    fresh = publish.decide_publish(
+        "main",
+        changed_files=changed,
+        authorizations=auths,
+        used_counts={},
+        high_risk_globs=DEFAULT_HIGH_RISK_GLOBS,
+        never_automerge_globs=DEFAULT_NEVER_AUTOMERGE_GLOBS,
+    )
+    assert fresh.action == "merge"
+    assert fresh.auth_id == auth_id
+
+    exhausted = publish.decide_publish(
+        "main",
+        changed_files=changed,
+        authorizations=auths,
+        used_counts={auth_id: 1},
+        high_risk_globs=DEFAULT_HIGH_RISK_GLOBS,
+        never_automerge_globs=DEFAULT_NEVER_AUTOMERGE_GLOBS,
+    )
+    assert exhausted.action == "pr"
+
+    sibling = publish.decide_publish(
+        "main",
+        changed_files=["docs/other.md"],
+        authorizations=auths,
+        used_counts={},
+        high_risk_globs=DEFAULT_HIGH_RISK_GLOBS,
+        never_automerge_globs=DEFAULT_NEVER_AUTOMERGE_GLOBS,
+    )
+    assert sibling.action == "pr"
+
+    partial = publish.decide_publish(
+        "main",
+        changed_files=[*changed, "docs/other.md"],
+        authorizations=auths,
+        used_counts={},
+        high_risk_globs=DEFAULT_HIGH_RISK_GLOBS,
+        never_automerge_globs=DEFAULT_NEVER_AUTOMERGE_GLOBS,
+    )
+    assert partial.action == "pr"
 
 
 def test_merge_counts_roundtrip(tmp_path: Path) -> None:

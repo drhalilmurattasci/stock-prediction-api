@@ -37,9 +37,18 @@ unarmed; arm it and add a matching authorization to try the full path.
 
 ## dispatch-smoke-doc: Create a dispatcher smoke-test note
 
-- STATUS: armed
+- STATUS: done
 
 Create `docs/dispatch_smoke.md` with exactly one short line:
 `Dispatcher smoke test passed.`
 
 Do not edit any other files. MAY edit: `docs/dispatch_smoke.md`.
+
+## step6-doc-smoke: Create the authorized merge smoke-test note
+
+- STATUS: armed
+
+Create `docs/step6_smoke.md` with exactly one short line:
+`Dispatcher step 6 smoke test passed.`
+
+Do not edit any other files. MAY edit: `docs/step6_smoke.md`.
