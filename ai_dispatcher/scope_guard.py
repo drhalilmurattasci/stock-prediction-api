@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
-_STATUS_LINE_RE = re.compile(r"^..\s(?P<path>.+)$")
+_STATUS_LINE_RE = re.compile(r"^(?P<xy>..)\s(?P<path>.+)$")
 
 
 def _glob_to_regex(glob: str) -> re.Pattern[str]:
@@ -35,7 +35,10 @@ def matches_any(path: str, globs: Iterable[str]) -> bool:
 def parse_status_porcelain(text: str) -> set[str]:
     """Parse ``git status --porcelain=v1`` output into a set of paths.
 
-    Rename entries (``old -> new``) contribute the destination path.
+    Rename/copy entries (status ``R``/``C``, formatted ``ORIG -> PATH``)
+    contribute the destination path. Every other status keeps its literal path,
+    which may itself contain ``" -> "`` — so the arrow split is gated on the
+    status code, never applied blindly.
     """
     paths: set[str] = set()
     for raw in text.splitlines():
@@ -44,8 +47,11 @@ def parse_status_porcelain(text: str) -> set[str]:
         match = _STATUS_LINE_RE.match(raw)
         if match is None:
             continue
+        xy = match.group("xy")
         path = match.group("path").strip()
-        if " -> " in path:
+        # Only rename/copy ("R"/"C") entries use the "ORIG -> PATH" form; for any
+        # other status a " -> " is part of the literal filename and must be kept.
+        if ("R" in xy or "C" in xy) and " -> " in path:
             path = path.split(" -> ", 1)[1].strip()
         path = path.strip('"')
         if path:

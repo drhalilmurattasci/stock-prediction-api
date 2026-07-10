@@ -31,6 +31,19 @@ def test_parse_status_porcelain_handles_rename_and_untracked() -> None:
     assert paths == {"app/main.py", "ai_dispatcher/handoffs/x.md", "new/name.py"}
 
 
+def test_parse_status_keeps_arrow_in_non_rename_filenames() -> None:
+    # H2: only R/C entries are "ORIG -> PATH". A modified/untracked file whose
+    # literal name contains " -> " must NOT be split down to its suffix, which
+    # would evade the scope guard / authorization coverage on the real path.
+    text = (
+        " M weird -> name.py\n"  # modified file literally named "weird -> name.py"
+        "?? docs/a -> b.md\n"  # untracked file with an arrow in its name
+        "R  old.py -> new/name.py\n"  # a genuine rename still yields the destination
+    )
+    paths = scope_guard.parse_status_porcelain(text)
+    assert paths == {"weird -> name.py", "docs/a -> b.md", "new/name.py"}
+
+
 def test_out_of_scope_flags_only_disallowed_paths() -> None:
     changed = ["docs/a.md", "app/secret.py", "tests/test_x.py"]
     allowed = ["docs/**", "tests/**"]
