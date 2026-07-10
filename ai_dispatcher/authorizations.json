@@ -1,11 +1,3 @@
 {
-  "authorizations": [
-    {
-      "id": "step6-doc-smoke",
-      "scope": ["docs/step6_smoke.md"],
-      "max_merges": 1,
-      "expires": "2026-07-17",
-      "granted_by": "drhalilmurattasci"
-    }
-  ]
+  "authorizations": []
 }
