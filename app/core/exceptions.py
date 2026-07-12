@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -51,12 +53,17 @@ def _envelope(
     message: str,
     status_code: int,
     details: object | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
     request_id = getattr(request.state, "request_id", None)
     body = ErrorResponse(
         error=ErrorBody(code=code, message=message, request_id=request_id, details=details)
     )
-    return JSONResponse(status_code=status_code, content=body.model_dump(mode="json"))
+    return JSONResponse(
+        status_code=status_code,
+        content=body.model_dump(mode="json"),
+        headers=headers,
+    )
 
 
 def install_exception_handlers(app: FastAPI) -> None:
@@ -77,6 +84,7 @@ def install_exception_handlers(app: FastAPI) -> None:
             code="http_error",
             message=str(exc.detail),
             status_code=exc.status_code,
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)

@@ -19,10 +19,18 @@ async def require_api_key(
 ) -> str:
     """Validate the ``X-API-Key`` header against configured keys.
 
-    When no keys are configured (local/dev) anonymous access is allowed.
+    When no keys are configured, anonymous access is allowed only in local/test
+    environments. Staging and production fail closed instead of silently
+    exposing product endpoints when deployment configuration is incomplete.
     """
     allowed = settings.api_key_set
     if not allowed:
+        if settings.app_env in {"staging", "production"}:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="API key authentication is not configured.",
+                headers={"WWW-Authenticate": API_KEY_HEADER},
+            )
         return x_api_key or "anonymous"
     if x_api_key is None or x_api_key not in allowed:
         raise HTTPException(

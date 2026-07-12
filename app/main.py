@@ -65,6 +65,11 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = settings
+    # Make the resolved settings authoritative for settings-based dependencies
+    # (e.g. require_api_key), not just app.state: a settings object passed to the
+    # factory must be what Depends(get_settings) returns, or auth/config wired
+    # through the DI graph would silently read the env-cached defaults instead.
+    app.dependency_overrides[get_settings] = lambda: settings
     if readiness_probes is not None:
         app.state.readiness_probes = tuple(readiness_probes)
 
