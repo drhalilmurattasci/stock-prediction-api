@@ -16,14 +16,32 @@ from sqlalchemy.ext.asyncio import (
 from app.config import Settings
 
 
-def build_engine(settings: Settings) -> AsyncEngine:
-    """Build an async SQLAlchemy engine from runtime settings."""
+def statement_timeout_connect_args(statement_timeout_ms: int | None) -> dict[str, object]:
+    """asyncpg connect args enforcing a per-statement server-side timeout.
+
+    Returns ``{}`` when disabled (``None`` or non-positive). Postgres then
+    cancels any single statement exceeding the budget, so a pathological scan
+    (e.g. a filter the indexes cannot bound) cannot pin the database.
+    """
+    if statement_timeout_ms is None or statement_timeout_ms <= 0:
+        return {}
+    return {"server_settings": {"statement_timeout": str(statement_timeout_ms)}}
+
+
+def build_engine(settings: Settings, *, statement_timeout_ms: int | None = None) -> AsyncEngine:
+    """Build an async SQLAlchemy engine from runtime settings.
+
+    ``statement_timeout_ms`` is opt-in per engine: the API's request-serving
+    engine passes its budget, while ingestion/migration engines omit it so
+    long-running batch transactions are never capped by the read budget.
+    """
     return create_async_engine(
         settings.database_url,
         pool_pre_ping=True,
         pool_size=settings.database_pool_size,
         max_overflow=settings.database_max_overflow,
         pool_timeout=settings.database_pool_timeout,
+        connect_args=statement_timeout_connect_args(statement_timeout_ms),
         future=True,
     )
 

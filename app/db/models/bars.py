@@ -36,6 +36,22 @@ class Bar(Base):
         CheckConstraint("low <= open AND low <= close", name="low_lte_open_close"),
         Index("ix_bars_symbol_ts", "symbol", "ts"),
         Index("ix_bars_source_as_of", "source", "as_of"),
+        # Covering series index: every equality column of the /v1/prices read
+        # (and the upsert conflict key) ahead of ``ts``, so a bounded
+        # ``ORDER BY ts DESC LIMIT n`` is a pure index range (Postgres walks a
+        # btree backwards for DESC). Without it the PK only covers the
+        # (symbol, timespan, multiplier) prefix — source/adjustment_basis sit
+        # AFTER ts — so a sparse/absent series degrades to scanning the whole
+        # prefix across every hypertable chunk and LIMIT stops bounding work.
+        Index(
+            "ix_bars_series_ts",
+            "symbol",
+            "timespan",
+            "multiplier",
+            "source",
+            "adjustment_basis",
+            "ts",
+        ),
     )
 
     symbol: Mapped[str] = mapped_column(String(32), primary_key=True)

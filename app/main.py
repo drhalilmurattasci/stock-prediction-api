@@ -35,7 +35,9 @@ async def lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     configure_logging(settings.log_level, json_logs=settings.is_production)
     init_sentry(settings)
-    app.state.engine = build_engine(settings)
+    app.state.engine = build_engine(
+        settings, statement_timeout_ms=settings.api_statement_timeout_ms
+    )
     app.state.sessionmaker = build_sessionmaker(app.state.engine)
     app.state.redis_cache = aioredis.from_url(
         settings.redis_cache_url,

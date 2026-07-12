@@ -6,15 +6,24 @@ are Phase 4/5 work per STOCK_API_MASTER_PLAN.md.
 
 from __future__ import annotations
 
-from fastapi import Depends, Header, HTTPException, status
+from typing import Annotated
+
+from fastapi import Depends, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 
 from app.config import Settings, get_settings
 
 API_KEY_HEADER = "X-API-Key"
+api_key_scheme = APIKeyHeader(
+    name=API_KEY_HEADER,
+    scheme_name="ApiKeyAuth",
+    description="API key for versioned product endpoints.",
+    auto_error=False,
+)
 
 
 async def require_api_key(
-    x_api_key: str | None = Header(default=None, alias=API_KEY_HEADER),
+    x_api_key: Annotated[str | None, Security(api_key_scheme)],
     settings: Settings = Depends(get_settings),
 ) -> str:
     """Validate the ``X-API-Key`` header against configured keys.
