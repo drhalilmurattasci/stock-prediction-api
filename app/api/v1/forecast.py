@@ -1,19 +1,18 @@
 """/v1/forecast endpoints: probabilistic forecasts with calibrated intervals.
 
 The Pydantic request/response contract is locked early so model work can evolve
-behind a stable API surface. Runtime implementation is planned for Phase 3; the
-routes intentionally return HTTP 501 until then.
+behind a stable API surface. Both routes delegate through an injectable service;
+the default remains fail-closed until immutable snapshot resolution exists.
 """
 
 from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, Path, Query
+from fastapi import APIRouter, Depends, Header, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AwareDatetime, ValidationError
 
-from app.core.exceptions import NotImplementedYet
 from app.schemas.common import ErrorResponse
 from app.schemas.forecast import (
     Coverage,
@@ -23,6 +22,7 @@ from app.schemas.forecast import (
     ForecastResponse,
     ForecastTarget,
 )
+from app.services.forecasting import ForecastService, get_forecast_service
 
 router = APIRouter(prefix="/forecast", tags=["forecast"])
 
@@ -38,7 +38,7 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     "/{symbol}",
     response_model=ForecastResponse,
     responses=ERROR_RESPONSES,
-    summary="Probabilistic forecast for a symbol (contract only)",
+    summary="Probabilistic forecast for a symbol",
 )
 async def get_forecast(
     symbol: Annotated[
@@ -50,6 +50,7 @@ async def get_forecast(
             description="Canonical symbol accepted by the API, e.g. AAPL.",
         ),
     ],
+    service: Annotated[ForecastService, Depends(get_forecast_service)],
     horizon: Annotated[
         int,
         Query(ge=1, le=252, description="Number of forecast steps to return."),
@@ -101,23 +102,18 @@ async def get_forecast(
         request = ForecastRequest.model_validate(request_data)
     except ValidationError as exc:
         raise RequestValidationError(exc.errors()) from exc
-    raise NotImplementedYet(
-        f"/v1/forecast/{request.symbol} is planned for Phase 3.",
-        details={
-            "contract": "ForecastResponse",
-            "request": request.model_dump(mode="json"),
-        },
-    )
+    return await service.forecast(request)
 
 
 @router.post(
     "",
     response_model=ForecastResponse,
     responses=ERROR_RESPONSES,
-    summary="Create a snapshot-pinned probabilistic forecast (contract only)",
+    summary="Create a snapshot-pinned probabilistic forecast",
 )
 async def create_forecast(
     request: ForecastRequest,
+    service: Annotated[ForecastService, Depends(get_forecast_service)],
     idempotency_key: Annotated[
         str | None,
         Header(
@@ -128,10 +124,4 @@ async def create_forecast(
         ),
     ] = None,
 ) -> ForecastResponse:
-    raise NotImplementedYet(
-        f"POST /v1/forecast for {request.symbol} is planned for Phase 3.",
-        details={
-            "contract": "ForecastRequest -> ForecastResponse",
-            "idempotency_key": idempotency_key,
-        },
-    )
+    return await service.forecast(request, idempotency_key=idempotency_key)
