@@ -55,7 +55,13 @@ class CostBudgetExceeded(ProviderError):
 
 # --- DTOs -------------------------------------------------------------------
 class _DTO(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
+    # allow_inf_nan=False: a NaN/Infinity from a vendor payload must be rejected
+    # at ingestion. Postgres CHECK constraints alone cannot be trusted for this
+    # (NaN compares greater-than-everything there), and a stored non-finite
+    # value would 500 every read of its page (the read contract is finite-only).
+    model_config = ConfigDict(
+        frozen=True, extra="forbid", str_strip_whitespace=True, allow_inf_nan=False
+    )
 
 
 class OHLCVBar(_DTO):

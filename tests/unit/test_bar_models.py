@@ -71,3 +71,22 @@ def test_bars_series_index_puts_every_equality_column_before_ts():
         'BAR_SERIES_INDEX = ("symbol", "timespan", "multiplier", "source", '
         '"adjustment_basis", "ts")'
     ) in migration
+
+
+def test_bars_reject_non_finite_values_at_the_storage_layer():
+    # Postgres treats NaN as greater than everything (NaN >= 0 is TRUE), so the
+    # nonnegativity CHECKs cannot exclude NaN/+Infinity; `col < 'Infinity'` is
+    # FALSE for both. A stored non-finite value would 500 every finite-only
+    # /v1/prices read of its page, so storage must refuse it outright.
+    constraint_names = {str(c.name) for c in Bar.__table__.constraints}
+    assert {"ck_bars_ohlcv_finite", "ck_bars_vwap_finite"} <= constraint_names
+    finite = next(c for c in Bar.__table__.constraints if str(c.name) == "ck_bars_ohlcv_finite")
+    for column in ("open", "high", "low", "close", "volume"):
+        assert f"{column} < 'Infinity'::float8" in str(finite.sqltext)
+
+    migration = Path("migrations/versions/0004_bars_finiteness.py").read_text(encoding="utf-8")
+    assert '"0003_bars_series_index"' in migration  # chains onto the index migration
+    assert "ck_bars_ohlcv_finite" in migration
+    assert "ck_bars_vwap_finite" in migration
+    assert "volume < 'Infinity'::float8" in migration
+    assert "vwap IS NULL OR vwap < 'Infinity'::float8" in migration

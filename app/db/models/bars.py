@@ -29,7 +29,19 @@ class Bar(Base):
             "open >= 0 AND high >= 0 AND low >= 0 AND close >= 0 AND volume >= 0",
             name="ohlcv_nonnegative",
         ),
+        # Finiteness: Postgres orders NaN GREATER than every value (NaN >= 0 is
+        # TRUE, NaN = NaN is TRUE), so the nonnegativity checks above cannot
+        # exclude NaN/+Infinity — but the finite-only read contract would 500 on
+        # such a row. ``col < 'Infinity'`` is FALSE for both NaN and +Infinity
+        # (and -Infinity already fails ``>= 0``), giving finite-nonnegative.
+        CheckConstraint(
+            "open < 'Infinity'::float8 AND high < 'Infinity'::float8 "
+            "AND low < 'Infinity'::float8 AND close < 'Infinity'::float8 "
+            "AND volume < 'Infinity'::float8",
+            name="ohlcv_finite",
+        ),
         CheckConstraint("vwap IS NULL OR vwap >= 0", name="vwap_nonnegative"),
+        CheckConstraint("vwap IS NULL OR vwap < 'Infinity'::float8", name="vwap_finite"),
         CheckConstraint("trade_count IS NULL OR trade_count >= 0", name="trade_count_nonnegative"),
         CheckConstraint("high >= low", name="high_gte_low"),
         CheckConstraint("high >= open AND high >= close", name="high_gte_open_close"),
