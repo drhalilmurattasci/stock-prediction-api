@@ -143,5 +143,6 @@ def test_bar_version_history_is_db_recorded_append_only_and_fully_indexed():
     assert "env_file:" not in app_tier
     assert "MIGRATION_DATABASE_URL" not in app_tier
     assert "POSTGRES_PASSWORD:" not in app_tier
+    assert '"--concurrency=1"' in app_tier
     assert "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS" in role_init
     assert "ALTER ROLE stockapi_app RESET ALL" in role_init

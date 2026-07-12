@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from typing import Any
 
 import structlog
@@ -17,6 +18,7 @@ from app.config import Settings, get_settings
 from app.db.models.bars import Bar
 from app.db.session import build_engine, build_sessionmaker
 from data_sources.base import MarketDataProvider, OHLCVBar, ProviderHTTPError, SymbolNotFoundError
+from data_sources.guards import InMemoryCostRateGuard
 from data_sources.polygon import PolygonProvider
 from ingestion.upsert import BarUpsertPlan, upsert_bars
 
@@ -210,7 +212,29 @@ def _build_provider(
         return provider_factory(settings)
     if not settings.polygon_api_key:
         raise ValueError("POLYGON_API_KEY is required for price ingestion")
-    return PolygonProvider(settings.polygon_api_key)
+    return PolygonProvider(
+        settings.polygon_api_key,
+        guard=_polygon_guard(
+            settings.polygon_max_calls_per_window,
+            settings.polygon_rate_window_seconds,
+            settings.polygon_total_call_budget,
+        ),
+    )
+
+
+@lru_cache(maxsize=16)
+def _polygon_guard(
+    max_calls_per_window: int,
+    window_seconds: float,
+    total_budget: int,
+) -> InMemoryCostRateGuard:
+    """Share the configured temporary guard across tasks in one worker process."""
+
+    return InMemoryCostRateGuard(
+        max_calls_per_window=max_calls_per_window,
+        window_seconds=window_seconds,
+        total_budget=total_budget or None,
+    )
 
 
 def _normalize_symbols(symbols: Sequence[str] | None) -> list[str]:

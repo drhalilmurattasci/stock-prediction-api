@@ -121,7 +121,17 @@ services:
     profiles: ["app"]
     build: .
     container_name: stockapi-worker
-    command: ["celery", "-A", "ingestion.celery_app.celery_app", "worker", "--loglevel=INFO"]
+    # The current Polygon guard is process-local. Keep one worker process until
+    # the planned Redis-backed, cross-worker guard replaces it.
+    command:
+      [
+        "celery",
+        "-A",
+        "ingestion.celery_app.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+      ]
     environment:
       APP_ENV: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -134,6 +144,9 @@ services:
       CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
       MLFLOW_TRACKING_URI: http://mlflow:5000
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      POLYGON_MAX_CALLS_PER_WINDOW: ${POLYGON_MAX_CALLS_PER_WINDOW:-5}
+      POLYGON_RATE_WINDOW_SECONDS: ${POLYGON_RATE_WINDOW_SECONDS:-60}
+      POLYGON_TOTAL_CALL_BUDGET: ${POLYGON_TOTAL_CALL_BUDGET:-0}
       FMP_API_KEY: ${FMP_API_KEY:-}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
       NASDAQ_DATA_LINK_API_KEY: ${NASDAQ_DATA_LINK_API_KEY:-}

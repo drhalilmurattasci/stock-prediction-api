@@ -254,8 +254,11 @@ async def test_splits_and_dividends_parse():
 
 async def test_guard_is_invoked_per_request():
     guard = InMemoryCostRateGuard(max_calls_per_window=1, window_seconds=60, clock=lambda: 0.0)
+    calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
         return httpx.Response(200, json={"results": []})
 
     provider = _provider(handler, guard=guard)
@@ -264,6 +267,7 @@ async def test_guard_is_invoked_per_request():
 
     with pytest.raises(VendorRateLimitError):
         await provider.get_daily_bars("MSFT", date(2026, 7, 1), date(2026, 7, 6))
+    assert calls == 1  # the rejected call never reaches the network
     await provider.aclose()
 
 

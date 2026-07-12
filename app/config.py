@@ -64,6 +64,12 @@ class Settings(BaseSettings):
 
     # --- vendor keys ---
     polygon_api_key: str | None = None
+    # Temporary single-process guard for the default Polygon ingestion path.
+    # A positive total budget is cumulative for the worker process lifetime;
+    # zero disables that non-renewing cap.
+    polygon_max_calls_per_window: int = Field(default=5, ge=1)
+    polygon_rate_window_seconds: float = Field(default=60.0, gt=0)
+    polygon_total_call_budget: int = Field(default=0, ge=0)
     fmp_api_key: str | None = None
     finnhub_api_key: str | None = None
     nasdaq_data_link_api_key: str | None = None

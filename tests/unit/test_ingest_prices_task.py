@@ -11,7 +11,14 @@ from sqlalchemy.dialects import postgresql
 
 from app.config import Settings
 from data_sources.base import OHLCVBar, SymbolNotFoundError
-from ingestion.tasks.ingest_prices import _latest_bar_ts_statement, ingest_prices_async
+from data_sources.guards import InMemoryCostRateGuard
+from data_sources.polygon import PolygonProvider
+from ingestion.tasks.ingest_prices import (
+    _build_provider,
+    _latest_bar_ts_statement,
+    _polygon_guard,
+    ingest_prices_async,
+)
 from ingestion.upsert import BarUpsertPlan, build_bar_upserts, build_existing_bars_select
 
 TS = datetime(2026, 7, 6, tzinfo=UTC)
@@ -124,6 +131,28 @@ async def _fake_upsert(session: Any, bars: Sequence[OHLCVBar]) -> BarUpsertPlan:
     del session
     rows = build_bar_upserts(bars)
     return BarUpsertPlan(rows=rows, revisions=[])
+
+
+async def test_default_polygon_provider_has_shared_fail_closed_guard():
+    _polygon_guard.cache_clear()
+    settings = Settings(
+        app_env="test",
+        polygon_api_key="test-key",
+    )
+    first = _build_provider(settings, None)
+    second = _build_provider(settings, None)
+    try:
+        assert isinstance(first, PolygonProvider)
+        assert isinstance(second, PolygonProvider)
+        assert isinstance(first._guard, InMemoryCostRateGuard)
+        assert first._guard is second._guard
+        assert first._guard.max_calls == 5
+        assert first._guard.window == 60
+        assert first._guard.total_budget is None
+    finally:
+        await first.aclose()
+        await second.aclose()
+        _polygon_guard.cache_clear()
 
 
 @pytest.mark.asyncio

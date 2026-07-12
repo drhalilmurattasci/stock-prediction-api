@@ -264,6 +264,10 @@ MLFLOW_TRACKING_URI=http://localhost:5000
 
 # ---- Vendor API keys (fill these in) ----
 POLYGON_API_KEY=
+POLYGON_MAX_CALLS_PER_WINDOW=5
+POLYGON_RATE_WINDOW_SECONDS=60
+# Optional process-lifetime cap; 0 disables.
+POLYGON_TOTAL_CALL_BUDGET=0
 FMP_API_KEY=
 FINNHUB_API_KEY=
 NASDAQ_DATA_LINK_API_KEY=
@@ -516,7 +520,7 @@ uvicorn app.main:app --reload --port 8000
 # Readiness:    http://localhost:8000/readyz    (checks DB + Redis)
 
 # In separate terminals (needed for scheduled Polygon price ingestion):
-celery -A ingestion.celery_app.celery_app worker --loglevel=INFO
+celery -A ingestion.celery_app.celery_app worker --loglevel=INFO --concurrency=1
 celery -A ingestion.celery_app.celery_app beat   --loglevel=INFO
 ```
 
@@ -529,7 +533,7 @@ celery -A ingestion.celery_app.celery_app beat   --loglevel=INFO
 docker compose up -d                 # infra
 .\.venv\Scripts\Activate.ps1         # python env
 uvicorn app.main:app --reload        # api
-# (optional) celery -A ingestion.celery_app.celery_app worker --loglevel=INFO
+# (optional) celery -A ingestion.celery_app.celery_app worker --loglevel=INFO --concurrency=1
 
 # Stop
 docker compose stop                  # stop containers, keep data
