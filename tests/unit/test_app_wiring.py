@@ -20,6 +20,19 @@ def test_settings_accepts_legacy_redis_url_alias():
     assert settings.redis_url == "redis://legacy-cache:6379/4"
 
 
+def test_runtime_and_migration_database_credentials_are_separate() -> None:
+    runtime = "postgresql+asyncpg://runtime:runtime@localhost/db"
+    owner = "postgresql+asyncpg://owner:owner@localhost/db"
+    settings = Settings(database_url=runtime, migration_database_url=owner)
+
+    assert settings.database_url == runtime
+    assert settings.effective_migration_database_url == owner
+    assert (
+        Settings(database_url=runtime, migration_database_url=None).effective_migration_database_url
+        == runtime
+    )
+
+
 def test_lifespan_creates_app_owned_resources():
     async def ok_probe(_request: Request) -> None:
         return None

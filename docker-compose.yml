@@ -7,12 +7,13 @@ name: stock-api
 
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg17
+    image: timescale/timescaledb:2.28.2-pg17
     container_name: stockapi-timescaledb
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -88,14 +89,24 @@ services:
     profiles: ["app"]
     build: .
     container_name: stockapi-api
-    env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+asyncpg://stockapi_app:${POSTGRES_APP_URL_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-5}
+      DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-30}
+      API_STATEMENT_TIMEOUT_MS: ${API_STATEMENT_TIMEOUT_MS:-5000}
       REDIS_CACHE_URL: redis://redis-cache:6379/0
       RATE_LIMIT_STORAGE_URI: redis://redis-cache:6379/1
+      RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT:-120/minute}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
       CELERY_BROKER_URL: redis://redis-celery:6379/0
       CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      JWT_SECRET: ${JWT_SECRET:-change_me_random_64_chars}
+      API_KEYS: ${API_KEYS:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
     ports:
       - "8000:8000"
     depends_on:
@@ -111,13 +122,24 @@ services:
     build: .
     container_name: stockapi-worker
     command: ["celery", "-A", "ingestion.celery_app.celery_app", "worker", "--loglevel=INFO"]
-    env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+asyncpg://stockapi_app:${POSTGRES_APP_URL_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-5}
+      DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-30}
       REDIS_CACHE_URL: redis://redis-cache:6379/0
       CELERY_BROKER_URL: redis://redis-celery:6379/0
       CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      FMP_API_KEY: ${FMP_API_KEY:-}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      NASDAQ_DATA_LINK_API_KEY: ${NASDAQ_DATA_LINK_API_KEY:-}
+      ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -131,8 +153,9 @@ services:
     build: .
     container_name: stockapi-beat
     command: ["celery", "-A", "ingestion.celery_app.celery_app", "beat", "--loglevel=INFO"]
-    env_file: .env
     environment:
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       CELERY_BROKER_URL: redis://redis-celery:6379/0
       CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
     depends_on:

@@ -47,6 +47,10 @@ def test_bar_upsert_statement_uses_conflict_key_and_is_distinct_from():
     assert "excluded.close" in sql
     assert "fetched_at = excluded.fetched_at" in sql
     assert "as_of = excluded.as_of" in sql
+    # Stale changed rows must reach the DB trigger and raise; filtering them
+    # here would silently turn a version conflict into a zero-row no-op.
+    assert "excluded.as_of > bars.as_of" not in sql
+    assert "excluded.fetched_at > bars.fetched_at" not in sql
 
 
 def test_bar_upsert_statement_rejects_empty_rows():
@@ -64,4 +68,3 @@ def test_revision_plan_maps_previous_and_incoming_values_for_sink():
     assert revision.conflict_key == existing.conflict_key
     assert revision.previous.close == 100.0
     assert revision.incoming.close == 101.0
-    assert revision.revised_at == new_fetch

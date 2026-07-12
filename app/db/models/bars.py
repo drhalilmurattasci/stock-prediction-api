@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -46,6 +47,9 @@ class Bar(Base):
         CheckConstraint("high >= low", name="high_gte_low"),
         CheckConstraint("high >= open AND high >= close", name="high_gte_open_close"),
         CheckConstraint("low <= open AND low <= close", name="low_lte_open_close"),
+        CheckConstraint("fetched_at >= ts", name="fetched_not_before_bar"),
+        CheckConstraint("as_of >= fetched_at", name="as_of_not_before_fetch"),
+        CheckConstraint("recorded_at >= as_of", name="recorded_not_before_as_of"),
         Index("ix_bars_symbol_ts", "symbol", "ts"),
         Index("ix_bars_source_as_of", "source", "as_of"),
         # Covering series index: every equality column of the /v1/prices read
@@ -82,6 +86,11 @@ class Bar(Base):
     trade_count: Mapped[int | None] = mapped_column(Integer)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    )
 
 
 class BarRevision(Base):
@@ -90,8 +99,76 @@ class BarRevision(Base):
     __tablename__ = "bars_revisions"
     __table_args__ = (
         CheckConstraint("multiplier >= 1", name="revision_multiplier_positive"),
+        CheckConstraint(
+            "previous_open >= 0 AND previous_high >= 0 AND previous_low >= 0 "
+            "AND previous_close >= 0 AND previous_volume >= 0 "
+            "AND incoming_open >= 0 AND incoming_high >= 0 AND incoming_low >= 0 "
+            "AND incoming_close >= 0 AND incoming_volume >= 0",
+            name="revision_ohlcv_nonnegative",
+        ),
+        CheckConstraint(
+            "previous_open < 'Infinity'::float8 "
+            "AND previous_high < 'Infinity'::float8 "
+            "AND previous_low < 'Infinity'::float8 "
+            "AND previous_close < 'Infinity'::float8 "
+            "AND previous_volume < 'Infinity'::float8 "
+            "AND incoming_open < 'Infinity'::float8 "
+            "AND incoming_high < 'Infinity'::float8 "
+            "AND incoming_low < 'Infinity'::float8 "
+            "AND incoming_close < 'Infinity'::float8 "
+            "AND incoming_volume < 'Infinity'::float8",
+            name="revision_ohlcv_finite",
+        ),
+        CheckConstraint(
+            "(previous_vwap IS NULL OR (previous_vwap >= 0 "
+            "AND previous_vwap < 'Infinity'::float8)) "
+            "AND (incoming_vwap IS NULL OR (incoming_vwap >= 0 "
+            "AND incoming_vwap < 'Infinity'::float8))",
+            name="revision_vwap_finite_nonnegative",
+        ),
+        CheckConstraint(
+            "(previous_trade_count IS NULL OR previous_trade_count >= 0) "
+            "AND (incoming_trade_count IS NULL OR incoming_trade_count >= 0)",
+            name="revision_trade_count_nonnegative",
+        ),
+        CheckConstraint(
+            "previous_high >= previous_low "
+            "AND previous_high >= previous_open AND previous_high >= previous_close "
+            "AND previous_low <= previous_open AND previous_low <= previous_close "
+            "AND incoming_high >= incoming_low "
+            "AND incoming_high >= incoming_open AND incoming_high >= incoming_close "
+            "AND incoming_low <= incoming_open AND incoming_low <= incoming_close",
+            name="revision_ohlc_shape",
+        ),
+        CheckConstraint(
+            "previous_fetched_at >= ts AND incoming_fetched_at >= ts "
+            "AND previous_as_of >= previous_fetched_at "
+            "AND incoming_as_of >= incoming_fetched_at",
+            name="revision_availability_order",
+        ),
+        CheckConstraint(
+            "(previous_recorded_at IS NULL AND incoming_recorded_at IS NULL) OR "
+            "(previous_recorded_at IS NOT NULL AND incoming_recorded_at IS NOT NULL "
+            "AND previous_recorded_at < incoming_recorded_at "
+            "AND previous_recorded_at >= previous_as_of "
+            "AND incoming_recorded_at >= incoming_as_of "
+            "AND incoming_recorded_at = revised_at "
+            "AND previous_as_of < incoming_as_of "
+            "AND previous_fetched_at < incoming_fetched_at)",
+            name="revision_version_evidence",
+        ),
         Index("ix_bars_revisions_conflict_key", "symbol", "timespan", "multiplier", "ts"),
         Index("ix_bars_revisions_revised_at", "revised_at"),
+        Index(
+            "ix_bars_revisions_series_version",
+            "symbol",
+            "timespan",
+            "multiplier",
+            "source",
+            "adjustment_basis",
+            "ts",
+            "incoming_recorded_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
@@ -122,5 +199,14 @@ class BarRevision(Base):
     incoming_trade_count: Mapped[int | None] = mapped_column(Integer)
     incoming_fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     incoming_as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    previous_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    incoming_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     revised_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

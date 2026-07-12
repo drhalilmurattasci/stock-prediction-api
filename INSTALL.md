@@ -230,15 +230,20 @@ Create **`A:\tansel\.env.example`** (copy to `.env` and fill in real keys — ne
 
 ```dotenv
 # ---- Database (TimescaleDB) ----
-POSTGRES_USER=stockapi
-POSTGRES_PASSWORD=change_me_strong
+POSTGRES_USER=stockapi_owner
+POSTGRES_PASSWORD=change_me_owner_strong
 POSTGRES_DB=stockapi
-# Async driver (asyncpg) — the app uses full async I/O end to end.
-# Alembic derives a sync (psycopg) URL from this automatically.
-DATABASE_URL=postgresql+asyncpg://stockapi:change_me_strong@localhost:5432/stockapi
+POSTGRES_APP_PASSWORD=change_me_app_strong
+# Percent-encoded form for compose DATABASE_URL interpolation.
+POSTGRES_APP_URL_PASSWORD=change_me_app_strong
+# Runtime is non-owner; only Alembic uses the owner credential.
+# Percent-encode reserved characters in each password embedded in these URLs.
+DATABASE_URL=postgresql+asyncpg://stockapi_app:change_me_app_strong@localhost:5432/stockapi
+MIGRATION_DATABASE_URL=postgresql+asyncpg://stockapi_owner:change_me_owner_strong@localhost:5432/stockapi
 DATABASE_POOL_SIZE=5
 DATABASE_MAX_OVERFLOW=5
 DATABASE_POOL_TIMEOUT=30
+API_STATEMENT_TIMEOUT_MS=5000
 
 # ---- Redis (cache + rate-limit counters) ----
 REDIS_CACHE_URL=redis://localhost:6379/0
@@ -251,6 +256,7 @@ CELERY_RESULT_BACKEND=redis://localhost:6380/1
 # memory:// is fine for a single worker in dev; use redis://localhost:6379/1 so
 # limits are shared across workers in production.
 RATE_LIMIT_STORAGE_URI=memory://
+RATE_LIMIT_DEFAULT=120/minute
 RATE_LIMIT_ENABLED=true
 
 # ---- Services ----
@@ -303,12 +309,13 @@ name: stock-api
 
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg17
+    image: timescale/timescaledb:2.28.2-pg17
     container_name: stockapi-timescaledb
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -445,6 +452,27 @@ docker compose ps           # all services should be "running"/"healthy"
 
 First run pulls images (TimescaleDB, Redis) and the MLflow container pip-installs MLflow on boot (~1–2 min the first time).
 
+Fresh databases create the fixed, non-owner `stockapi_app` runtime role through
+`scripts/db-init/02-runtime-role.sh`. Existing initialized database directories
+do not rerun Docker init scripts; bootstrap the role once before applying
+migration `0006`:
+
+```powershell
+docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh
+alembic upgrade head
+```
+
+The migration fails with a clear error if this one-time bootstrap was missed.
+Only Alembic receives `MIGRATION_DATABASE_URL`; API, worker, and Beat containers
+receive an explicit runtime-variable allowlist and never inherit owner database
+credentials from `.env`.
+
+For an existing volume, retain the `POSTGRES_USER`, `POSTGRES_DB`, and owner
+password that originally initialized that database (older local volumes often
+use `stockapi`). Changing Docker environment variables does not rename or reset
+an existing PostgreSQL owner. If the old local data is disposable, recreating
+the database directory is the alternative; do not delete it merely to upgrade.
+
 **Watch logs if needed:**
 ```powershell
 docker compose logs -f timescaledb
@@ -458,8 +486,8 @@ docker compose logs -f mlflow
 | Component | Command | Expected |
 |---|---|---|
 | Docker engine | `docker version` | client + server versions |
-| TimescaleDB up | `docker exec stockapi-timescaledb pg_isready -U stockapi` | `accepting connections` |
-| Timescale ext | `docker exec stockapi-timescaledb psql -U stockapi -d stockapi -c "SELECT extversion FROM pg_extension WHERE extname='timescaledb';"` | a version row |
+| TimescaleDB up | `docker compose exec timescaledb sh -c 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'` | `accepting connections` |
+| Timescale ext (owner check) | `docker compose exec timescaledb sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT extversion FROM pg_extension WHERE extname=''timescaledb'';"'` | a version row |
 | Redis cache | `docker exec stockapi-redis-cache redis-cli ping` | `PONG` |
 | Redis Celery | `docker exec stockapi-redis-celery redis-cli ping` | `PONG` |
 | MLflow UI | open `http://localhost:5000` | MLflow dashboard |

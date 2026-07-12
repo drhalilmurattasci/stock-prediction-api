@@ -70,6 +70,7 @@ def _row(
         trade_count=100 + day,
         fetched_at=observed,
         as_of=observed,
+        recorded_at=observed + timedelta(minutes=1),
     )
 
 
@@ -85,6 +86,7 @@ def _price_bar(timestamp: datetime = TS) -> PriceBar:
         trade_count=42,
         fetched_at=TS + timedelta(hours=1),
         as_of=TS + timedelta(hours=1),
+        recorded_at=TS + timedelta(hours=1, minutes=1),
     )
 
 
@@ -97,6 +99,7 @@ def _response(**overrides: Any) -> PricesResponse:
         "multiplier": 1,
         "adjustment_basis": "raw",
         "data_as_of": bar.as_of,
+        "data_recorded_at": bar.recorded_at,
         "count": 1,
         "page": PricePage(limit=100, has_more=False),
         "bars": [bar],
@@ -297,6 +300,7 @@ async def test_read_prices_returns_newest_page_in_chronological_order():
         next_end=datetime(2026, 7, 2, tzinfo=UTC),
     )
     assert response.data_as_of == datetime(2026, 7, 4, 10, tzinfo=UTC)
+    assert response.data_recorded_at == datetime(2026, 7, 4, 10, 1, tzinfo=UTC)
 
     sql = str(
         session.statements[0].compile(
@@ -318,6 +322,7 @@ async def test_read_prices_normalizes_row_times_to_utc():
     assert response.bars[0].timestamp == datetime(2026, 6, 30, 21, tzinfo=UTC)
     assert response.bars[0].as_of == datetime(2026, 7, 1, 9, tzinfo=UTC)
     assert response.data_as_of == response.bars[0].as_of
+    assert response.data_recorded_at == response.bars[0].recorded_at
 
 
 @pytest.mark.asyncio
@@ -339,6 +344,7 @@ async def test_read_prices_data_as_of_is_page_max_not_newest_bar():
     assert [bar.timestamp.day for bar in response.bars] == [2, 3, 4]
     assert response.data_as_of == restated_as_of
     assert response.data_as_of != response.bars[-1].as_of
+    assert response.data_recorded_at == restated_as_of + timedelta(minutes=1)
 
 
 @pytest.mark.asyncio
@@ -373,6 +379,7 @@ async def test_read_prices_returns_complete_empty_200_shape():
         multiplier=1,
         adjustment_basis="raw",
         data_as_of=None,
+        data_recorded_at=None,
         count=0,
         page=PricePage(limit=25, has_more=False, next_end=None),
         bars=[],

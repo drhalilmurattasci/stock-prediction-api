@@ -91,12 +91,18 @@ class PriceBar(_PriceModel):
     fetched_at: AwareDatetime = Field(description="UTC time when the source payload was fetched.")
     as_of: AwareDatetime = Field(
         description=(
-            "System observation/version time for this current row; not a historical "
-            "point-in-time query cutoff."
+            "Conservative data-availability cutoff for this current row; not a historical "
+            "point-in-time query parameter."
+        )
+    )
+    recorded_at: AwareDatetime = Field(
+        description=(
+            "Database write-acceptance time for this exact current-row version; "
+            "transaction commit and visibility may be later."
         )
     )
 
-    @field_validator("timestamp", "fetched_at", "as_of")
+    @field_validator("timestamp", "fetched_at", "as_of", "recorded_at")
     @classmethod
     def normalize_datetimes_to_utc(cls, value: datetime) -> datetime:
         return value.astimezone(UTC)
@@ -109,6 +115,8 @@ class PriceBar(_PriceModel):
             raise ValueError("high must be greater than or equal to open and close")
         if self.low > min(self.open, self.close):
             raise ValueError("low must be less than or equal to open and close")
+        if not self.timestamp <= self.fetched_at <= self.as_of <= self.recorded_at:
+            raise ValueError("timestamp, fetched_at, as_of, and recorded_at must be nondecreasing")
         return self
 
 
@@ -143,7 +151,13 @@ class PricesResponse(_PriceModel):
     multiplier: int = Field(ge=1)
     adjustment_basis: AdjustmentBasis
     data_as_of: AwareDatetime | None = Field(
-        description="Newest system observation time among bars on this response page."
+        description="Newest data-availability cutoff among bars on this response page."
+    )
+    data_recorded_at: AwareDatetime | None = Field(
+        description=(
+            "Newest database write-acceptance time among bars on this response page; "
+            "transaction commit and visibility may be later."
+        )
     )
     count: int = Field(ge=0)
     page: PricePage
@@ -159,7 +173,7 @@ class PricesResponse(_PriceModel):
     def normalize_response_source(cls, value: str) -> str:
         return value.lower()
 
-    @field_validator("data_as_of")
+    @field_validator("data_as_of", "data_recorded_at")
     @classmethod
     def normalize_data_as_of_to_utc(cls, value: datetime | None) -> datetime | None:
         return value.astimezone(UTC) if value is not None else None

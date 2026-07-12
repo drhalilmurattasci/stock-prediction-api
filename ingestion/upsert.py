@@ -1,18 +1,21 @@
 """Idempotent upsert planning and DB sink for OHLCV bars.
 
-The ingestion boundary stores raw/current bar values in ``bars`` and preserves
-vendor restatements in ``bars_revisions`` before updating the current row. The
-database write uses ``IS DISTINCT FROM`` so unchanged replays are no-ops while
-real value changes are explicit and auditable.
+The ingestion boundary stores current bar values in ``bars``. A PostgreSQL
+trigger stamps database-recorded version time and atomically captures every
+restatement in append-only ``bars_revisions``. The upsert uses
+``IS DISTINCT FROM`` so unchanged replays are no-ops while real value changes
+require strictly newer availability evidence.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
-from typing import Any, cast
+from datetime import UTC
+from typing import Any, Self, cast
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict
-from sqlalchemy import Select, select, tuple_
+from pydantic import AwareDatetime, BaseModel, ConfigDict, model_validator
+from sqlalchemy import Select, func, select, tuple_
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,10 +42,14 @@ BAR_VALUE_COLUMNS: tuple[str, ...] = (
 )
 
 
+class BarVersionConflictError(ValueError):
+    """A changed value did not carry strictly newer availability evidence."""
+
+
 class BarUpsertRow(BaseModel):
     """One row ready for an idempotent OHLCV upsert."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     symbol: str
     ts: AwareDatetime
@@ -60,6 +67,14 @@ class BarUpsertRow(BaseModel):
     fetched_at: AwareDatetime
     as_of: AwareDatetime
 
+    @model_validator(mode="after")
+    def timestamps_follow_data_availability_order(self) -> Self:
+        if self.fetched_at < self.ts:
+            raise ValueError("fetched_at must not be earlier than the bar timestamp")
+        if self.as_of < self.fetched_at:
+            raise ValueError("as_of must not be earlier than fetched_at")
+        return self
+
     @property
     def conflict_key(self) -> tuple[object, ...]:
         return tuple(getattr(self, column) for column in BAR_CONFLICT_KEY)
@@ -69,20 +84,19 @@ class BarUpsertRow(BaseModel):
 
 
 class BarRevisionRow(BaseModel):
-    """One captured prior value for an incoming bar restatement/correction."""
+    """Expected revision shape used only for planning and ingest counters."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     conflict_key: tuple[object, ...]
     previous: BarUpsertRow
     incoming: BarUpsertRow
-    revised_at: AwareDatetime
 
 
 class BarUpsertPlan(BaseModel):
-    """Rows to write plus append-only revisions to insert first."""
+    """Rows to write plus expected database-triggered revisions."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
 
     rows: list[BarUpsertRow]
     revisions: list[BarRevisionRow]
@@ -91,17 +105,13 @@ class BarUpsertPlan(BaseModel):
 def build_bar_upserts(
     bars: Iterable[OHLCVBar], *, as_of: AwareDatetime | None = None
 ) -> list[BarUpsertRow]:
-    """Dedupe bars by conflict key (last write wins) and stamp ``as_of``.
+    """Dedupe identical bars by conflict key and stamp ``as_of``.
 
     Pure and idempotent: the same input always yields the same output. ``as_of``
     defaults to each bar's ``fetched_at`` when not supplied. Rows are returned
-    sorted by (symbol, ts, source) for stable, reviewable output.
+    sorted by the full conflict key for stable locking and reviewable output.
     """
-    by_key: dict[tuple[object, ...], BarUpsertRow] = {}
-    for bar in bars:
-        row = _to_bar_upsert_row(bar, as_of=as_of)
-        by_key[row.conflict_key] = row
-    return sorted(by_key.values(), key=lambda r: (r.symbol, r.ts, r.source))
+    return _dedupe_rows(_to_bar_upsert_row(bar, as_of=as_of) for bar in bars)
 
 
 def build_bar_upsert_plan(
@@ -109,13 +119,11 @@ def build_bar_upsert_plan(
     *,
     existing_rows: Iterable[BarUpsertRow] = (),
     as_of: AwareDatetime | None = None,
-    revised_at: AwareDatetime | None = None,
 ) -> BarUpsertPlan:
     """Build rows to upsert and revision rows for changed existing values."""
     return build_bar_upsert_plan_from_rows(
         build_bar_upserts(bars, as_of=as_of),
         existing_rows=existing_rows,
-        revised_at=revised_at,
     )
 
 
@@ -123,7 +131,6 @@ def build_bar_upsert_plan_from_rows(
     rows: Iterable[BarUpsertRow],
     *,
     existing_rows: Iterable[BarUpsertRow] = (),
-    revised_at: AwareDatetime | None = None,
 ) -> BarUpsertPlan:
     """Build rows to upsert and revision rows for already-normalized rows."""
     row_list = _dedupe_rows(rows)
@@ -133,12 +140,15 @@ def build_bar_upsert_plan_from_rows(
         previous = existing_by_key.get(row.conflict_key)
         if previous is None or previous.value_tuple() == row.value_tuple():
             continue
+        if row.as_of <= previous.as_of or row.fetched_at <= previous.fetched_at:
+            raise BarVersionConflictError(
+                "changed bar values require strictly newer fetched_at and as_of timestamps"
+            )
         revisions.append(
             BarRevisionRow(
                 conflict_key=row.conflict_key,
                 previous=previous,
                 incoming=row,
-                revised_at=revised_at or row.as_of,
             )
         )
     return BarUpsertPlan(rows=row_list, revisions=revisions)
@@ -149,21 +159,17 @@ async def upsert_bars(
     bars: Iterable[OHLCVBar],
     *,
     as_of: AwareDatetime | None = None,
-    revised_at: AwareDatetime | None = None,
 ) -> BarUpsertPlan:
-    """Upsert provider DTOs into TimescaleDB and append revision rows first."""
+    """Upsert provider DTOs; PostgreSQL atomically appends revision rows."""
     return await upsert_bar_rows(
         session,
         build_bar_upserts(bars, as_of=as_of),
-        revised_at=revised_at,
     )
 
 
 async def upsert_bar_rows(
     session: AsyncSession,
     rows: Iterable[BarUpsertRow],
-    *,
-    revised_at: AwareDatetime | None = None,
 ) -> BarUpsertPlan:
     """Upsert normalized rows into ``bars`` and append changed values to revisions.
 
@@ -175,18 +181,25 @@ async def upsert_bar_rows(
     if not row_list:
         return BarUpsertPlan(rows=[], revisions=[])
 
+    await _lock_bar_keys(session, row_list)
     existing_rows = await load_existing_bar_rows(session, row_list)
     plan = build_bar_upsert_plan_from_rows(
         row_list,
         existing_rows=existing_rows,
-        revised_at=revised_at,
     )
 
-    if plan.revisions:
-        revision_dicts = [_revision_to_insert_dict(r) for r in plan.revisions]
-        await session.execute(insert(BarRevision), revision_dicts)
+    write_started_at = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+    # The database trigger appends revision rows and stamps recorded_at in the
+    # same statement. Keeping capture in PostgreSQL prevents direct writers or
+    # an absent-key race from bypassing history.
     await session.execute(build_bar_upsert_statement(plan.rows))
-    return plan
+    await _verify_persisted_rows(session, plan.rows)
+    persisted_revisions = await _load_persisted_revisions(
+        session,
+        plan.rows,
+        recorded_not_before=write_started_at,
+    )
+    return BarUpsertPlan(rows=plan.rows, revisions=persisted_revisions)
 
 
 async def load_existing_bar_rows(
@@ -252,28 +265,94 @@ def _to_bar_upsert_row(bar: OHLCVBar, *, as_of: AwareDatetime | None = None) -> 
 def _dedupe_rows(rows: Iterable[BarUpsertRow]) -> list[BarUpsertRow]:
     by_key: dict[tuple[object, ...], BarUpsertRow] = {}
     for row in rows:
-        by_key[row.conflict_key] = row
-    return sorted(by_key.values(), key=lambda r: (r.symbol, r.ts, r.source))
+        previous = by_key.get(row.conflict_key)
+        if previous is None:
+            by_key[row.conflict_key] = row
+        elif previous.value_tuple() != row.value_tuple():
+            raise BarVersionConflictError(
+                "one ingest batch cannot contain conflicting values for the same bar key"
+            )
+        elif (row.as_of, row.fetched_at) < (previous.as_of, previous.fetched_at):
+            # Preserve the earliest known availability for identical values;
+            # input order must not rewrite historical visibility.
+            by_key[row.conflict_key] = row
+    return sorted(
+        by_key.values(),
+        key=lambda row: (
+            row.symbol,
+            row.timespan,
+            row.multiplier,
+            row.ts,
+            row.source,
+            row.adjustment_basis,
+        ),
+    )
+
+
+async def _lock_bar_keys(session: AsyncSession, rows: Iterable[BarUpsertRow]) -> None:
+    """Serialize even absent conflict keys for plan/trigger agreement."""
+
+    for row in rows:
+        lock_key = json.dumps(
+            [
+                row.symbol,
+                row.timespan,
+                row.multiplier,
+                row.ts.astimezone(UTC).isoformat(),
+                row.source,
+                row.adjustment_basis,
+            ],
+            separators=(",", ":"),
+        )
+        await session.execute(
+            select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0)))
+        )
+
+
+async def _verify_persisted_rows(
+    session: AsyncSession,
+    rows: Iterable[BarUpsertRow],
+) -> None:
+    """Fail if a non-cooperating concurrent writer won an absent-key race."""
+
+    row_list = _dedupe_rows(rows)
+    persisted = {row.conflict_key: row for row in await load_existing_bar_rows(session, row_list)}
+    for incoming in row_list:
+        current = persisted.get(incoming.conflict_key)
+        if current is None or current.value_tuple() != incoming.value_tuple():
+            raise BarVersionConflictError("database retained a different bar version")
+
+
+async def _load_persisted_revisions(
+    session: AsyncSession,
+    rows: Iterable[BarUpsertRow],
+    *,
+    recorded_not_before: AwareDatetime,
+) -> list[BarRevisionRow]:
+    """Hydrate revisions actually emitted by this DB write window."""
+
+    row_list = _dedupe_rows(rows)
+    version_columns = (
+        *(BarRevision.__table__.c[column] for column in BAR_CONFLICT_KEY),
+        BarRevision.incoming_fetched_at,
+        BarRevision.incoming_as_of,
+    )
+    version_keys = [(*row.conflict_key, row.fetched_at, row.as_of) for row in row_list]
+    result = await session.execute(
+        select(BarRevision).where(
+            tuple_(*version_columns).in_(version_keys),
+            BarRevision.incoming_recorded_at >= recorded_not_before,
+        )
+    )
+    revisions = [_orm_revision_to_plan(row) for row in result.scalars()]
+    if len({revision.conflict_key for revision in revisions}) != len(revisions):
+        raise RuntimeError("database emitted duplicate revisions for one incoming bar version")
+    return sorted(revisions, key=lambda revision: revision.conflict_key)
 
 
 def _bar_to_insert_dict(row: BarUpsertRow) -> dict[str, Any]:
     columns = (*BAR_CONFLICT_KEY, *BAR_VALUE_COLUMNS, "fetched_at", "as_of")
     return {column: getattr(row, column) for column in columns}
-
-
-def _revision_to_insert_dict(revision: BarRevisionRow) -> dict[str, Any]:
-    previous = revision.previous
-    incoming = revision.incoming
-    values: dict[str, Any] = {column: getattr(previous, column) for column in BAR_CONFLICT_KEY}
-    for column in BAR_VALUE_COLUMNS:
-        values[f"previous_{column}"] = getattr(previous, column)
-        values[f"incoming_{column}"] = getattr(incoming, column)
-    values["previous_fetched_at"] = previous.fetched_at
-    values["previous_as_of"] = previous.as_of
-    values["incoming_fetched_at"] = incoming.fetched_at
-    values["incoming_as_of"] = incoming.as_of
-    values["revised_at"] = revision.revised_at
-    return values
 
 
 def _orm_bar_to_upsert_row(bar: Bar) -> BarUpsertRow:
@@ -293,4 +372,44 @@ def _orm_bar_to_upsert_row(bar: Bar) -> BarUpsertRow:
         trade_count=bar.trade_count,
         fetched_at=bar.fetched_at,
         as_of=bar.as_of,
+    )
+
+
+def _orm_revision_to_plan(revision: BarRevision) -> BarRevisionRow:
+    common = {
+        "symbol": revision.symbol,
+        "ts": revision.ts,
+        "timespan": cast(Timespan, revision.timespan),
+        "multiplier": revision.multiplier,
+        "source": revision.source,
+        "adjustment_basis": cast(AdjustmentBasis, revision.adjustment_basis),
+    }
+    previous = BarUpsertRow(
+        **common,
+        open=revision.previous_open,
+        high=revision.previous_high,
+        low=revision.previous_low,
+        close=revision.previous_close,
+        volume=revision.previous_volume,
+        vwap=revision.previous_vwap,
+        trade_count=revision.previous_trade_count,
+        fetched_at=revision.previous_fetched_at,
+        as_of=revision.previous_as_of,
+    )
+    incoming = BarUpsertRow(
+        **common,
+        open=revision.incoming_open,
+        high=revision.incoming_high,
+        low=revision.incoming_low,
+        close=revision.incoming_close,
+        volume=revision.incoming_volume,
+        vwap=revision.incoming_vwap,
+        trade_count=revision.incoming_trade_count,
+        fetched_at=revision.incoming_fetched_at,
+        as_of=revision.incoming_as_of,
+    )
+    return BarRevisionRow(
+        conflict_key=incoming.conflict_key,
+        previous=previous,
+        incoming=incoming,
     )

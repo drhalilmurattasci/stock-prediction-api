@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from data_sources.base import OHLCVBar
-from ingestion.upsert import BAR_CONFLICT_KEY, build_bar_upsert_plan, build_bar_upserts
+from ingestion.upsert import (
+    BAR_CONFLICT_KEY,
+    BarVersionConflictError,
+    build_bar_upsert_plan,
+    build_bar_upsert_plan_from_rows,
+    build_bar_upserts,
+)
 
 TS = datetime(2026, 7, 6, tzinfo=UTC)
 
@@ -29,14 +37,22 @@ def _bar(close: float, fetched_at: datetime, **overrides) -> OHLCVBar:
     return OHLCVBar(**fields)
 
 
-def test_same_key_last_write_wins():
+def test_same_batch_rejects_conflicting_versions_of_one_key():
     earlier = datetime(2026, 7, 6, 10, tzinfo=UTC)
     later = datetime(2026, 7, 6, 11, tzinfo=UTC)
-    rows = build_bar_upserts([_bar(100.0, earlier), _bar(101.0, later)])
 
-    assert len(rows) == 1
-    assert rows[0].close == 101.0
-    assert rows[0].as_of == later
+    with pytest.raises(BarVersionConflictError, match="one ingest batch"):
+        build_bar_upserts([_bar(100.0, earlier), _bar(101.0, later)])
+
+
+def test_identical_batch_duplicates_keep_earliest_availability_regardless_of_order():
+    earlier = datetime(2026, 7, 6, 10, tzinfo=UTC)
+    later = datetime(2026, 7, 6, 11, tzinfo=UTC)
+    forward = build_bar_upserts([_bar(100.0, earlier), _bar(100.0, later)])
+    reversed_rows = build_bar_upserts([_bar(100.0, later), _bar(100.0, earlier)])
+
+    assert forward == reversed_rows
+    assert forward[0].as_of == earlier
 
 
 def test_distinct_keys_are_kept_and_sorted():
@@ -82,7 +98,6 @@ def test_revision_plan_captures_changed_existing_row():
     assert len(plan.revisions) == 1
     assert plan.revisions[0].previous.close == 100.0
     assert plan.revisions[0].incoming.close == 101.0
-    assert plan.revisions[0].revised_at == new_fetch
 
 
 def test_revision_plan_skips_unchanged_existing_row():
@@ -92,3 +107,31 @@ def test_revision_plan_skips_unchanged_existing_row():
 
     assert plan.rows == [existing]
     assert plan.revisions == []
+
+
+@pytest.mark.parametrize(
+    ("incoming_fetch", "incoming_as_of"),
+    [
+        (datetime(2026, 7, 6, 10, tzinfo=UTC), datetime(2026, 7, 6, 10, tzinfo=UTC)),
+        (datetime(2026, 7, 6, 9, tzinfo=UTC), datetime(2026, 7, 6, 12, tzinfo=UTC)),
+    ],
+)
+def test_changed_values_require_both_newer_fetch_and_as_of(
+    incoming_fetch: datetime,
+    incoming_as_of: datetime,
+) -> None:
+    existing_fetch = datetime(2026, 7, 6, 10, tzinfo=UTC)
+    existing = build_bar_upserts([_bar(100.0, existing_fetch)])[0]
+    incoming = build_bar_upserts(
+        [_bar(101.0, incoming_fetch)],
+        as_of=incoming_as_of,
+    )[0]
+
+    with pytest.raises(BarVersionConflictError, match="strictly newer"):
+        build_bar_upsert_plan_from_rows([incoming], existing_rows=[existing])
+
+
+def test_upsert_row_rejects_availability_before_fetch() -> None:
+    fetched = datetime(2026, 7, 6, 10, tzinfo=UTC)
+    with pytest.raises(ValueError, match="as_of"):
+        build_bar_upserts([_bar(100.0, fetched)], as_of=fetched.replace(hour=9))

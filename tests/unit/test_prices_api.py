@@ -62,6 +62,7 @@ def _bar(day: int, *, close: float, as_of_hour: int) -> Bar:
         trade_count=100 + day,
         fetched_at=timestamp + timedelta(hours=as_of_hour - 1),
         as_of=timestamp + timedelta(hours=as_of_hour),
+        recorded_at=timestamp + timedelta(hours=as_of_hour, minutes=1),
     )
 
 
@@ -94,6 +95,7 @@ def test_prices_returns_chronological_exact_bytes_and_cache_headers() -> None:
     assert body["source"] == "polygon"
     assert body["count"] == 2
     assert body["data_as_of"] == "2026-07-03T18:00:00Z"
+    assert body["data_recorded_at"] == "2026-07-03T18:01:00Z"
     assert [bar["timestamp"] for bar in body["bars"]] == [
         "2026-07-02T00:00:00Z",
         "2026-07-03T00:00:00Z",
@@ -189,6 +191,7 @@ def test_empty_series_has_a_complete_stable_shape() -> None:
         "multiplier": 1,
         "adjustment_basis": "raw",
         "data_as_of": None,
+        "data_recorded_at": None,
         "count": 0,
         "page": {"limit": 100, "has_more": False, "next_end": None},
         "bars": [],

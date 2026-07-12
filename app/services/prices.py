@@ -54,6 +54,7 @@ async def read_prices(
             trade_count=row.trade_count,
             fetched_at=row.fetched_at,
             as_of=row.as_of,
+            recorded_at=row.recorded_at,
         )
         for row in chronological
     ]
@@ -65,6 +66,7 @@ async def read_prices(
         multiplier=filters.multiplier,
         adjustment_basis=filters.adjustment_basis,
         data_as_of=max((bar.as_of for bar in bars), default=None),
+        data_recorded_at=max((bar.recorded_at for bar in bars), default=None),
         count=len(bars),
         page=PricePage(limit=filters.limit, has_more=has_more, next_end=next_end),
         bars=bars,
