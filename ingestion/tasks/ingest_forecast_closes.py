@@ -157,6 +157,7 @@ async def ingest_forecast_closes_async(
     engine: AsyncEngine | None = None,
     upsert_fn: UpsertFn = upsert_bars,
     clock: Callable[[], datetime] = _utcnow,
+    include_error_details: bool = True,
 ) -> dict[str, Any]:
     """Fetch and persist official open/close responses for completed sessions."""
 
@@ -222,7 +223,7 @@ async def ingest_forecast_closes_async(
                             "symbol": symbol,
                             "status": "failed",
                             "error_type": type(exc).__name__,
-                            "error": str(exc),
+                            "error": str(exc) if include_error_details else "details suppressed",
                             "retryable": retryable,
                         }
                     )
@@ -231,7 +232,7 @@ async def ingest_forecast_closes_async(
                         symbol=symbol,
                         error_type=type(exc).__name__,
                         retryable=retryable,
-                        exc_info=True,
+                        exc_info=include_error_details,
                     )
                     continue
 

@@ -13,13 +13,14 @@ import argparse
 import asyncio
 import json
 import sys
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import UTC, date, datetime
 from typing import Any
 
 import exchange_calendars as xcals
 import pandas as pd
-from sqlalchemy import and_, exists, select
+from sqlalchemy import and_, exists, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
@@ -29,6 +30,7 @@ from app.db.models.bars import Bar, BarVersionAvailability
 from app.db.session import build_engine
 from data_sources.guards import AsyncPacingCostRateGuard
 from data_sources.polygon_open_close import PolygonOpenCloseProvider
+from ingestion.locks import stable_lock_id
 from ingestion.tasks.ingest_forecast_closes import (
     ingest_forecast_closes_async,
     latest_completed_xnys_session,
@@ -41,10 +43,12 @@ SMOKE_TIMESPAN = "day"
 SMOKE_ADJUSTMENT_BASIS = "raw"
 SMOKE_MULTIPLIER = 1
 SMOKE_ATTEMPT_BUDGET = 1
+SMOKE_LOCK_ID = stable_lock_id("vendor-smoke", SMOKE_SOURCE, SMOKE_SYMBOL)
 
 IngestFn = Callable[..., Awaitable[dict[str, Any]]]
 RowExistsFn = Callable[[Settings, str, datetime], Awaitable[bool]]
 ReceiptExistsFn = Callable[[Settings, str, datetime], Awaitable[bool]]
+SmokeLockFn = Callable[[Settings], AbstractAsyncContextManager[None]]
 
 
 class VendorSmokeRefused(RuntimeError):
@@ -58,8 +62,11 @@ def _utcnow() -> datetime:
 def _safe_settings(settings: Settings) -> Settings:
     if settings.app_env != "local":
         raise VendorSmokeRefused("APP_ENV must be exactly local")
-    if not settings.polygon_api_key or not settings.polygon_api_key.strip():
+    key = settings.polygon_api_key.strip() if settings.polygon_api_key else ""
+    if not key:
         raise VendorSmokeRefused("POLYGON_API_KEY must be non-empty in .env")
+    if not key.isascii() or any(not 0x21 <= ord(character) <= 0x7E for character in key):
+        raise VendorSmokeRefused("POLYGON_API_KEY must contain only visible ASCII characters")
 
     try:
         database_url = make_url(settings.database_url)
@@ -84,10 +91,44 @@ def _safe_settings(settings: Settings) -> Settings:
     # Force both the rolling window and cumulative process budget to one.
     return settings.model_copy(
         update={
+            "polygon_api_key": key,
             "polygon_max_calls_per_window": SMOKE_ATTEMPT_BUDGET,
             "polygon_total_call_budget": SMOKE_ATTEMPT_BUDGET,
         }
     )
+
+
+@asynccontextmanager
+async def _exclusive_smoke_run(settings: Settings) -> AsyncIterator[None]:
+    """Hold a cross-process DB lock across precheck, request, and receipt proof."""
+
+    engine = build_engine(settings)
+    try:
+        async with engine.connect() as connection:
+            acquired = bool(
+                (
+                    await connection.execute(
+                        text("SELECT pg_try_advisory_lock(:lock_id)"),
+                        {"lock_id": SMOKE_LOCK_ID},
+                    )
+                ).scalar_one()
+            )
+            # Session locks survive commit; do not hold an idle transaction open
+            # while the bounded vendor request is in flight.
+            await connection.commit()
+            if not acquired:
+                raise VendorSmokeRefused("another vendor smoke is already running")
+            try:
+                yield
+            finally:
+                await connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": SMOKE_LOCK_ID},
+                )
+                await connection.commit()
+    finally:
+        # Closing the dedicated connection is also a server-side unlock backstop.
+        await engine.dispose()
 
 
 def _session_close(session_date: date) -> datetime:
@@ -205,6 +246,7 @@ async def run_vendor_smoke(
     ingest_fn: IngestFn = ingest_forecast_closes_async,
     row_exists_fn: RowExistsFn = _target_row_exists,
     receipt_exists_fn: ReceiptExistsFn = _target_receipt_exists,
+    lock_fn: SmokeLockFn = _exclusive_smoke_run,
 ) -> dict[str, object]:
     """Make at most one outbound request, then prove the exact row persisted."""
 
@@ -222,25 +264,27 @@ async def run_vendor_smoke(
 
     observed_at = _session_close(session_date)
     guarded_settings = _safe_settings(settings or get_settings())
-    if await row_exists_fn(guarded_settings, SMOKE_SYMBOL, observed_at):
-        raise VendorSmokeRefused("the exact MSFT smoke row already exists; refusing a replay")
+    async with lock_fn(guarded_settings):
+        if await row_exists_fn(guarded_settings, SMOKE_SYMBOL, observed_at):
+            raise VendorSmokeRefused("the exact MSFT smoke row already exists; refusing a replay")
 
-    result = await ingest_fn(
-        symbols=[SMOKE_SYMBOL],
-        start=session_date,
-        end=session_date,
-        use_watermark=False,
-        settings=guarded_settings,
-        provider_factory=_single_attempt_provider,
-        clock=clock,
-    )
-    _validate_result(result)
-    if not await row_exists_fn(guarded_settings, SMOKE_SYMBOL, observed_at):
-        raise VendorSmokeRefused("ingestion reported success but the exact bar is absent")
-    if not await receipt_exists_fn(guarded_settings, SMOKE_SYMBOL, observed_at):
-        raise VendorSmokeRefused(
-            "the exact bar lacks its DB-stamped post-commit availability receipt"
+        result = await ingest_fn(
+            symbols=[SMOKE_SYMBOL],
+            start=session_date,
+            end=session_date,
+            use_watermark=False,
+            settings=guarded_settings,
+            provider_factory=_single_attempt_provider,
+            clock=clock,
+            include_error_details=False,
         )
+        _validate_result(result)
+        if not await row_exists_fn(guarded_settings, SMOKE_SYMBOL, observed_at):
+            raise VendorSmokeRefused("ingestion reported success but the exact bar is absent")
+        if not await receipt_exists_fn(guarded_settings, SMOKE_SYMBOL, observed_at):
+            raise VendorSmokeRefused(
+                "the exact bar lacks its DB-stamped post-commit availability receipt"
+            )
 
     return {
         "status": "ok",
@@ -268,12 +312,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    # Pin structlog to plain, locals-free tracebacks BEFORE any vendor work:
-    # unconfigured structlog with `rich` importable (dev/ml extras) renders
-    # exception locals on failure — including PolygonProvider._request's
-    # Authorization header — to the operator console. The app configuration
-    # formats exceptions as plain text with no locals.
-    configure_logging("INFO", json_logs=False)
+    # Remove exception payloads BEFORE any vendor work. Rich tracebacks render
+    # exception locals, while transport failures can echo an invalid
+    # Authorization value in their exception text. Structured error types remain.
+    configure_logging("INFO", json_logs=False, exception_details=False)
     try:
         result = asyncio.run(
             run_vendor_smoke(

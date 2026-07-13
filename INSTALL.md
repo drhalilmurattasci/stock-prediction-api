@@ -565,10 +565,13 @@ The harness is hard-bound to `MSFT`, `stockapi_app`, and the local
 `stockapi_test` database. It refuses a pre-existing target row and forces one
 total HTTP attempt with retries disabled. Keep the ordinary ingestion worker and
 Beat stopped; the wrapper checks the local process/container state before
-starting and serializes concurrent wrapper invocations. Success requires both
-the exact bar and its DB-stamped post-commit availability receipt. It does not
-build a snapshot or serve a forecast; those remain a later, separately budgeted
-backfill gate.
+starting, including Celery launched through versioned Python executables. A
+machine-wide Windows mutex serializes wrapper invocations, and the Python module
+holds a non-blocking PostgreSQL advisory lock from the absence precheck through
+the post-commit receipt proof, so direct module invocations also fail closed on
+contention. Success requires both the exact bar and its DB-stamped post-commit
+availability receipt. It does not build a snapshot or serve a forecast; those
+remain a later, separately budgeted backfill gate.
 
 ---
 

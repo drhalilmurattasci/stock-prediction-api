@@ -42,11 +42,12 @@ try {
     if ($conflictingServices.Count -ne 0) {
         throw "stop the ordinary worker and beat before the one-attempt smoke"
     }
+    $workerProcessNamePattern = "^(?:python(?:w|[0-9]+(?:\.[0-9]+)?)?|celery)(?:\.exe)?$"
     $nativeWorkers = @(
         Get-CimInstance Win32_Process |
             Where-Object {
                 $_.ProcessId -ne $PID -and
-                $_.Name -match "^(python|pythonw|celery)(\.exe)?$" -and
+                $_.Name -match $workerProcessNamePattern -and
                 $_.CommandLine -match "(?i)\bcelery\b"
             }
     )

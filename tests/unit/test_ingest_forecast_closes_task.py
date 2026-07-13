@@ -53,6 +53,19 @@ class FakeProvider:
         ]
 
 
+class FailingProvider(FakeProvider):
+    async def get_daily_bars(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        *,
+        adjusted: bool = False,
+    ) -> list[OHLCVBar]:
+        self.calls.append((symbol, start, end, adjusted))
+        raise RuntimeError("Authorization: Bearer FAKE_KEY_MUST_NOT_REACH_RESULT")
+
+
 async def test_ingests_latest_completed_session_with_distinct_source(
     monkeypatch: Any,
 ) -> None:
@@ -96,6 +109,49 @@ async def test_ingests_latest_completed_session_with_distinct_source(
     assert all(call["source"] == "polygon_open_close" for call in resolution_calls)
     assert all(call["adjustment_basis"] == "raw" for call in resolution_calls)
     assert all(call["source"] == "polygon_open_close" for call in upsert_calls)
+
+
+async def test_error_details_can_be_suppressed_for_the_live_credential_smoke(
+    monkeypatch: Any,
+) -> None:
+    provider = FailingProvider()
+    warnings: list[dict[str, Any]] = []
+
+    class CapturingLog:
+        def warning(self, _event: str, **kwargs: Any) -> None:
+            warnings.append(kwargs)
+
+        def info(self, _event: str, **kwargs: Any) -> None:
+            del kwargs
+
+    async def resolve_fetch_start(sessionmaker: Any, **kwargs: Any) -> date:
+        del sessionmaker
+        return kwargs["requested_start"]
+
+    monkeypatch.setattr(close_task, "_resolve_fetch_start", resolve_fetch_start)
+    monkeypatch.setattr(close_task, "log", CapturingLog())
+    result = await close_task.ingest_forecast_closes_async(
+        symbols=["MSFT"],
+        start=date(2026, 7, 10),
+        end=date(2026, 7, 10),
+        settings=Settings(app_env="test", polygon_api_key="unused"),
+        provider_factory=lambda _settings: provider,  # type: ignore[return-value]
+        sessionmaker=object(),  # type: ignore[arg-type]
+        clock=lambda: datetime(2026, 7, 13, 21, tzinfo=UTC),
+        include_error_details=False,
+    )
+
+    assert result["status"] == "failed"
+    assert result["per_symbol"][0]["error"] == "details suppressed"
+    assert "FAKE_KEY_MUST_NOT_REACH_RESULT" not in repr(result)
+    assert warnings == [
+        {
+            "symbol": "MSFT",
+            "error_type": "RuntimeError",
+            "retryable": True,
+            "exc_info": False,
+        }
+    ]
 
 
 def test_latest_completed_session_never_selects_an_open_session() -> None:
