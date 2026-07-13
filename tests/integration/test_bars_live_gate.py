@@ -66,6 +66,7 @@ from app.services.forecast_snapshots import (
     SnapshotObservation,
     SnapshotSourceLineage,
     build_snapshot_record,
+    parse_snapshot_payload,
     validate_and_resolve_snapshot,
 )
 from app.services.prices import read_prices
@@ -891,20 +892,81 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     async with runtime_maker() as session, session.begin():
         await finalize_bar_version_availability(session, plan.rows)
 
-    cutoff = await database_snapshot_cutoff(builder_maker)
-    spec = SnapshotBuildSpec(
+    historical_cutoff = await database_snapshot_cutoff(builder_maker)
+    historical_spec = SnapshotBuildSpec(
         symbol="AAPL",
         target="close",
         horizon_unit="trading_day",
-        as_of=cutoff,
+        as_of=historical_cutoff,
     )
     builder = ForecastSnapshotBuilder(builder_maker)
-    created = await builder.build(spec)
-    replayed = await builder.build(spec)
-    assert created.created is True
-    assert replayed.created is False
-    assert replayed.snapshot_id == created.snapshot_id
-    assert replayed.availability_checked_at == created.availability_checked_at
+    historical_created = await builder.build(historical_spec)
+
+    # Freeze the historical cutoff above, then publish and finalize a newer
+    # version. Replaying the old semantic key must reconstruct the prior close
+    # from bars_revisions, while a later cutoff must select the restatement.
+    previous = bars[-1]
+    restated_close = previous.close + 7.0
+    restatement = OHLCVBar(
+        symbol=previous.symbol,
+        timestamp=previous.timestamp,
+        timespan=previous.timespan,
+        multiplier=previous.multiplier,
+        open=restated_close - 0.5,
+        high=restated_close + 1.0,
+        low=restated_close - 1.0,
+        close=restated_close,
+        volume=previous.volume,
+        source=previous.source,
+        adjustment_basis=previous.adjustment_basis,
+        fetched_at=previous.fetched_at + timedelta(minutes=1),
+    )
+    async with runtime_maker() as session, session.begin():
+        restated_plan = await upsert_bars(session, [restatement])
+    assert len(restated_plan.revisions) == 1
+    async with runtime_maker() as session, session.begin():
+        assert await finalize_bar_version_availability(session, restated_plan.rows) == 1
+
+    historical_replayed = await builder.build(historical_spec)
+    current_cutoff = await database_snapshot_cutoff(builder_maker)
+    current_created = await builder.build(
+        SnapshotBuildSpec(
+            symbol="AAPL",
+            target="close",
+            horizon_unit="trading_day",
+            as_of=current_cutoff,
+        )
+    )
+    assert historical_created.created is True
+    assert historical_replayed.created is False
+    assert historical_replayed.snapshot_id == historical_created.snapshot_id
+    assert historical_replayed.availability_checked_at == historical_created.availability_checked_at
+    assert current_created.created is True
+    assert current_created.snapshot_id != historical_created.snapshot_id
+
+    async with builder_maker() as session:
+        stored_snapshots = (
+            (
+                await session.execute(
+                    select(ForecastInputSnapshot).where(
+                        ForecastInputSnapshot.snapshot_id.in_(
+                            (
+                                historical_created.snapshot_id,
+                                current_created.snapshot_id,
+                            )
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    payloads = {
+        row.snapshot_id: parse_snapshot_payload(bytes(row.canonical_payload))
+        for row in stored_snapshots
+    }
+    assert payloads[historical_created.snapshot_id].observations[-1].value == previous.close
+    assert payloads[current_created.snapshot_id].observations[-1].value == restated_close
 
     service = SnapshotForecastService(
         repository=SqlForecastInputSnapshotRepository(
@@ -922,12 +984,12 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
             horizon=2,
             horizon_unit="trading_day",
             target="close",
-            snapshot_id=created.snapshot_id,
+            snapshot_id=current_created.snapshot_id,
             model="baseline_naive",
             interval_coverages=[0.8],
         )
     )
     assert response.symbol == "AAPL"
-    assert response.provenance.snapshot_id == created.snapshot_id
+    assert response.provenance.snapshot_id == current_created.snapshot_id
     assert response.provenance.lookahead_check.status == "passed"
     assert len(response.forecasts) == 2

@@ -10,7 +10,7 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 
 ## Status
 
-🚧 **First honest forecast vertical slice is code-complete; live DB proof is still gated.**
+🚧 **First honest forecast vertical slice is code-complete; the live DB gate passes.**
 The repository now has API-key auth, bounded `/v1/prices` reads, versioned Polygon
 daily-bar ingestion, append-only restatement history, leakage-aware baselines, an
 immutable point-in-time snapshot builder, and snapshot-backed `/v1/forecast`.
@@ -24,9 +24,13 @@ prices remain refused until the separate corporate-action ledger exists. The
 route also stays `501` until an operator explicitly pins the code-derived policy
 and availability hashes.
 
-Unit/static gates pass locally. The destructive TimescaleDB integration gate is
-skipped until Docker, `.env`, and explicit owner/runtime/snapshot-builder URLs
-point to a designated throwaway database.
+Unit/static gates and the one-command destructive TimescaleDB integration gate
+pass locally. `run-live-gate.ps1` is hard-bound to the designated
+`stockapi_test` throwaway database and proves migrations through `0008`, exact
+runtime/builder role boundaries, restatement history, historical point-in-time
+snapshot reconstruction, and snapshot-backed serving. Ordinary test runs still
+skip that gate when its explicit live-database environment is absent. The first
+real Massive/Polygon call remains a separate credentialed smoke gate.
 
 ## Quickstart
 

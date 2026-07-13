@@ -333,7 +333,7 @@ services:
       POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
       POSTGRES_SNAPSHOT_BUILDER_PASSWORD: ${POSTGRES_SNAPSHOT_BUILDER_PASSWORD}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - ./data/pgdata:/var/lib/postgresql/data
       - ./scripts/db-init:/docker-entrypoint-initdb.d:ro
@@ -535,12 +535,14 @@ tables before proving migrations, role ACLs, bar revisions, snapshot creation,
 and read-only serving:
 
 ```powershell
-$env:TEST_DATABASE_URL = 'postgresql+asyncpg://<owner>:<encoded-secret>@localhost:5432/<throwaway-db>'
-$env:TEST_RUNTIME_DATABASE_URL = 'postgresql+asyncpg://stockapi_app:<encoded-secret>@localhost:5432/<throwaway-db>'
-$env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = 'postgresql+asyncpg://stockapi_snapshot_builder:<encoded-secret>@localhost:5432/<throwaway-db>'
-$env:TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET = 'stockapi-test-only'
-uv run pytest tests/integration -v
+.\run-live-gate.ps1
 ```
+
+The runner refuses any database/user except `stockapi_test` owned by
+`stockapi_owner`, requires distinct owner/runtime/snapshot-builder passwords in
+`.env`, starts TimescaleDB, waits at most five minutes for health, supplies the
+destructive-test sentinel only for the test process, and removes all test URLs
+afterward. It never makes a vendor call.
 
 ✅ When all rows pass, the database migration, privilege, revision, snapshot,
 and read-only serving boundaries are proven. Polygon credentials, Celery/Beat,
