@@ -37,11 +37,10 @@ from app.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.models.bars import Bar, BarVersionAvailability
 from app.db.session import build_engine, build_sessionmaker
+from app.services.market_calendar import latest_completed_xnys_session
 from data_sources.base import OHLCVBar
 from data_sources.guards import AsyncPacingCostRateGuard
-from data_sources.polygon_open_close import PolygonOpenCloseProvider
 from ingestion.locks import vendor_operation_lock_id
-from ingestion.tasks.ingest_forecast_closes import latest_completed_xnys_session
 from ingestion.tasks.ingest_prices import _advisory_xact_lock
 from ingestion.upsert import BAR_VERSION_KEY, upsert_bars
 
@@ -60,6 +59,16 @@ DEFAULT_LEDGER_PATH = REPO_ROOT / "data" / "vendor_backfill_attempts.jsonl"
 _AUTHORIZATION_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 _PLAN_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _GIT_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+_GIT_ROUTING_ENVIRONMENT = frozenset(
+    {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    }
+)
 
 
 class BackfillRefused(RuntimeError):
@@ -200,7 +209,19 @@ def _dates_digest(values: tuple[date, ...]) -> str:
 def _clean_git_revision() -> str:
     """Bind planning and execution to one reviewed, clean repository commit."""
 
+    environment = os.environ.copy()
+    for name in _GIT_ROUTING_ENVIRONMENT:
+        environment.pop(name, None)
     try:
+        repository = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=REPO_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         status = subprocess.run(
             [
                 "git",
@@ -210,6 +231,7 @@ def _clean_git_revision() -> str:
                 "--ignore-submodules=none",
             ],
             cwd=REPO_ROOT,
+            env=environment,
             check=False,
             capture_output=True,
             text=True,
@@ -218,6 +240,7 @@ def _clean_git_revision() -> str:
         revision = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=REPO_ROOT,
+            env=environment,
             check=False,
             capture_output=True,
             text=True,
@@ -225,6 +248,16 @@ def _clean_git_revision() -> str:
         )
     except (OSError, subprocess.SubprocessError):
         raise BackfillRefused("could not prove a clean Git revision") from None
+    try:
+        repository_root = Path(repository.stdout.strip()).resolve()
+    except (OSError, ValueError):
+        raise BackfillRefused("could not prove the repository root") from None
+    if (
+        repository.returncode != 0
+        or repository.stderr.strip()
+        or repository_root != REPO_ROOT.resolve()
+    ):
+        raise BackfillRefused("Git is not rooted at the reviewed repository")
     if status.returncode != 0 or status.stdout.strip() or status.stderr.strip():
         raise BackfillRefused("the backfill operator requires a clean Git worktree")
     value = revision.stdout.strip()
@@ -854,6 +887,10 @@ def _default_provider(
     settings: Settings,
     guard: AsyncPacingCostRateGuard,
 ) -> BackfillProvider:
+    # Keep provider code and vendor SDKs out of read-only planning and the
+    # separate no-vendor forecast-demo controller.
+    from data_sources.polygon_open_close import PolygonOpenCloseProvider
+
     key = settings.polygon_api_key or ""
     if not key:
         raise BackfillRefused("POLYGON_API_KEY must be non-empty in .env")

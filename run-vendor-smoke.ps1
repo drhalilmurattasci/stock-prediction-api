@@ -14,7 +14,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 # Global\ scope: exclusion must hold machine-wide across logon sessions
 # (console + RDP + scheduled task), not just within one session.
-$mutex = [System.Threading.Mutex]::new($false, "Global\StockApiVendorSmoke")
+$mutex = [System.Threading.Mutex]::new($false, "Global\StockApiMutatingOperator")
 $mutexHeld = $false
 
 Push-Location -LiteralPath $PSScriptRoot
@@ -31,7 +31,47 @@ try {
     if (-not (Test-Path -LiteralPath ".env")) {
         throw ".env is required"
     }
-    $runningServices = @(docker compose ps --status running --services)
+    foreach ($name in @(
+        "COMPOSE_FILE",
+        "COMPOSE_PROFILES",
+        "COMPOSE_PROJECT_NAME",
+        "COMPOSE_ENV_FILES",
+        "COMPOSE_DISABLE_ENV_FILE",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST"
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name, "Process"))) {
+            throw "$name must be unset for the local vendor smoke"
+        }
+    }
+    $dockerContext = ([string](docker context show)).Trim()
+    if ($LASTEXITCODE -ne 0 -or $dockerContext -cne "desktop-linux") {
+        throw "Docker must use the local desktop-linux context"
+    }
+    $dockerEndpoint = ([string](
+        docker context inspect "desktop-linux" --format "{{.Endpoints.docker.Host}}"
+    )).Trim()
+    if ($LASTEXITCODE -ne 0 -or $dockerEndpoint -cne "npipe:////./pipe/dockerDesktopLinuxEngine") {
+        throw "Docker must use the local Docker Desktop Linux endpoint"
+    }
+    $dockerArgs = @("--context", "desktop-linux")
+    $dockerIdentity = ([string](
+        docker @dockerArgs info --format "{{.Name}}|{{.OperatingSystem}}"
+    )).Trim()
+    if ($LASTEXITCODE -ne 0 -or $dockerIdentity -cne "docker-desktop|Docker Desktop") {
+        throw "the local Docker Desktop Linux daemon is unavailable"
+    }
+    $composeFile = (Resolve-Path -LiteralPath "docker-compose.yml").Path
+    $envFile = (Resolve-Path -LiteralPath ".env").Path
+    $composeArgs = @(
+        "--env-file", $envFile,
+        "--file", $composeFile,
+        "--project-directory", $PSScriptRoot,
+        "--project-name", "stock-api"
+    )
+    $runningServices = @(
+        docker @dockerArgs compose @composeArgs ps --status running --services
+    )
     if ($LASTEXITCODE -ne 0) {
         throw "docker compose status check failed"
     }

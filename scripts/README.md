@@ -32,3 +32,26 @@ Smoke, backfill, ordinary close ingestion, and ordinary Polygon price ingestion
 share one PostgreSQL vendor-operation lock, so no controlled Polygon lane can
 overlap an authorized run. See `INSTALL.md` for the owner authorization and
 failure/recovery runbook.
+
+`forecast_demo.py` is the final local seal-and-serve lane behind
+`run-forecast-demo.ps1`. Its `plan` mode is read-only and requires the exact
+258-session MSFT backfill, database-clock session currency, all exact current
+version receipts, one configured API key, the code-derived policy pins, and a
+clean Git commit. `execute` requires that content-addressed plan plus the exact
+`stockapi-msft-seal-serve-only` sentinel. It starts only the loopback API and
+runs one short-lived container with the `stockapi_snapshot_builder` credential;
+it never starts a persistent queue consumer, ordinary worker, or Beat. The
+wrapper builds from an exact detached Git worktree, binds both roles to the
+same revision-labelled immutable image, starts the API with that image ID, and
+runs the builder with the same ID plus `--pull never`. The controller also
+requires the freshly recreated API container ID, Compose project/service
+labels, and zero mounts. After a validated seal, any remaining proof failure is
+reported as a sanitized `sealed_proof_failed` recovery receipt rather than
+hiding the committed snapshot. The controller proves unauthenticated `401`,
+authenticated pre-seal `404`, the
+sealed row through the runtime role, and authenticated `200` parsed as the
+locked `ForecastResponse`. This lane has no vendor-provider import and makes no
+vendor call. It also proves a wrong key returns `401`, disables ambient HTTP
+proxies, binds API-key identity with a nonpublic JWT-keyed HMAC inside the plan,
+and compares the response's exact XNYS schedule, deterministic naïve values,
+0.8 interval bucket, and source-manifest lineage to the sealed bytes.

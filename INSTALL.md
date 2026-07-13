@@ -542,13 +542,19 @@ The runner refuses any database/user except `stockapi_test` owned by
 `stockapi_owner`, requires distinct owner/runtime/snapshot-builder passwords in
 `.env`, starts TimescaleDB, waits at most five minutes for health, supplies the
 destructive-test sentinel only for the test process, and removes all test URLs
-afterward. The module fixture then drops its seeded test data and reapplies
+afterward. Both wrapper and test module independently enforce the exact local
+owner target; the wrapper also refuses to reset while API/Celery/uvicorn
+processes could race it. All mutating operator wrappers share one machine-wide
+mutex, and the fixture holds the same PostgreSQL vendor-operation advisory lock
+used by direct smoke/backfill/demo lanes across reset and teardown. The module
+fixture then drops its seeded test data and reapplies
 migrations, leaving an empty schema at migration head so the later vendor smoke
 still proves absence. It never makes a vendor call.
 
-✅ When all rows pass, the database migration, privilege, revision, snapshot,
-and read-only serving boundaries are proven. Polygon credentials, Celery/Beat,
-and the authenticated HTTP route still require their separate smoke checks.
+✅ When all rows pass, the database migration, privilege, revision, immutable
+snapshot, runtime-role serving, API-key short circuit, and authenticated HTTP
+forecast boundaries are proven. Polygon credentials and Celery/Beat remain
+outside this destructive gate.
 
 ### Separately authorized first vendor request
 
@@ -654,6 +660,84 @@ Success reports 258 required sessions, zero remaining sessions, and equal
 `attempts_reserved`/`attempts_spent`. Re-run `plan` to independently obtain
 `status: complete`; only then proceed to snapshot sealing and authenticated
 forecast serving.
+
+### Separately authorized local seal-and-serve proof
+
+This step makes **no vendor request**. It does make one idempotent insert into
+`forecast_input_snapshots` (or proves an exact replay) and starts the local API,
+so review a fresh read-only plan before authorizing it. Prerequisites are:
+
+- the backfill plan reports all 258 exact MSFT receipts complete;
+- `.env` pins both hashes printed by the policy command;
+- `.env` contains exactly one non-empty `API_KEYS` value; and
+- `.env` contains a non-default ASCII `JWT_SECRET` of at least 32 characters
+  (used only as the HMAC key for a nonpublic API-key plan binding); and
+- the worktree is clean at the reviewed commit.
+
+Plan without starting the API or writing a snapshot:
+
+```powershell
+.\run-forecast-demo.ps1 -Mode plan -End 2026-07-10
+```
+
+`status: ready` binds the exact backfill/version state, stable maximum receipt
+cutoff, database-clock session, clean `tool_revision`, policy identities, local
+runtime/broker targets, secret-safe API-key identity, bounded session-rollover
+margin, and fixed five-step `baseline_naive` request into `plan_id`. A newer
+completed XNYS session, data restatement, receipt change, credential/policy
+change, code change, or dirty worktree invalidates it. The HMAC binding is never
+printed; only the outer content-addressed `plan_id` is public.
+
+After the owner explicitly authorizes that exact plan, execute:
+
+```powershell
+.\run-forecast-demo.ps1 `
+  -Mode execute `
+  -End 2026-07-10 `
+  -PlanId sha256:<64-hex-plan-id> `
+  -Authorization stockapi-msft-seal-serve-only
+```
+
+The wrapper first rechecks the plan before changing service state, then builds
+one shared API/builder image from an exact detached worktree of the reviewed
+Git commit (never the mutable checkout), explicitly starts the two local Redis
+dependencies, publishes the API at `127.0.0.1:8000`, and refuses ordinary
+worker, Beat, persistent snapshot worker, or native Celery/uvicorn contention.
+It pins the repository Compose file/project and the local Docker Desktop Linux
+daemon; ambient Compose/Docker overrides are refused. The image carries the
+reviewed revision as an OCI label and baked file. The wrapper hands immutable
+image and freshly recreated API-container IDs to the controller; API startup
+uses `--no-build --pull never`, and the builder is overridden to the exact
+image ID and run with `--pull never --rm --no-deps`. Container project/service,
+running state, and zero mounts are checked before and after the write. Snapshot
+creation is one short-lived process, not a queue consumer, so stale Redis
+messages cannot widen the write set. A deterministic plan-labelled container
+name permits immutable-ID cleanup after interruption. The host controller holds
+the shared PostgreSQL vendor lock, recomputes the exact plan, proves
+unauthenticated and wrong-key `401` plus authenticated missing-snapshot `404`, validates
+the sealed bytes/header/availability evidence through `stockapi_app`, then
+requires an authenticated `200` parsed as `ForecastResponse` with five ordered
+XNYS steps exactly matching the sealed schedule, deterministic naïve
+points/quantiles, the requested 0.8 intervals, exact Polygon source-manifest
+lineage, passed lookahead evidence, and honest uncalibrated metadata. HTTPX
+ignores ambient proxies, vendor variables are removed from the controller and
+one-shot environments (then restored in the caller), and no database password
+or API key appears on argv or in proof JSON. This local attestation assumes the
+Git object store, OS user, and Docker Desktop daemon are trusted; production
+provenance additionally requires digest-pinned bases and signed artifacts.
+
+Success is the demo milestone: one immutable point-in-time snapshot and one
+real authenticated forecast response. The local API remains available on
+loopback for inspection; vendor backfill authorization is neither implied nor
+consumed by this step. Planning/execution refuse inside a ten-minute guard band
+before the next XNYS close. If the session nevertheless advances after the
+snapshot commits, the command exits `3` with an explicit nonsecret
+`sealed_session_advanced` receipt (including the snapshot ID) instead of hiding
+the committed write behind a generic failure. Any runtime-row, HTTP, response,
+container-revalidation, final-clock, or lock-release failure after a validated
+seal likewise exits `3` with `sealed_proof_failed`, the snapshot ID/status,
+immutable image IDs, fixed failure phase, and exception type/HTTP status—but
+never exception text or response bodies.
 
 ---
 

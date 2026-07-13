@@ -25,7 +25,6 @@ from data_sources.base import (
     SymbolNotFoundError,
 )
 from data_sources.guards import InMemoryCostRateGuard
-from data_sources.polygon import PolygonProvider
 from ingestion.locks import (
     acquire_advisory_xact_lock,
     bar_series_lock_id,
@@ -231,6 +230,10 @@ def _build_provider(
     settings: Settings,
     provider_factory: ProviderFactory | None,
 ) -> MarketDataProvider:
+    # Read-only planners import task helpers; defer the vendor adapter/SDK until
+    # an actual ingestion provider is constructed.
+    from data_sources.polygon import PolygonProvider
+
     if provider_factory is not None:
         return provider_factory(settings)
     if not settings.polygon_api_key:

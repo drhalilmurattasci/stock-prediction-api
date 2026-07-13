@@ -36,6 +36,7 @@ from pathlib import Path
 
 import exchange_calendars
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, make_url, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -45,7 +46,8 @@ from app.config import Settings
 from app.db.models.bars import Bar, BarRevision
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.db.session import build_engine, build_sessionmaker
-from app.schemas.forecast import ForecastRequest
+from app.main import create_app
+from app.schemas.forecast import ForecastRequest, ForecastResponse
 from app.schemas.prices import PriceFilters
 from app.services.forecast_serving import (
     ForecastServingPolicy,
@@ -71,7 +73,11 @@ from app.services.forecast_snapshots import (
 )
 from app.services.prices import read_prices
 from data_sources.base import OHLCVBar
-from ingestion.locks import exclusive_vendor_operation
+from ingestion.locks import (
+    VendorOperationBusy,
+    exclusive_vendor_operation,
+    vendor_operation_lock_id,
+)
 from ingestion.upsert import (
     BarVersionConflictError,
     finalize_bar_version_availability,
@@ -111,6 +117,26 @@ def _async_url(url: str) -> str:
 
 def _sync_url(url: str) -> str:
     return _async_url(url).replace("+asyncpg", "+psycopg")
+
+
+def _validated_owner_url(url: str) -> str:
+    """Bind destructive reset authority to the one local throwaway target."""
+
+    parsed = make_url(_async_url(url))
+    target = (
+        parsed.drivername,
+        parsed.username,
+        (parsed.host or "").lower(),
+        parsed.port or 5432,
+        parsed.database,
+    )
+    allowed = {
+        ("postgresql+asyncpg", "stockapi_owner", "localhost", 5432, "stockapi_test"),
+        ("postgresql+asyncpg", "stockapi_owner", "127.0.0.1", 5432, "stockapi_test"),
+    }
+    if target not in allowed or not parsed.password or parsed.query:
+        raise ValueError("TEST_DATABASE_URL must use stockapi_owner on local stockapi_test:5432")
+    return parsed.render_as_string(hide_password=False)
 
 
 def _runtime_url_for(owner_url: str) -> str:
@@ -169,10 +195,20 @@ def _drop_project_schema(url: str) -> None:
 
 
 def _run_alembic(url: str, *arguments: str) -> None:
+    environment = os.environ.copy()
+    environment.pop("ALEMBIC_CONFIG", None)
+    environment.update({"DATABASE_URL": url, "MIGRATION_DATABASE_URL": url})
     result = subprocess.run(  # fresh process: env.py resolves DATABASE_URL uncached
-        [sys.executable, "-m", "alembic", *arguments],
+        [
+            sys.executable,
+            "-m",
+            "alembic",
+            "-c",
+            str(REPO_ROOT / "alembic.ini"),
+            *arguments,
+        ],
         cwd=REPO_ROOT,
-        env={**os.environ, "DATABASE_URL": url, "MIGRATION_DATABASE_URL": url},
+        env=environment,
         capture_output=True,
         text=True,
         timeout=300,
@@ -185,9 +221,22 @@ def _run_alembic(url: str, *arguments: str) -> None:
 @pytest.fixture(scope="module")
 def migrated_database_url() -> LiveDatabaseUrls:
     """Reset/migrate the throwaway DB, then restore an empty migrated schema."""
-    url = _async_url(TEST_DATABASE_URL)
+    url = _validated_owner_url(TEST_DATABASE_URL)
     runtime_url = _runtime_url_for(url)
     snapshot_builder_url = _snapshot_builder_url_for(url)
+    guard_engine = create_engine(_sync_url(url))
+    guard_connection = guard_engine.connect()
+    acquired = bool(
+        guard_connection.execute(
+            text("SELECT pg_try_advisory_lock(:lock_id)"),
+            {"lock_id": vendor_operation_lock_id()},
+        ).scalar_one()
+    )
+    guard_connection.commit()
+    if not acquired:
+        guard_connection.close()
+        guard_engine.dispose()
+        raise RuntimeError("another controlled vendor/operator lane is active")
     try:
         _drop_project_schema(url)
         _run_alembic(url, "upgrade", "head")
@@ -205,8 +254,17 @@ def migrated_database_url() -> LiveDatabaseUrls:
     finally:
         # The gate may seed the exact vendor lane. Restore a clean migrated
         # throwaway database so a later one-request smoke still proves absence.
-        _drop_project_schema(url)
-        _run_alembic(url, "upgrade", "head")
+        try:
+            _drop_project_schema(url)
+            _run_alembic(url, "upgrade", "head")
+        finally:
+            guard_connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_id)"),
+                {"lock_id": vendor_operation_lock_id()},
+            )
+            guard_connection.commit()
+            guard_connection.close()
+            guard_engine.dispose()
 
 
 @pytest.fixture
@@ -631,10 +689,12 @@ async def test_backfill_store_repairs_only_exact_dates_and_shares_vendor_lock(
         assert exact_persist.complete_dates == (newly_persisted,)
         assert exact_persist.repairable_dates == (out_of_window,)
 
-    async with exclusive_vendor_operation(settings):
-        with pytest.raises(BackfillRefused, match="already running"):
-            async with _exclusive_backfill(settings):
-                pytest.fail("contended backfill lock body must not run")
+    with pytest.raises(VendorOperationBusy, match="already running"):
+        async with exclusive_vendor_operation(settings):
+            pytest.fail("contended generic vendor lock body must not run")
+    with pytest.raises(BackfillRefused, match="already running"):
+        async with _exclusive_backfill(settings):
+            pytest.fail("contended backfill lock body must not run")
 
 
 async def test_stale_conflicts_and_history_mutation_fail_closed(
@@ -1071,3 +1131,43 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     assert response.provenance.snapshot_id == current_created.snapshot_id
     assert response.provenance.lookahead_check.status == "passed"
     assert len(response.forecasts) == 2
+
+    # Complete the real HTTP chain as the runtime role: aggregate-router auth
+    # must short-circuit first, then the same immutable row must serve through
+    # app factory -> dependency wiring -> repository -> response validation.
+    api_key = "live-gate-forecast-key"
+    api_settings = Settings(
+        app_env="test",
+        database_url=engine.url.render_as_string(hide_password=False),
+        redis_cache_url="redis://localhost:6379/0",
+        rate_limit_enabled=False,
+        api_keys=api_key,
+        forecast_resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+        forecast_trusted_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+    )
+    app = create_app(api_settings)
+    params = {
+        "horizon": 5,
+        "horizon_unit": "trading_day",
+        "target": "close",
+        "snapshot_id": current_created.snapshot_id,
+        "model": "baseline_naive",
+        "coverage": 0.8,
+    }
+    with TestClient(app) as client:
+        unauthenticated = client.get("/v1/forecast/AAPL", params=params)
+        authenticated = client.get(
+            "/v1/forecast/AAPL",
+            params=params,
+            headers={"X-API-Key": api_key},
+        )
+
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.headers["WWW-Authenticate"] == "X-API-Key"
+    assert authenticated.status_code == 200
+    served = ForecastResponse.model_validate(authenticated.json())
+    assert served.symbol == "AAPL"
+    assert served.provenance.snapshot_id == current_created.snapshot_id
+    assert served.provenance.feature_set_hash == current_created.snapshot_id
+    assert served.provenance.lookahead_check.status == "passed"
+    assert len(served.forecasts) == 5

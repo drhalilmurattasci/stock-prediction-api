@@ -39,6 +39,11 @@ no-auto-retry backfill checkpoints one bar and exact availability receipt per
 request at a hard 5/60 pace. Its append-only local ledger makes late failures
 resumable and ambiguous crashes fail closed. All controlled Polygon ingestion,
 smoke, and backfill paths share one vendor-wide PostgreSQL operation lock.
+The final no-vendor step is also scaffolded: a read-only plan binds the completed
+backfill, clean commit, database clock, policy hashes, and API auth configuration;
+its separately authorized execution uses one short-lived least-privilege builder
+container, then proves the real loopback route returns `401` without a key and
+`200` with the configured key. It never starts the ordinary worker or Beat.
 
 ## Quickstart
 
@@ -60,7 +65,10 @@ uv run python -m ingestion.tasks.build_forecast_snapshots --print-policy-hashes
 The full container tier (`--profile app`) includes a dedicated
 `stockapi_snapshot_builder` worker whose credential cannot write bars or mutate
 sealed snapshots. See [INSTALL.md](INSTALL.md) for role bootstrap and the live
-database gate.
+database gate. For the bounded milestone proof, use `run-forecast-demo.ps1`
+instead of starting the full app tier; Compose publishes the API on loopback
+only. That proof builds from the exact reviewed Git commit and pins both API
+and one-shot builder execution to revision-labelled immutable image IDs.
 
 See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Run the ordinary
 worker, least-privilege snapshot worker, and scheduler with `make worker`,

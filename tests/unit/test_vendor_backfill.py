@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -662,6 +663,29 @@ def test_main_never_renders_a_secret_bearing_failure(
     assert result == 1
     assert fake_key not in rendered
     assert "Authorization" not in rendered
+
+
+def test_clean_revision_scrubs_git_routing_and_proves_repository_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in backfill._GIT_ROUTING_ENVIRONMENT:
+        monkeypatch.setenv(name, "outside-repository")
+
+    def run(arguments: list[str], **kwargs: object) -> SimpleNamespace:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert not (backfill._GIT_ROUTING_ENVIRONMENT & environment.keys())
+        if "--show-toplevel" in arguments:
+            stdout = str(backfill.REPO_ROOT)
+        elif "status" in arguments:
+            stdout = ""
+        else:
+            stdout = TEST_REVISION
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(backfill.subprocess, "run", run)
+
+    assert backfill._clean_git_revision() == TEST_REVISION
 
 
 def test_wrapper_parses_and_never_accepts_the_key_on_argv() -> None:

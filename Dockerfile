@@ -27,6 +27,13 @@ COPY ml ./ml
 COPY alembic.ini ./
 COPY migrations ./migrations
 
+# The local forecast proof binds the mutable Compose tags back to the exact
+# reviewed commit, and the one-shot builder independently checks this file
+# before opening a database connection.
+ARG STOCKAPI_BUILD_REVISION=unattested
+LABEL org.opencontainers.image.revision="${STOCKAPI_BUILD_REVISION}"
+RUN printf '%s\n' "$STOCKAPI_BUILD_REVISION" > /app/.stockapi-build-revision
+
 EXPOSE 8000
 # Default command runs the API; worker/snapshot-builder/beat override it in Compose.
 CMD ["uvicorn", "app.main:app", \

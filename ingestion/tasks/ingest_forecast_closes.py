@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.config import Settings, get_settings
 from app.db.models.bars import Bar
 from app.db.session import build_engine, build_sessionmaker
+from app.services.market_calendar import latest_completed_xnys_session
 from data_sources.base import MarketDataProvider, OHLCVBar
 from data_sources.guards import AsyncPacingCostRateGuard
 from data_sources.polygon_open_close import PolygonOpenCloseProvider
@@ -45,19 +46,6 @@ OperationLockFn = Callable[[Settings], AbstractAsyncContextManager[None]]
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
-
-
-def latest_completed_xnys_session(value: datetime) -> date:
-    """Resolve the most recent XNYS session whose official close has passed."""
-
-    if value.tzinfo is None:
-        raise ValueError("clock must return a timezone-aware datetime")
-    now = value.astimezone(UTC)
-    calendar = xcals.get_calendar("XNYS")
-    label = calendar.date_to_session(pd.Timestamp(now.date()), direction="previous")
-    if calendar.session_close(label).to_pydatetime() > now:
-        label = calendar.previous_session(label)
-    return label.date()
 
 
 def _earliest_missing_xnys_session(

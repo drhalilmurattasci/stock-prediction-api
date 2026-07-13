@@ -83,12 +83,13 @@ services:
                --backend-store-uri sqlite:////mlflow/mlflow.db
                --artifacts-destination /mlflow/artifacts"
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
       - ./data/mlflow:/mlflow
 
   api:
     profiles: ["app"]
+    image: ${STOCKAPI_API_IMAGE:-stock-api-api}
     build: .
     container_name: stockapi-api
     environment:
@@ -113,7 +114,7 @@ services:
       FORECAST_TRUSTED_AVAILABILITY_RULE_SET_HASH: ${FORECAST_TRUSTED_AVAILABILITY_RULE_SET_HASH:-}
       FORECAST_SEASONAL_PERIOD: ${FORECAST_SEASONAL_PERIOD:-5}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -168,6 +169,7 @@ services:
 
   snapshot-builder:
     profiles: ["app"]
+    image: ${STOCKAPI_SNAPSHOT_BUILDER_IMAGE:-stock-api-snapshot-builder}
     build: .
     container_name: stockapi-snapshot-builder
     command:
