@@ -17,6 +17,8 @@ from numbers import Real
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
+from fastapi import Request
+
 from app.core.exceptions import NotImplementedYet
 from app.schemas.forecast import (
     DataSourceLineage,
@@ -119,9 +121,23 @@ class UnavailableForecastService:
 _UNAVAILABLE_SERVICE = UnavailableForecastService()
 
 
-def get_forecast_service() -> ForecastService:
-    """FastAPI dependency; production replaces this only with a real resolver."""
-    return _UNAVAILABLE_SERVICE
+def get_forecast_service(request: Request) -> ForecastService:
+    """FastAPI dependency: snapshot-backed only when serving is explicitly enabled.
+
+    With the forecast-serving hashes unset (the default) this keeps returning
+    the fail-closed 501 service; nothing is served until an operator pins both
+    the resolution policy and the trusted availability rule set.
+    """
+    # Local import: forecast_serving composes this module's pure assembly, so a
+    # module-level import here would be a cycle.
+    from app.services.forecast_serving import build_forecast_service
+
+    settings = getattr(request.app.state, "settings", None)
+    sessionmaker = getattr(request.app.state, "sessionmaker", None)
+    if settings is None or sessionmaker is None:
+        return _UNAVAILABLE_SERVICE
+    service = build_forecast_service(settings, sessionmaker)
+    return service if service is not None else _UNAVAILABLE_SERVICE
 
 
 def assemble_baseline_forecast_response(

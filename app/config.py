@@ -62,6 +62,15 @@ class Settings(BaseSettings):
     # --- observability ---
     sentry_dsn: str | None = None
 
+    # --- forecast serving (fail-closed: unset keeps /v1/forecast at 501) ---
+    # Both hashes must be explicitly configured before any forecast is served:
+    # the resolution-policy hash pins which snapshot-builder rules are
+    # acceptable, and the trusted rule-set hash is the only availability proof
+    # the server will honor. There are no defaults on purpose.
+    forecast_resolution_policy_hash: str | None = None
+    forecast_trusted_availability_rule_set_hash: str | None = None
+    forecast_seasonal_period: int = Field(default=5, ge=2)
+
     # --- vendor keys ---
     polygon_api_key: str | None = None
     # Temporary single-process guard for the default Polygon ingestion path.
