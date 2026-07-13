@@ -32,7 +32,13 @@ snapshot reconstruction, and snapshot-backed serving. Ordinary test runs still
 skip that gate when its explicit live-database environment is absent. The first
 real Massive/Polygon call remains a separate credentialed smoke gate.
 That gate now has a one-attempt, fail-closed operator command documented in
-`INSTALL.md`; no vendor request runs as part of ordinary verification.
+`INSTALL.md`; no vendor request runs as part of ordinary verification. The next
+history step is also scaffolded but has not run: a clean-commit-bound MSFT plan
+derives the exact final 258 XNYS sessions, then a separately authorized,
+no-auto-retry backfill checkpoints one bar and exact availability receipt per
+request at a hard 5/60 pace. Its append-only local ledger makes late failures
+resumable and ambiguous crashes fail closed. All controlled Polygon ingestion,
+smoke, and backfill paths share one vendor-wide PostgreSQL operation lock.
 
 ## Quickstart
 

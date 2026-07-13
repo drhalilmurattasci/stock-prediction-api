@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, date, datetime, timedelta
+from functools import lru_cache
 from typing import Any
 
 import exchange_calendars as xcals
@@ -20,6 +22,7 @@ from app.db.session import build_engine, build_sessionmaker
 from data_sources.base import MarketDataProvider, OHLCVBar
 from data_sources.guards import AsyncPacingCostRateGuard
 from data_sources.polygon_open_close import PolygonOpenCloseProvider
+from ingestion.locks import exclusive_vendor_operation
 from ingestion.tasks.ingest_prices import (
     _advisory_xact_lock,
     _effective_start_date,
@@ -37,6 +40,7 @@ log = structlog.get_logger(__name__)
 DEFAULT_BOOTSTRAP_DAYS = 420
 ProviderFactory = Callable[[Settings], MarketDataProvider]
 UpsertFn = Callable[[AsyncSession, Sequence[OHLCVBar]], Awaitable[BarUpsertPlan]]
+OperationLockFn = Callable[[Settings], AbstractAsyncContextManager[None]]
 
 
 def _utcnow() -> datetime:
@@ -158,6 +162,7 @@ async def ingest_forecast_closes_async(
     upsert_fn: UpsertFn = upsert_bars,
     clock: Callable[[], datetime] = _utcnow,
     include_error_details: bool = True,
+    operation_lock_fn: OperationLockFn = exclusive_vendor_operation,
 ) -> dict[str, Any]:
     """Fetch and persist official open/close responses for completed sessions."""
 
@@ -173,7 +178,7 @@ async def ingest_forecast_closes_async(
         engine = engine or build_engine(settings)
         sessionmaker = build_sessionmaker(engine)
 
-    provider = _build_provider(settings, provider_factory)
+    provider_name = "polygon_open_close"
     started_at = clock().astimezone(UTC)
     per_symbol: list[dict[str, Any]] = []
     total_rows = 0
@@ -183,75 +188,80 @@ async def ingest_forecast_closes_async(
     retryable_failures = 0
 
     try:
-        async with provider:
-            for symbol in symbol_list:
-                try:
-                    fetch_start = await _resolve_fetch_start(
-                        sessionmaker,
-                        symbol=symbol,
-                        source=provider.name,
-                        timespan="day",
-                        adjustment_basis="raw",
-                        requested_start=requested_start,
-                        end=end_date,
-                        use_watermark=use_watermark and start is None,
-                    )
-                    if fetch_start is None:
-                        bars: list[OHLCVBar] = []
-                        plan = BarUpsertPlan(rows=[], revisions=[])
-                    else:
-                        bars = await provider.get_daily_bars(
-                            symbol,
-                            fetch_start,
-                            end_date,
-                            adjusted=False,
-                        )
-                        plan = await _upsert_symbol_bars(
+        async with operation_lock_fn(settings):
+            provider = _build_provider(settings, provider_factory)
+            provider_name = provider.name
+            async with provider:
+                for symbol in symbol_list:
+                    try:
+                        fetch_start = await _resolve_fetch_start(
                             sessionmaker,
                             symbol=symbol,
                             source=provider.name,
                             timespan="day",
-                            bars=bars,
-                            upsert_fn=upsert_fn,
+                            adjustment_basis="raw",
+                            requested_start=requested_start,
+                            end=end_date,
+                            use_watermark=use_watermark and start is None,
                         )
-                except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures.
-                    failures += 1
-                    retryable = _is_retryable_symbol_error(exc)
-                    retryable_failures += int(retryable)
+                        if fetch_start is None:
+                            bars: list[OHLCVBar] = []
+                            plan = BarUpsertPlan(rows=[], revisions=[])
+                        else:
+                            bars = await provider.get_daily_bars(
+                                symbol,
+                                fetch_start,
+                                end_date,
+                                adjusted=False,
+                            )
+                            plan = await _upsert_symbol_bars(
+                                sessionmaker,
+                                symbol=symbol,
+                                source=provider.name,
+                                timespan="day",
+                                bars=bars,
+                                upsert_fn=upsert_fn,
+                            )
+                    except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures.
+                        failures += 1
+                        retryable = _is_retryable_symbol_error(exc)
+                        retryable_failures += int(retryable)
+                        per_symbol.append(
+                            {
+                                "symbol": symbol,
+                                "status": "failed",
+                                "error_type": type(exc).__name__,
+                                "error": (
+                                    str(exc) if include_error_details else "details suppressed"
+                                ),
+                                "retryable": retryable,
+                            }
+                        )
+                        log.warning(
+                            "ingest_forecast_closes.symbol_failed",
+                            symbol=symbol,
+                            error_type=type(exc).__name__,
+                            retryable=retryable,
+                            exc_info=include_error_details,
+                        )
+                        continue
+
+                    row_count = len(plan.rows)
+                    revision_count = len(plan.revisions)
+                    total_rows += row_count
+                    total_revisions += revision_count
+                    successes += 1
                     per_symbol.append(
                         {
                             "symbol": symbol,
-                            "status": "failed",
-                            "error_type": type(exc).__name__,
-                            "error": str(exc) if include_error_details else "details suppressed",
-                            "retryable": retryable,
+                            "status": "skipped" if fetch_start is None else "ok",
+                            "fetch_start": fetch_start.isoformat() if fetch_start else None,
+                            "fetch_end": end_date.isoformat(),
+                            "bars": len(bars),
+                            "rows_upserted": row_count,
+                            "revisions": revision_count,
                         }
                     )
-                    log.warning(
-                        "ingest_forecast_closes.symbol_failed",
-                        symbol=symbol,
-                        error_type=type(exc).__name__,
-                        retryable=retryable,
-                        exc_info=include_error_details,
-                    )
-                    continue
-
-                row_count = len(plan.rows)
-                revision_count = len(plan.revisions)
-                total_rows += row_count
-                total_revisions += revision_count
-                successes += 1
-                per_symbol.append(
-                    {
-                        "symbol": symbol,
-                        "status": "skipped" if fetch_start is None else "ok",
-                        "fetch_start": fetch_start.isoformat() if fetch_start else None,
-                        "fetch_end": end_date.isoformat(),
-                        "bars": len(bars),
-                        "rows_upserted": row_count,
-                        "revisions": revision_count,
-                    }
-                )
     finally:
         if owns_engine and engine is not None:
             await engine.dispose()
@@ -264,7 +274,7 @@ async def ingest_forecast_closes_async(
 
     result = {
         "status": status,
-        "provider": provider.name,
+        "provider": provider_name,
         "symbols": symbol_list,
         "requested_start": requested_start.isoformat(),
         "end": end_date.isoformat(),
@@ -291,9 +301,24 @@ def _build_provider(
         raise ValueError("POLYGON_API_KEY is required for regular-session close ingestion")
     return PolygonOpenCloseProvider(
         settings.polygon_api_key,
-        guard=AsyncPacingCostRateGuard(
-            max_calls_per_window=settings.polygon_max_calls_per_window,
-            window_seconds=settings.polygon_rate_window_seconds,
-            total_budget=settings.polygon_total_call_budget or None,
+        guard=_polygon_open_close_guard(
+            settings.polygon_max_calls_per_window,
+            settings.polygon_rate_window_seconds,
+            settings.polygon_total_call_budget,
         ),
+    )
+
+
+@lru_cache(maxsize=16)
+def _polygon_open_close_guard(
+    max_calls_per_window: int,
+    window_seconds: float,
+    total_budget: int,
+) -> AsyncPacingCostRateGuard:
+    """Keep pacing and total spend cumulative for one worker process."""
+
+    return AsyncPacingCostRateGuard(
+        max_calls_per_window=max_calls_per_window,
+        window_seconds=window_seconds,
+        total_budget=total_budget or None,
     )

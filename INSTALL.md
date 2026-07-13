@@ -542,7 +542,9 @@ The runner refuses any database/user except `stockapi_test` owned by
 `stockapi_owner`, requires distinct owner/runtime/snapshot-builder passwords in
 `.env`, starts TimescaleDB, waits at most five minutes for health, supplies the
 destructive-test sentinel only for the test process, and removes all test URLs
-afterward. It never makes a vendor call.
+afterward. The module fixture then drops its seeded test data and reapplies
+migrations, leaving an empty schema at migration head so the later vendor smoke
+still proves absence. It never makes a vendor call.
 
 ✅ When all rows pass, the database migration, privilege, revision, snapshot,
 and read-only serving boundaries are proven. Polygon credentials, Celery/Beat,
@@ -571,7 +573,87 @@ holds a non-blocking PostgreSQL advisory lock from the absence precheck through
 the post-commit receipt proof, so direct module invocations also fail closed on
 contention. Success requires both the exact bar and its DB-stamped post-commit
 availability receipt. It does not build a snapshot or serve a forecast; those
-remain a later, separately budgeted backfill gate.
+remain behind the separately budgeted backfill gate below.
+
+### Separately authorized, resumable MSFT backfill
+
+The history pull is not covered by the one-request smoke authorization. Run it
+only from a reviewed, clean commit with the ordinary worker and Beat stopped.
+First produce a read-only plan; this mode does not require `POLYGON_API_KEY` and
+cannot make a vendor call:
+
+```powershell
+.\run-vendor-backfill.ps1 -Mode plan -End 2026-07-10
+```
+
+`-End` must still be the latest completed XNYS session. The plan is hard-bound
+to MSFT, raw `polygon_open_close` bars, the local `stockapi_test` runtime role,
+exactly 258 sessions, and 5 calls per 60 seconds. It also binds the clean Git
+`tool_revision`, every current bar/receipt version, the missing-date digest, and
+the durable attempt ledger state into `plan_id`. Any session rollover, database
+restatement, receipt change, ledger ambiguity, code change, or dirty worktree
+invalidates the plan instead of drifting.
+
+Interpret `status` before asking for authorization:
+
+- `blocked`: the latest-session smoke receipt is absent, or an unresolved prior
+  attempt overlaps a still-missing date. Do not execute.
+- `ready`: one or more exact receipt repairs or vendor calls remain.
+- `complete`: all 258 exact receipts exist; do not execute.
+
+After a successful one-bar latest-session smoke, the first ordinary plan should
+show 257 missing sessions and 257 required outbound attempts. At the hard 5/60
+pace that takes roughly 52 minutes plus network/database time. The owner grant
+must explicitly name MSFT, `window_end`, `tool_revision`, `plan_id`,
+`missing_sessions_sha256`, the exact `required_outbound_attempts`, the 5/60
+pace, and a new lowercase `authorization_id`. The fixed sentinel passed to the
+program is a mechanical check; it does not substitute for that owner grant.
+
+With those exact reviewed values, run:
+
+```powershell
+.\run-vendor-backfill.ps1 `
+  -Mode execute `
+  -End 2026-07-10 `
+  -PlanId sha256:<64-hex-plan-id> `
+  -MaxCalls 257 `
+  -Authorization stockapi-msft-backfill-only `
+  -AuthorizationId msft-20260710-a
+```
+
+The wrapper never accepts the API key on argv. The Python lane disables HTTP
+retries, rechecks session currency at each post-pacing admission, reserves the
+date durably before sending, then commits and re-reads that date's exact
+post-commit receipt before continuing. A vendor-wide PostgreSQL lock excludes
+the smoke and both ordinary Polygon ingestion lanes; the machine-wide wrapper
+mutex and worker/Beat process checks are additional defenses.
+
+Audit history lives at `data/vendor_backfill_attempts.jsonl` (ignored by Git).
+Preserve it; never delete or edit it to clear a refusal, and never reuse an
+authorization ID. Recovery is fail-closed:
+
+- A caught failed attempt has a terminal ledger outcome. Re-run `plan`, obtain
+  a fresh owner grant for only the remaining digest/count, and use a new ID.
+- A committed bar lacking only its receipt is repaired with zero vendor calls:
+
+  ```powershell
+  .\run-vendor-backfill.ps1 `
+    -Mode repair `
+    -End 2026-07-10 `
+    -PlanId sha256:<current-plan-id>
+  ```
+
+  `repair` still mutates the throwaway database, so its wrapper also requires
+  the worker and Beat to be stopped.
+- An unresolved reservation for a still-missing date means the process died in
+  the unknown request/checkpoint window. Stop for independent vendor/DB
+  forensics; the harness intentionally has no automatic or destructive
+  "clear" switch.
+
+Success reports 258 required sessions, zero remaining sessions, and equal
+`attempts_reserved`/`attempts_spent`. Re-run `plan` to independently obtain
+`status: complete`; only then proceed to snapshot sealing and authenticated
+forecast serving.
 
 ---
 

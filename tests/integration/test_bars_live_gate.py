@@ -31,7 +31,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, fields, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import exchange_calendars
@@ -71,10 +71,17 @@ from app.services.forecast_snapshots import (
 )
 from app.services.prices import read_prices
 from data_sources.base import OHLCVBar
+from ingestion.locks import exclusive_vendor_operation
 from ingestion.upsert import (
     BarVersionConflictError,
     finalize_bar_version_availability,
     upsert_bars,
+)
+from scripts.vendor_backfill import (
+    BackfillRefused,
+    SqlBackfillStore,
+    _exclusive_backfill,
+    _session_close,
 )
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
@@ -138,57 +145,68 @@ def _snapshot_builder_url_for(owner_url: str) -> str:
     return builder_url.render_as_string(hide_password=False)
 
 
-@pytest.fixture(scope="module")
-def migrated_database_url() -> LiveDatabaseUrls:
-    """Reset the throwaway database, then apply the full migration chain."""
-    url = _async_url(TEST_DATABASE_URL)
-    runtime_url = _runtime_url_for(url)
-    snapshot_builder_url = _snapshot_builder_url_for(url)
+def _drop_project_schema(url: str) -> None:
     sync_engine = create_engine(_sync_url(url))
-    with sync_engine.begin() as conn:
-        conn.execute(
-            text(
-                "DROP TABLE IF EXISTS forecast_input_snapshots, "
-                "bar_version_availability, bars_revisions, bars, alembic_version CASCADE"
+    try:
+        with sync_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "DROP TABLE IF EXISTS forecast_input_snapshots, "
+                    "bar_version_availability, bars_revisions, bars, alembic_version CASCADE"
+                )
             )
-        )
-        conn.execute(text("DROP FUNCTION IF EXISTS reject_forecast_input_snapshot_mutation()"))
-        conn.execute(text("DROP FUNCTION IF EXISTS stamp_forecast_input_snapshot_sealed_at()"))
-        conn.execute(text("DROP FUNCTION IF EXISTS reject_bar_history_mutation()"))
-        conn.execute(text("DROP FUNCTION IF EXISTS require_bar_revision_version_evidence()"))
-        conn.execute(text("DROP FUNCTION IF EXISTS version_bar_write()"))
-        conn.execute(text("DROP FUNCTION IF EXISTS stamp_bar_version_availability()"))
-    sync_engine.dispose()
+            for function_name in (
+                "reject_forecast_input_snapshot_mutation",
+                "stamp_forecast_input_snapshot_sealed_at",
+                "reject_bar_history_mutation",
+                "require_bar_revision_version_evidence",
+                "version_bar_write",
+                "stamp_bar_version_availability",
+            ):
+                conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
+    finally:
+        sync_engine.dispose()
 
+
+def _run_alembic(url: str, *arguments: str) -> None:
     result = subprocess.run(  # fresh process: env.py resolves DATABASE_URL uncached
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        [sys.executable, "-m", "alembic", *arguments],
         cwd=REPO_ROOT,
         env={**os.environ, "DATABASE_URL": url, "MIGRATION_DATABASE_URL": url},
         capture_output=True,
         text=True,
         timeout=300,
     )
-    assert result.returncode == 0, f"alembic upgrade failed:\n{result.stdout}\n{result.stderr}"
-    for direction, target in (
-        ("downgrade", "0007_snapshot_builder_privileges"),
-        ("upgrade", "head"),
-    ):
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", direction, target],
-            cwd=REPO_ROOT,
-            env={**os.environ, "DATABASE_URL": url, "MIGRATION_DATABASE_URL": url},
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        assert result.returncode == 0, (
-            f"alembic {direction} {target} failed:\n{result.stdout}\n{result.stderr}"
-        )
-    return LiveDatabaseUrls(
-        owner=url,
-        runtime=runtime_url,
-        snapshot_builder=snapshot_builder_url,
+    assert result.returncode == 0, (
+        f"alembic {' '.join(arguments)} failed:\n{result.stdout}\n{result.stderr}"
     )
+
+
+@pytest.fixture(scope="module")
+def migrated_database_url() -> LiveDatabaseUrls:
+    """Reset/migrate the throwaway DB, then restore an empty migrated schema."""
+    url = _async_url(TEST_DATABASE_URL)
+    runtime_url = _runtime_url_for(url)
+    snapshot_builder_url = _snapshot_builder_url_for(url)
+    try:
+        _drop_project_schema(url)
+        _run_alembic(url, "upgrade", "head")
+        for direction, target in (
+            ("downgrade", "0007_snapshot_builder_privileges"),
+            ("upgrade", "head"),
+        ):
+            _run_alembic(url, direction, target)
+        urls = LiveDatabaseUrls(
+            owner=url,
+            runtime=runtime_url,
+            snapshot_builder=snapshot_builder_url,
+        )
+        yield urls
+    finally:
+        # The gate may seed the exact vendor lane. Restore a clean migrated
+        # throwaway database so a later one-request smoke still proves absence.
+        _drop_project_schema(url)
+        _run_alembic(url, "upgrade", "head")
 
 
 @pytest.fixture
@@ -557,6 +575,66 @@ async def test_receipt_rejects_version_written_in_same_outer_transaction_savepoi
         # A trailing-only retry reconciles the two earlier versions whose
         # hypothetical first finalizer never committed.
         assert await finalize_bar_version_availability(session, plan.rows[-1:]) == 3
+
+
+async def test_backfill_store_repairs_only_exact_dates_and_shares_vendor_lock(
+    engine: AsyncEngine,
+    migrated_database_url: LiveDatabaseUrls,
+) -> None:
+    """Prove the operator's exact receipt write and cross-lane DB exclusion."""
+
+    session_dates = (date(2026, 7, 8), date(2026, 7, 9), date(2026, 7, 10))
+    out_of_window = date(2024, 1, 2)
+    newly_persisted = date(2026, 7, 7)
+
+    def close_bar(session_date: date) -> OHLCVBar:
+        observed_at = _session_close(session_date)
+        return OHLCVBar(
+            symbol="MSFT",
+            timestamp=observed_at,
+            timespan="day",
+            multiplier=1,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=1_000.0,
+            source="polygon_open_close",
+            adjustment_basis="raw",
+            fetched_at=observed_at + timedelta(minutes=1),
+        )
+
+    maker = build_sessionmaker(engine)
+    async with maker() as session, session.begin():
+        complete_plan = await upsert_bars(session, [close_bar(session_dates[0])])
+    async with maker() as session, session.begin():
+        assert await finalize_bar_version_availability(session, complete_plan.rows) == 1
+    async with maker() as session, session.begin():
+        await upsert_bars(
+            session,
+            [close_bar(value) for value in (*session_dates[1:], out_of_window)],
+        )
+
+    settings = Settings(app_env="local", database_url=migrated_database_url.runtime)
+    async with SqlBackfillStore(settings) as store:
+        before = await store.coverage(session_dates)
+        assert before.complete_dates == (session_dates[0],)
+        assert before.repairable_dates == session_dates[1:]
+
+        assert await store.repair_receipts((session_dates[1],)) == 1
+        after = await store.coverage(session_dates)
+        assert after.complete_dates == session_dates[:2]
+        assert after.repairable_dates == (session_dates[2],)
+
+        await store.persist(close_bar(newly_persisted))
+        exact_persist = await store.coverage((out_of_window, newly_persisted))
+        assert exact_persist.complete_dates == (newly_persisted,)
+        assert exact_persist.repairable_dates == (out_of_window,)
+
+    async with exclusive_vendor_operation(settings):
+        with pytest.raises(BackfillRefused, match="already running"):
+            async with _exclusive_backfill(settings):
+                pytest.fail("contended backfill lock body must not run")
 
 
 async def test_stale_conflicts_and_history_mutation_fail_closed(

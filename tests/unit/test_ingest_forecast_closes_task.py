@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import asyncio
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from typing import Any
 
+import pytest
+
 from app.config import Settings
-from data_sources.base import OHLCVBar
+from data_sources.base import CostBudgetExceeded, OHLCVBar
 from data_sources.guards import AsyncPacingCostRateGuard
 from data_sources.polygon_open_close import PolygonOpenCloseProvider
+from ingestion.locks import VendorOperationBusy
 from ingestion.tasks import ingest_forecast_closes as close_task
 from ingestion.upsert import BarUpsertPlan, build_bar_upserts
 
@@ -66,6 +71,12 @@ class FailingProvider(FakeProvider):
         raise RuntimeError("Authorization: Bearer FAKE_KEY_MUST_NOT_REACH_RESULT")
 
 
+@asynccontextmanager
+async def _no_operation_lock(settings: Settings) -> AsyncIterator[None]:
+    del settings
+    yield
+
+
 async def test_ingests_latest_completed_session_with_distinct_source(
     monkeypatch: Any,
 ) -> None:
@@ -93,6 +104,7 @@ async def test_ingests_latest_completed_session_with_distinct_source(
         provider_factory=lambda _settings: provider,  # type: ignore[return-value]
         sessionmaker=object(),  # type: ignore[arg-type]
         clock=lambda: fixed_now,
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert provider.closed is True
@@ -139,6 +151,7 @@ async def test_error_details_can_be_suppressed_for_the_live_credential_smoke(
         sessionmaker=object(),  # type: ignore[arg-type]
         clock=lambda: datetime(2026, 7, 13, 21, tzinfo=UTC),
         include_error_details=False,
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert result["status"] == "failed"
@@ -154,10 +167,44 @@ async def test_error_details_can_be_suppressed_for_the_live_credential_smoke(
     ]
 
 
+async def test_vendor_wide_lock_refuses_before_provider_construction() -> None:
+    constructed = False
+
+    def provider_factory(settings: Settings) -> FakeProvider:
+        nonlocal constructed
+        del settings
+        constructed = True
+        return FakeProvider()
+
+    @asynccontextmanager
+    async def contended(settings: Settings) -> AsyncIterator[None]:
+        del settings
+        raise VendorOperationBusy("synthetic contention")
+        yield  # pragma: no cover
+
+    with pytest.raises(VendorOperationBusy, match="synthetic contention"):
+        await close_task.ingest_forecast_closes_async(
+            symbols=["MSFT", "AAPL"],
+            start=date(2026, 7, 10),
+            end=date(2026, 7, 10),
+            settings=Settings(app_env="test", polygon_api_key="unused"),
+            provider_factory=provider_factory,  # type: ignore[arg-type]
+            sessionmaker=object(),  # type: ignore[arg-type]
+            clock=lambda: datetime(2026, 7, 13, 21, tzinfo=UTC),
+            operation_lock_fn=contended,
+        )
+
+    assert constructed is False
+
+
 def test_latest_completed_session_never_selects_an_open_session() -> None:
     assert close_task.latest_completed_xnys_session(datetime(2026, 7, 13, 16, tzinfo=UTC)) == date(
         2026, 7, 10
     )
+
+
+def test_total_call_budget_exhaustion_is_not_retryable() -> None:
+    assert close_task._is_retryable_symbol_error(CostBudgetExceeded("spent")) is False
 
 
 def test_gap_audit_returns_the_earliest_missing_xnys_session() -> None:
@@ -181,24 +228,48 @@ def test_gap_audit_returns_the_earliest_missing_xnys_session() -> None:
 
 
 async def test_default_provider_paces_per_session_vendor_calls() -> None:
+    close_task._polygon_open_close_guard.cache_clear()
+    settings = Settings(
+        app_env="test",
+        polygon_api_key="test-key",
+        polygon_max_calls_per_window=7,
+        polygon_rate_window_seconds=30,
+        polygon_total_call_budget=11,
+    )
     provider = close_task._build_provider(
-        Settings(
-            app_env="test",
-            polygon_api_key="test-key",
-            polygon_max_calls_per_window=7,
-            polygon_rate_window_seconds=30,
-            polygon_total_call_budget=11,
-        ),
+        settings,
+        None,
+    )
+    second = close_task._build_provider(
+        settings,
         None,
     )
     try:
         assert isinstance(provider, PolygonOpenCloseProvider)
         assert isinstance(provider._guard, AsyncPacingCostRateGuard)  # noqa: SLF001
+        assert provider._guard is second._guard  # noqa: SLF001
         assert provider._guard.max_calls == 7  # noqa: SLF001
         assert provider._guard.window == 30  # noqa: SLF001
         assert provider._guard.total_budget == 11  # noqa: SLF001
     finally:
         await provider.aclose()
+        await second.aclose()
+        close_task._polygon_open_close_guard.cache_clear()
+
+
+def test_default_provider_total_budget_survives_separate_event_loops() -> None:
+    close_task._polygon_open_close_guard.cache_clear()
+    settings = Settings(app_env="test", polygon_api_key="test-key", polygon_total_call_budget=1)
+    first = close_task._build_provider(settings, None)
+    second = close_task._build_provider(settings, None)
+    try:
+        asyncio.run(first._guard.acquire(first.name))  # noqa: SLF001
+        with pytest.raises(CostBudgetExceeded):
+            asyncio.run(second._guard.acquire(second.name))  # noqa: SLF001
+    finally:
+        asyncio.run(first.aclose())
+        asyncio.run(second.aclose())
+        close_task._polygon_open_close_guard.cache_clear()
 
 
 async def test_explicit_window_disables_automatic_watermark(monkeypatch: Any) -> None:
@@ -230,6 +301,7 @@ async def test_explicit_window_disables_automatic_watermark(monkeypatch: Any) ->
         provider_factory=lambda _settings: provider,  # type: ignore[return-value]
         sessionmaker=object(),  # type: ignore[arg-type]
         clock=lambda: datetime(2026, 7, 13, 21, tzinfo=UTC),
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert result["watermark_enabled"] is False

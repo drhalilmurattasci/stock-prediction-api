@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 from typing import Any
@@ -16,10 +17,20 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.config import Settings, get_settings
 from app.db.models.bars import Bar
 from app.db.session import build_engine, build_sessionmaker
-from data_sources.base import MarketDataProvider, OHLCVBar, ProviderHTTPError, SymbolNotFoundError
+from data_sources.base import (
+    CostBudgetExceeded,
+    MarketDataProvider,
+    OHLCVBar,
+    ProviderHTTPError,
+    SymbolNotFoundError,
+)
 from data_sources.guards import InMemoryCostRateGuard
 from data_sources.polygon import PolygonProvider
-from ingestion.locks import acquire_advisory_xact_lock, bar_series_lock_id
+from ingestion.locks import (
+    acquire_advisory_xact_lock,
+    bar_series_lock_id,
+    exclusive_vendor_operation,
+)
 from ingestion.upsert import (
     BarUpsertPlan,
     finalize_bar_version_availability,
@@ -35,6 +46,7 @@ DEFAULT_LOOKBACK_DAYS = 800
 DEFAULT_TRAILING_OVERLAP_DAYS = 7
 ProviderFactory = Callable[[Settings], MarketDataProvider]
 UpsertFn = Callable[[AsyncSession, Sequence[OHLCVBar]], Awaitable[BarUpsertPlan]]
+OperationLockFn = Callable[[Settings], AbstractAsyncContextManager[None]]
 
 
 @shared_task(
@@ -80,6 +92,7 @@ async def ingest_prices_async(
     sessionmaker: async_sessionmaker[AsyncSession] | None = None,
     engine: AsyncEngine | None = None,
     upsert_fn: UpsertFn = upsert_bars,
+    operation_lock_fn: OperationLockFn = exclusive_vendor_operation,
 ) -> dict[str, Any]:
     """Async implementation used by Celery and unit tests."""
     settings = settings or get_settings()
@@ -94,7 +107,7 @@ async def ingest_prices_async(
         engine = engine or build_engine(settings)
         sessionmaker = build_sessionmaker(engine)
 
-    provider = _build_provider(settings, provider_factory)
+    provider_name = "polygon"
     started_at = datetime.now(UTC)
     per_symbol: list[dict[str, Any]] = []
     total_rows = 0
@@ -104,83 +117,86 @@ async def ingest_prices_async(
     retryable_failures = 0
 
     try:
-        async with provider:
-            for symbol in symbol_list:
-                try:
-                    fetch_start = await _resolve_fetch_start(
-                        sessionmaker,
-                        symbol=symbol,
-                        source=provider.name,
-                        timespan="day",
-                        adjustment_basis=_adjustment_basis(adjusted),
-                        requested_start=requested_start,
-                        end=end_date,
-                        use_watermark=use_watermark and start is None,
-                    )
-                    if fetch_start is None:
-                        bars = []
-                        plan = BarUpsertPlan(rows=[], revisions=[])
-                    else:
-                        bars = await provider.get_daily_bars(
-                            symbol,
-                            fetch_start,
-                            end_date,
-                            adjusted=adjusted,
-                        )
-                        plan = await _upsert_symbol_bars(
+        async with operation_lock_fn(settings):
+            provider = _build_provider(settings, provider_factory)
+            provider_name = provider.name
+            async with provider:
+                for symbol in symbol_list:
+                    try:
+                        fetch_start = await _resolve_fetch_start(
                             sessionmaker,
                             symbol=symbol,
                             source=provider.name,
                             timespan="day",
-                            bars=bars,
-                            upsert_fn=upsert_fn,
+                            adjustment_basis=_adjustment_basis(adjusted),
+                            requested_start=requested_start,
+                            end=end_date,
+                            use_watermark=use_watermark and start is None,
                         )
-                except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures.
-                    failures += 1
-                    retryable = _is_retryable_symbol_error(exc)
-                    retryable_failures += int(retryable)
+                        if fetch_start is None:
+                            bars = []
+                            plan = BarUpsertPlan(rows=[], revisions=[])
+                        else:
+                            bars = await provider.get_daily_bars(
+                                symbol,
+                                fetch_start,
+                                end_date,
+                                adjusted=adjusted,
+                            )
+                            plan = await _upsert_symbol_bars(
+                                sessionmaker,
+                                symbol=symbol,
+                                source=provider.name,
+                                timespan="day",
+                                bars=bars,
+                                upsert_fn=upsert_fn,
+                            )
+                    except Exception as exc:  # noqa: BLE001 - isolate per-symbol failures.
+                        failures += 1
+                        retryable = _is_retryable_symbol_error(exc)
+                        retryable_failures += int(retryable)
+                        per_symbol.append(
+                            {
+                                "symbol": symbol,
+                                "status": "failed",
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                                "retryable": retryable,
+                            }
+                        )
+                        log.warning(
+                            "ingest_prices.symbol_failed",
+                            symbol=symbol,
+                            error_type=type(exc).__name__,
+                            retryable=retryable,
+                            exc_info=True,
+                        )
+                        continue
+
+                    row_count = len(plan.rows)
+                    revision_count = len(plan.revisions)
+                    total_rows += row_count
+                    total_revisions += revision_count
+                    successes += 1
                     per_symbol.append(
                         {
                             "symbol": symbol,
-                            "status": "failed",
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                            "retryable": retryable,
+                            "status": "skipped" if fetch_start is None else "ok",
+                            "fetch_start": fetch_start.isoformat() if fetch_start else None,
+                            "fetch_end": end_date.isoformat(),
+                            "bars": len(bars),
+                            "rows_upserted": row_count,
+                            "revisions": revision_count,
                         }
                     )
-                    log.warning(
-                        "ingest_prices.symbol_failed",
+                    log.info(
+                        "ingest_prices.symbol_complete",
                         symbol=symbol,
-                        error_type=type(exc).__name__,
-                        retryable=retryable,
-                        exc_info=True,
+                        bars=len(bars),
+                        fetch_start=fetch_start.isoformat() if fetch_start else None,
+                        rows_upserted=row_count,
+                        revisions=revision_count,
                     )
-                    continue
-
-                row_count = len(plan.rows)
-                revision_count = len(plan.revisions)
-                total_rows += row_count
-                total_revisions += revision_count
-                successes += 1
-                per_symbol.append(
-                    {
-                        "symbol": symbol,
-                        "status": "skipped" if fetch_start is None else "ok",
-                        "fetch_start": fetch_start.isoformat() if fetch_start else None,
-                        "fetch_end": end_date.isoformat(),
-                        "bars": len(bars),
-                        "rows_upserted": row_count,
-                        "revisions": revision_count,
-                    }
-                )
-                log.info(
-                    "ingest_prices.symbol_complete",
-                    symbol=symbol,
-                    bars=len(bars),
-                    fetch_start=fetch_start.isoformat() if fetch_start else None,
-                    rows_upserted=row_count,
-                    revisions=revision_count,
-                )
     finally:
         if owns_engine and engine is not None:
             await engine.dispose()
@@ -193,7 +209,7 @@ async def ingest_prices_async(
 
     result = {
         "status": status,
-        "provider": provider.name,
+        "provider": provider_name,
         "symbols": symbol_list,
         "requested_start": requested_start.isoformat(),
         "end": end_date.isoformat(),
@@ -380,6 +396,8 @@ def _adjustment_basis(adjusted: bool) -> str:
 
 
 def _is_retryable_symbol_error(exc: Exception) -> bool:
+    if isinstance(exc, CostBudgetExceeded):
+        return False
     if isinstance(exc, SymbolNotFoundError):
         return False
     if isinstance(exc, ProviderHTTPError) and exc.status_code is not None:

@@ -171,6 +171,7 @@ async def test_smoke_forces_one_attempt_and_proves_one_new_row() -> None:
     assert captured["use_watermark"] is False
     assert captured["include_error_details"] is False
     assert captured["provider_factory"] is _single_attempt_provider
+    assert captured["operation_lock_fn"] is vendor_smoke._already_held_vendor_operation
     guarded = captured["settings"]
     assert isinstance(guarded, Settings)
     assert guarded.polygon_max_calls_per_window == 1
@@ -561,4 +562,5 @@ def test_main_never_renders_secret_bearing_exception_details(
 
 def test_wrapper_scans_versioned_python_worker_names() -> None:
     wrapper = (REPO_ROOT / "run-vendor-smoke.ps1").read_text(encoding="utf-8")
+    assert "(?:py|python" in wrapper
     assert "python(?:w|[0-9]+(?:\\.[0-9]+)?)?" in wrapper

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -13,6 +14,7 @@ from app.config import Settings
 from data_sources.base import OHLCVBar, SymbolNotFoundError
 from data_sources.guards import InMemoryCostRateGuard
 from data_sources.polygon import PolygonProvider
+from ingestion.locks import VendorOperationBusy
 from ingestion.tasks.ingest_prices import (
     _build_provider,
     _latest_bar_ts_statement,
@@ -133,6 +135,12 @@ async def _fake_upsert(session: Any, bars: Sequence[OHLCVBar]) -> BarUpsertPlan:
     return BarUpsertPlan(rows=rows, revisions=[])
 
 
+@asynccontextmanager
+async def _no_operation_lock(settings: Settings) -> AsyncIterator[None]:
+    del settings
+    yield
+
+
 async def test_default_polygon_provider_has_shared_fail_closed_guard():
     _polygon_guard.cache_clear()
     settings = Settings(
@@ -176,6 +184,7 @@ async def test_ingest_prices_fetches_locks_and_upserts_per_symbol():
         provider_factory=lambda _settings: provider,
         sessionmaker=sessionmaker,  # type: ignore[arg-type]
         upsert_fn=fake_upsert,  # type: ignore[arg-type]
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert provider.closed is True
@@ -216,6 +225,7 @@ async def test_ingest_prices_refetches_trailing_overlap_when_watermark_is_recent
         provider_factory=lambda _settings: provider,
         sessionmaker=sessionmaker,  # type: ignore[arg-type]
         upsert_fn=_fake_upsert,  # type: ignore[arg-type]
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert provider.calls == [("AAPL", date(2026, 6, 29), date(2026, 7, 6), False)]
@@ -236,6 +246,7 @@ async def test_first_ingest_bootstraps_enough_history_for_snapshot_baselines() -
         provider_factory=lambda _settings: provider,
         sessionmaker=sessionmaker,  # type: ignore[arg-type]
         upsert_fn=_fake_upsert,  # type: ignore[arg-type]
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert provider.calls == [("AAPL", date(2024, 4, 27), date(2026, 7, 6), False)]
@@ -254,6 +265,7 @@ async def test_ingest_prices_fetches_from_next_missing_day_after_long_outage():
         provider_factory=lambda _settings: provider,
         sessionmaker=sessionmaker,  # type: ignore[arg-type]
         upsert_fn=_fake_upsert,  # type: ignore[arg-type]
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert provider.calls == [("AAPL", date(2026, 7, 7), date(2026, 7, 20), False)]
@@ -273,6 +285,7 @@ async def test_ingest_prices_continues_after_one_symbol_failure():
         provider_factory=lambda _settings: provider,
         sessionmaker=sessionmaker,  # type: ignore[arg-type]
         upsert_fn=_fake_upsert,  # type: ignore[arg-type]
+        operation_lock_fn=_no_operation_lock,
     )
 
     assert result["status"] == "degraded"
@@ -284,6 +297,36 @@ async def test_ingest_prices_continues_after_one_symbol_failure():
         ("BAD", "failed"),
         ("MSFT", "ok"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_vendor_wide_lock_refuses_before_price_provider_construction() -> None:
+    constructed = False
+
+    def provider_factory(settings: Settings) -> FakeProvider:
+        nonlocal constructed
+        del settings
+        constructed = True
+        return FakeProvider()
+
+    @asynccontextmanager
+    async def contended(settings: Settings) -> AsyncIterator[None]:
+        del settings
+        raise VendorOperationBusy("synthetic contention")
+        yield  # pragma: no cover
+
+    with pytest.raises(VendorOperationBusy, match="synthetic contention"):
+        await ingest_prices_async(
+            symbols=["AAPL", "MSFT"],
+            start=date(2026, 7, 1),
+            end=date(2026, 7, 6),
+            settings=Settings(app_env="test", polygon_api_key="unused"),
+            provider_factory=provider_factory,
+            sessionmaker=FakeSessionmaker(),  # type: ignore[arg-type]
+            operation_lock_fn=contended,
+        )
+
+    assert constructed is False
 
 
 @pytest.mark.asyncio

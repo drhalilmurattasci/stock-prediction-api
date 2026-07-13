@@ -30,7 +30,7 @@ from app.db.models.bars import Bar, BarVersionAvailability
 from app.db.session import build_engine
 from data_sources.guards import AsyncPacingCostRateGuard
 from data_sources.polygon_open_close import PolygonOpenCloseProvider
-from ingestion.locks import stable_lock_id
+from ingestion.locks import vendor_operation_lock_id
 from ingestion.tasks.ingest_forecast_closes import (
     ingest_forecast_closes_async,
     latest_completed_xnys_session,
@@ -43,7 +43,7 @@ SMOKE_TIMESPAN = "day"
 SMOKE_ADJUSTMENT_BASIS = "raw"
 SMOKE_MULTIPLIER = 1
 SMOKE_ATTEMPT_BUDGET = 1
-SMOKE_LOCK_ID = stable_lock_id("vendor-smoke", SMOKE_SOURCE, SMOKE_SYMBOL)
+SMOKE_LOCK_ID = vendor_operation_lock_id()
 
 IngestFn = Callable[..., Awaitable[dict[str, Any]]]
 RowExistsFn = Callable[[Settings, str, datetime], Awaitable[bool]]
@@ -129,6 +129,14 @@ async def _exclusive_smoke_run(settings: Settings) -> AsyncIterator[None]:
     finally:
         # Closing the dedicated connection is also a server-side unlock backstop.
         await engine.dispose()
+
+
+@asynccontextmanager
+async def _already_held_vendor_operation(settings: Settings) -> AsyncIterator[None]:
+    """Mark the nested ingestion call as covered by the smoke's outer lock."""
+
+    del settings
+    yield
 
 
 def _session_close(session_date: date) -> datetime:
@@ -277,6 +285,7 @@ async def run_vendor_smoke(
             provider_factory=_single_attempt_provider,
             clock=clock,
             include_error_details=False,
+            operation_lock_fn=_already_held_vendor_operation,
         )
         _validate_result(result)
         if not await row_exists_fn(guarded_settings, SMOKE_SYMBOL, observed_at):
