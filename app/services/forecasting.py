@@ -1,10 +1,8 @@
 """Pure forecast assembly plus the fail-closed serving dependency seam.
 
-Baseline math can be implemented and verified before a production snapshot
-resolver exists. The public routes still use :class:`UnavailableForecastService`
-by default: they must not manufacture immutable snapshots, exchange-calendar
-target dates, adjusted closes, or point-in-time availability evidence from the
-current-only bars table.
+The public routes use :class:`UnavailableForecastService` until an operator
+explicitly pins the implemented snapshot-builder policy and availability rules.
+They never manufacture snapshots or trust evidence in the request path.
 """
 
 from __future__ import annotations
@@ -95,7 +93,7 @@ class ForecastService(Protocol):
 
 
 class UnavailableForecastService:
-    """Fail closed until immutable/PIT input resolution is implemented."""
+    """Fail closed until verified snapshot serving is explicitly enabled."""
 
     async def forecast(
         self,
@@ -104,15 +102,14 @@ class UnavailableForecastService:
         idempotency_key: str | None = None,
     ) -> ForecastResponse:
         raise NotImplementedYet(
-            f"Forecast execution for {request.symbol} needs an immutable snapshot resolver.",
+            f"Verified snapshot serving is not enabled for {request.symbol}.",
             details={
                 "contract": "ForecastRequest -> ForecastResponse",
                 "idempotency_key": idempotency_key,
                 "blockers": [
-                    "immutable point-in-time snapshot resolution",
-                    "exchange-calendar target timestamps",
-                    "adjusted-close resolution",
-                    "availability-aware lookahead proof",
+                    "pin the code-derived resolution-policy hash",
+                    "pin the trusted availability rule-set hash",
+                    "seal a matching verified forecast-input snapshot",
                 ],
             },
         )

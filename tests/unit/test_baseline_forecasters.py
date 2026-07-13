@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import pytest
 
+import ml.models.baselines as baseline_module
 from ml.models import DriftForecaster, Forecaster, NaiveForecaster, SeasonalNaiveForecaster
 
 
@@ -59,6 +62,25 @@ def test_seasonal_quantiles_use_distinct_horizon_specific_error_distributions():
         0.5: [16.0, 16.0],
         0.75: [17.75, 19.0],
     }
+
+
+def test_empirical_quantiles_sort_each_horizon_error_distribution_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sort_inputs: list[tuple[float, ...]] = []
+    builtin_sorted = sorted
+
+    def counting_sorted(values: Sequence[float]) -> list[float]:
+        sort_inputs.append(tuple(values))
+        return builtin_sorted(values)
+
+    monkeypatch.setattr(baseline_module, "sorted", counting_sorted, raising=False)
+
+    model = NaiveForecaster().fit([1.0, 4.0, 2.0, 8.0, 5.0, 11.0, 7.0, 15.0])
+    forecasts = model.predict_quantiles(3, [0.1, 0.25, 0.5, 0.75, 0.9])
+
+    assert list(forecasts) == [0.1, 0.25, 0.5, 0.75, 0.9]
+    assert [len(values) for values in sort_inputs] == [7, 6, 5]
 
 
 def test_predictions_are_fresh_and_cannot_mutate_fitted_state():

@@ -1,12 +1,32 @@
-# Stock Market Analysis & Price Prediction API
+# Stock Market Price Forecast API
 
-A REST/WebSocket API that ingests market data, computes structured analysis (trend, volatility, momentum, regime, risk), and serves **probabilistic price forecasts with confidence intervals**.
+A REST API that ingests versioned daily market data and serves baseline price
+forecasts with central **prediction intervals** and point-in-time provenance.
 
-> ⚠️ **Not investment advice.** Markets are near-efficient; this project ships *calibrated probabilistic forecasts*, never "accurate predictions" or trading/investment advice.
+> ⚠️ **Not investment advice.** Markets are near-efficient; this project reports
+> explicit uncertainty and never markets a forecast as an "accurate prediction"
+> or as trading/investment advice. Current baseline intervals are deliberately
+> labelled uncalibrated until held-out coverage validation is persisted.
 
 ## Status
 
-🚧 **Phase 1 — Price ingestion.** The FastAPI application spine is runnable: `/healthz`, `/readyz`, `/metrics`, `/v1` router surface (endpoints stubbed with `501` until later phases), structured logging with request IDs, error envelope, API-key auth + rate-limit wiring, Celery app + Beat schedule, Alembic migrations, and a Polygon daily-bars ingest task writing to the `bars` hypertable with revision capture. Forecasting lands in Phase 3.
+🚧 **First honest forecast vertical slice is code-complete; live DB proof is still gated.**
+The repository now has API-key auth, bounded `/v1/prices` reads, versioned Polygon
+daily-bar ingestion, append-only restatement history, leakage-aware baselines, an
+immutable point-in-time snapshot builder, and snapshot-backed `/v1/forecast`.
+
+The initial builder policy is intentionally narrow: Massive/Polygon raw
+regular-session closes from `/v1/open-close` (source `polygon_open_close`) for
+`AAPL`, `MSFT`, `NVDA`, `QQQ`, and `SPY`; XNYS `trading_day` horizons; USD; 512
+observation capacity with a 258-observation minimum; and 252 real
+exchange-session target closes. Adjusted
+prices remain refused until the separate corporate-action ledger exists. The
+route also stays `501` until an operator explicitly pins the code-derived policy
+and availability hashes.
+
+Unit/static gates pass locally. The destructive TimescaleDB integration gate is
+skipped until Docker, `.env`, and explicit owner/runtime/snapshot-builder URLs
+point to a designated throwaway database.
 
 ## Quickstart
 
@@ -18,7 +38,21 @@ uv run alembic upgrade head   # apply migrations
 make api                      # uvicorn app.main:app --reload  ->  http://localhost:8000/docs
 ```
 
-See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Run the workers with `make worker` / `make beat`.
+Before enabling snapshot creation/forecast serving, print and pin the exact
+policy identities:
+
+```bash
+uv run python -m ingestion.tasks.build_forecast_snapshots --print-policy-hashes
+```
+
+The full container tier (`--profile app`) includes a dedicated
+`stockapi_snapshot_builder` worker whose credential cannot write bars or mutate
+sealed snapshots. See [INSTALL.md](INSTALL.md) for role bootstrap and the live
+database gate.
+
+See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Run the ordinary
+worker, least-privilege snapshot worker, and scheduler with `make worker`,
+`make snapshot-builder`, and `make beat`.
 
 ## Documentation
 

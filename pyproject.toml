@@ -26,6 +26,10 @@ dependencies = [
   # --- analytics core ---
   "pandas>=2.2",
   "numpy>=1.26",
+  # Snapshot target timestamps must follow the real exchange schedule rather
+  # than a weekday approximation. Pin the rule set so its version can be part
+  # of the content-addressed resolution policy.
+  "exchange-calendars==4.13.2",
   "scikit-learn>=1.5",
   "statsmodels>=0.14",
   # --- tracking client ---

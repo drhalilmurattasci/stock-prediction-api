@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
-# API / worker / beat image. Requires a committed uv.lock (run `uv lock` first);
-# the build installs from the lockfile for reproducibility.
+# API / ordinary worker / snapshot-builder worker / beat image. Requires a
+# committed uv.lock (run `uv lock` first); the build installs from the lockfile
+# for reproducibility.
 
 FROM python:3.12-slim AS base
 ENV PYTHONUNBUFFERED=1 \
@@ -27,7 +28,7 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 
 EXPOSE 8000
-# Default command runs the API; worker/beat override this in docker-compose.
+# Default command runs the API; worker/snapshot-builder/beat override it in Compose.
 CMD ["uvicorn", "app.main:app", \
      "--host", "0.0.0.0", \
      "--port", "8000", \

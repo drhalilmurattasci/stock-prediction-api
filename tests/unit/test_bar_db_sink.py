@@ -12,6 +12,7 @@ from ingestion.upsert import (
     build_bar_upsert_plan,
     build_bar_upsert_statement,
     build_bar_upserts,
+    build_bar_version_availability_statement,
 )
 
 TS = datetime(2026, 7, 6, tzinfo=UTC)
@@ -56,6 +57,50 @@ def test_bar_upsert_statement_uses_conflict_key_and_is_distinct_from():
 def test_bar_upsert_statement_rejects_empty_rows():
     with pytest.raises(ValueError, match="at least one bar row is required"):
         build_bar_upsert_statement([])
+
+
+def test_receipt_reconciliation_repairs_full_lane_after_trailing_retry():
+    bootstrap_rows = build_bar_upserts(
+        [
+            _bar(
+                90.0,
+                datetime(2026, 1, 2, tzinfo=UTC),
+                timestamp=datetime(2026, 1, 2, tzinfo=UTC),
+            ),
+            _bar(
+                95.0,
+                datetime(2026, 2, 2, tzinfo=UTC),
+                timestamp=datetime(2026, 2, 2, tzinfo=UTC),
+            ),
+        ]
+    )
+    trailing_retry = build_bar_upserts([_bar(100.0, TS)])[0]
+
+    retry_sql = str(
+        build_bar_version_availability_statement([trailing_retry]).compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+    full_batch_sql = str(
+        build_bar_version_availability_statement([*bootstrap_rows, trailing_retry]).compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    # The retry query is identical to the original batch's query because its
+    # scope is the full source lane, not the timestamps present in the retry.
+    assert retry_sql == full_batch_sql
+    assert "(bars.symbol, bars.timespan, bars.multiplier, bars.source, " in retry_sql
+    assert "bars.adjustment_basis) IN" in retry_sql
+    assert "NOT (EXISTS" in retry_sql
+    assert "ON CONFLICT DO NOTHING" in retry_sql
+
+
+def test_receipt_reconciliation_statement_rejects_empty_rows():
+    with pytest.raises(ValueError, match="at least one bar row is required"):
+        build_bar_version_availability_statement([])
 
 
 def test_revision_plan_maps_previous_and_incoming_values_for_sink():

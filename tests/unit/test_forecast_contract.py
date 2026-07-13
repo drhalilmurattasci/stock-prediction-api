@@ -115,6 +115,12 @@ def test_forecast_request_rejects_duplicate_coverages():
         ForecastRequest(symbol="AAPL", interval_coverages=[0.8, 0.8])
 
 
+def test_forecast_request_defaults_to_the_current_raw_close_policy() -> None:
+    request = ForecastRequest(symbol="AAPL")
+    assert request.target == "close"
+    assert request.horizon_unit == "trading_day"
+
+
 @pytest.mark.parametrize("coverage", [1e-13, 0.9999999999999, 0.8001])
 def test_forecast_request_rejects_uncanonical_coverage_precision(coverage: float):
     with pytest.raises(ValidationError):

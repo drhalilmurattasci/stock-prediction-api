@@ -80,7 +80,15 @@ def _linear_quantile(values: Sequence[float], probability: float) -> float:
     and makes golden-value behavior stable across environments.
     """
 
-    ordered = sorted(values)
+    return _linear_quantile_from_ordered(sorted(values), probability)
+
+
+def _linear_quantile_from_ordered(
+    ordered: Sequence[float],
+    probability: float,
+) -> float:
+    """Return a linear quantile from values already sorted ascending."""
+
     position = (len(ordered) - 1) * probability
     lower_index = int(position)
     fraction = position - lower_index
@@ -137,14 +145,15 @@ class _EmpiricalResidualBaseline(ABC):
                     f"horizon step {step} requires at least 2 prefix-only historical errors; "
                     f"got {len(errors)}"
                 )
-            if min(errors) == max(errors):
+            ordered_errors = sorted(errors)
+            if ordered_errors[0] == ordered_errors[-1]:
                 raise ValueError(
                     f"horizon step {step} historical errors have zero dispersion; "
                     "cannot estimate a non-degenerate interval"
                 )
-            median_error = _linear_quantile(errors, 0.5)
+            median_error = _linear_quantile_from_ordered(ordered_errors, 0.5)
             for level in levels:
-                adjusted_error = _linear_quantile(errors, level) - median_error
+                adjusted_error = _linear_quantile_from_ordered(ordered_errors, level) - median_error
                 forecast = point + adjusted_error
                 if not isfinite(forecast):
                     raise ValueError("quantile forecast is non-finite")

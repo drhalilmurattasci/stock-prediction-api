@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import DateTime
+from sqlalchemy import BigInteger, DateTime
 
 from app.db.base import Base
-from app.db.models import Bar, BarRevision
+from app.db.models import Bar, BarRevision, BarVersionAvailability
 from ingestion.upsert import BAR_CONFLICT_KEY
 
 
 def test_bar_models_register_with_base_metadata():
     assert Base.metadata.tables["bars"] is Bar.__table__
     assert Base.metadata.tables["bars_revisions"] is BarRevision.__table__
+    assert Base.metadata.tables["bar_version_availability"] is BarVersionAvailability.__table__
 
 
 def test_bar_primary_key_matches_upsert_conflict_key():
@@ -28,6 +29,10 @@ def test_bar_timestamps_are_timestamptz():
         assert isinstance(column_type, DateTime)
         assert column_type.timezone is True
 
+    assert isinstance(Bar.__table__.c.version_creator_xid.type, BigInteger)
+    assert isinstance(BarRevision.__table__.c.previous_creator_xid.type, BigInteger)
+    assert isinstance(BarRevision.__table__.c.incoming_creator_xid.type, BigInteger)
+
     for column_name in (
         "ts",
         "previous_fetched_at",
@@ -39,6 +44,11 @@ def test_bar_timestamps_are_timestamptz():
         "revised_at",
     ):
         column_type = BarRevision.__table__.c[column_name].type
+        assert isinstance(column_type, DateTime)
+        assert column_type.timezone is True
+
+    for column_name in ("ts", "version_recorded_at", "available_at"):
+        column_type = BarVersionAvailability.__table__.c[column_name].type
         assert isinstance(column_type, DateTime)
         assert column_type.timezone is True
 
@@ -130,6 +140,9 @@ def test_bar_version_history_is_db_recorded_append_only_and_fully_indexed():
     assert "OLD.recorded_at + interval '1 microsecond'" in migration
     assert "INSERT INTO public.bars_revisions" in migration
     assert "required runtime role stockapi_app is missing" in migration
+    assert "DROP OWNED BY stockapi_app" in migration
+    assert "pg_shdepend" in migration
+    assert "REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC" in migration
     assert "GRANT USAGE, SELECT ON SEQUENCE public.bars_revisions_id_seq" in migration
     assert "REVOKE ALL PRIVILEGES ON TABLE public.bars FROM stockapi_app" in migration
     assert "BEFORE UPDATE OR DELETE ON bars_revisions" in migration
@@ -146,3 +159,27 @@ def test_bar_version_history_is_db_recorded_append_only_and_fully_indexed():
     assert '"--concurrency=1"' in app_tier
     assert "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS" in role_init
     assert "ALTER ROLE stockapi_app RESET ALL" in role_init
+
+
+def test_bar_version_availability_is_post_commit_and_append_only() -> None:
+    constraints = {
+        str(constraint.name) for constraint in BarVersionAvailability.__table__.constraints
+    }
+    assert "ck_bar_version_availability_availability_not_before_recording" in constraints
+    migration = Path("migrations/versions/0008_bar_version_availability.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'down_revision: str | None = "0007_snapshot_builder_privileges"' in migration
+    assert "NEW.version_creator_xid := txid_current()" in migration
+    assert "OLD.version_creator_xid" in migration
+    assert "versions.creator_xid = current_xid" in migration
+    assert "version_xmin" not in migration
+    assert "availability must be finalized after its write commits" in migration
+    assert "NEW.available_at := clock_timestamp()" in migration
+    assert "BEFORE UPDATE OR DELETE ON bar_version_availability" in migration
+    assert "FROM stockapi_app" in migration
+    assert "FROM stockapi_snapshot_builder" in migration
+    assert "'MAINTAIN'" in migration
+    assert "has_any_column_privilege" in migration
+    assert "GRANT SELECT, INSERT ON TABLE public.bar_version_availability" in migration
+    assert "TO stockapi_snapshot_builder" in migration

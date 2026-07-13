@@ -52,13 +52,11 @@ if TYPE_CHECKING:
 
 _HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
-#: The one honest basis per target: raw closes are served raw; adjusted and
-#: return targets require the fully split+dividend adjusted series.
+#: Policy v1 deliberately serves raw closes only. Adjusted targets require the
+#: separate corporate-action ledger promised by the project doctrine; vendor-
+#: rewritten adjusted history is not relabelled as locally reproducible data.
 _SERIES_BASIS_BY_TARGET = {
     "close": "raw",
-    "adjusted_close": "split_dividend_adjusted",
-    "return": "split_dividend_adjusted",
-    "log_return": "split_dividend_adjusted",
 }
 
 
@@ -196,6 +194,12 @@ class SnapshotForecastService:
                 "Retry-safe forecast creation requires a persisted forecast-run "
                 "store; retry without an Idempotency-Key for one-shot creation.",
                 details={"idempotency_key": idempotency_key},
+            )
+        if request.horizon_unit != "trading_day":
+            raise AppError(
+                "only trading_day forecast horizons are servable by policy v1",
+                code="horizon_unit_not_servable",
+                status_code=status.HTTP_409_CONFLICT,
             )
         series_basis = self.policy.series_basis_for(request.target)
         record = await self._load_record(request, series_basis)

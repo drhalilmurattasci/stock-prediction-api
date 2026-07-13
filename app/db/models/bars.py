@@ -50,6 +50,7 @@ class Bar(Base):
         CheckConstraint("fetched_at >= ts", name="fetched_not_before_bar"),
         CheckConstraint("as_of >= fetched_at", name="as_of_not_before_fetch"),
         CheckConstraint("recorded_at >= as_of", name="recorded_not_before_as_of"),
+        CheckConstraint("version_creator_xid >= 0", name="version_creator_xid_nonnegative"),
         Index("ix_bars_symbol_ts", "symbol", "ts"),
         Index("ix_bars_source_as_of", "source", "as_of"),
         # Covering series index: every equality column of the /v1/prices read
@@ -91,6 +92,7 @@ class Bar(Base):
         nullable=False,
         server_default=func.clock_timestamp(),
     )
+    version_creator_xid: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class BarRevision(Base):
@@ -157,6 +159,10 @@ class BarRevision(Base):
             "AND previous_fetched_at < incoming_fetched_at)",
             name="revision_version_evidence",
         ),
+        CheckConstraint(
+            "previous_creator_xid >= 0 AND incoming_creator_xid >= 0",
+            name="creator_xids_nonnegative",
+        ),
         Index("ix_bars_revisions_conflict_key", "symbol", "timespan", "multiplier", "ts"),
         Index("ix_bars_revisions_revised_at", "revised_at"),
         Index(
@@ -208,5 +214,46 @@ class BarRevision(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    previous_creator_xid: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    incoming_creator_xid: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     revised_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class BarVersionAvailability(Base):
+    """DB-stamped post-commit publication receipt for one exact bar version."""
+
+    __tablename__ = "bar_version_availability"
+    __table_args__ = (
+        CheckConstraint("multiplier >= 1", name="availability_multiplier_positive"),
+        CheckConstraint(
+            "available_at >= version_recorded_at",
+            name="availability_not_before_recording",
+        ),
+        Index(
+            "ix_bar_version_availability_series_time",
+            "symbol",
+            "timespan",
+            "multiplier",
+            "source",
+            "adjustment_basis",
+            "ts",
+            "available_at",
+        ),
+    )
+
+    symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
+    timespan: Mapped[str] = mapped_column(String(16), primary_key=True)
+    multiplier: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    source: Mapped[str] = mapped_column(String(64), primary_key=True)
+    adjustment_basis: Mapped[str] = mapped_column(String(32), primary_key=True)
+    version_recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        primary_key=True,
+    )
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.clock_timestamp(),
+    )

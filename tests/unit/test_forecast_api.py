@@ -168,8 +168,8 @@ def test_default_forecast_service_stays_fail_closed() -> None:
     assert response.status_code == 501
     body = response.json()["error"]
     assert body["code"] == "not_implemented"
-    assert "immutable snapshot resolver" in body["message"]
-    assert "exchange-calendar target timestamps" in body["details"]["blockers"]
+    assert "not enabled" in body["message"]
+    assert "pin the code-derived resolution-policy hash" in body["details"]["blockers"]
 
 
 def test_api_key_auth_short_circuits_forecast_service() -> None:
@@ -184,3 +184,26 @@ def test_api_key_auth_short_circuits_forecast_service() -> None:
 
     assert response.status_code == 401
     assert service.calls == []
+
+
+def test_forecast_validation_and_openapi_use_the_project_error_envelope() -> None:
+    app = create_app(Settings(app_env="test", rate_limit_enabled=False))
+    with TestClient(app) as client:
+        invalid = client.get("/v1/forecast/AAPL", params={"horizon": 0})
+        schema = client.get("/openapi.json").json()
+
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "validation_error"
+    for operation in (
+        schema["paths"]["/v1/forecast/{symbol}"]["get"],
+        schema["paths"]["/v1/forecast"]["post"],
+    ):
+        validation_schema = operation["responses"]["422"]["content"]["application/json"]["schema"]
+        assert validation_schema["$ref"].endswith("/ErrorResponse")
+
+    get_parameters = schema["paths"]["/v1/forecast/{symbol}"]["get"]["parameters"]
+    descriptions = {item["name"]: item["description"] for item in get_parameters}
+    assert "baseline_naive" in descriptions["model"]
+    post_parameters = schema["paths"]["/v1/forecast"]["post"]["parameters"]
+    idempotency = next(item for item in post_parameters if item["name"] == "Idempotency-Key")
+    assert "return 501" in idempotency["description"]

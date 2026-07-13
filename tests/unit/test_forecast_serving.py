@@ -49,7 +49,7 @@ def _payload(**overrides: object) -> ForecastInputSnapshotPayload:
         "resolution_policy_hash": POLICY_HASH,
         "symbol": "AAPL",
         "target": "close",
-        "horizon_unit": "calendar_day",
+        "horizon_unit": "trading_day",
         "series_basis": "raw",
         "input_timespan": "day",
         "input_multiplier": 1,
@@ -65,7 +65,7 @@ def _payload(**overrides: object) -> ForecastInputSnapshotPayload:
             )
             for offset in range(10, 0, -1)
         ),
-        "target_times": (AS_OF + timedelta(days=1), AS_OF + timedelta(days=2)),
+        "target_times": (AS_OF + timedelta(days=3), AS_OF + timedelta(days=4)),
         "data_sources": (
             SnapshotSourceLineage(
                 name="fixture-market-data",
@@ -88,7 +88,7 @@ def _request(**overrides: object) -> ForecastRequest:
     fields: dict[str, object] = {
         "symbol": "AAPL",
         "horizon": 2,
-        "horizon_unit": "calendar_day",
+        "horizon_unit": "trading_day",
         "target": "close",
         "model": "baseline_naive",
         "interval_coverages": [0.8],
@@ -147,7 +147,7 @@ async def test_serves_verified_snapshot_with_honest_provenance() -> None:
             resolution_policy_hash=POLICY_HASH,
             symbol="AAPL",
             target="close",
-            horizon_unit="calendar_day",
+            horizon_unit="trading_day",
             series_basis="raw",
             input_timespan="day",
             input_multiplier=1,
@@ -217,6 +217,24 @@ async def test_missing_snapshot_is_a_404() -> None:
 
 
 @pytest.mark.parametrize(
+    ("overrides", "code"),
+    [
+        ({"horizon_unit": "calendar_day"}, "horizon_unit_not_servable"),
+        ({"target": "adjusted_close"}, "target_not_servable"),
+    ],
+)
+async def test_policy_v1_refuses_unversioned_horizon_and_adjusted_semantics(
+    overrides: dict[str, object],
+    code: str,
+) -> None:
+    service, _ = _service(_record())
+    with pytest.raises(AppError) as excinfo:
+        await service.forecast(_request(**overrides))
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.code == code
+
+
+@pytest.mark.parametrize(
     "availability",
     [
         SnapshotAvailabilityEvidence(status="not_run"),  # never verified upstream
@@ -283,7 +301,7 @@ def test_latest_statement_filters_exact_series_and_orders_newest_first() -> None
         resolution_policy_hash=POLICY_HASH,
         symbol="AAPL",
         target="close",
-        horizon_unit="calendar_day",
+        horizon_unit="trading_day",
         series_basis="raw",
         input_timespan="day",
         input_multiplier=1,
@@ -316,6 +334,12 @@ def test_build_forecast_service_is_fail_closed_by_configuration() -> None:
 
     # Fully unset -> serving was never enabled -> None (route stays 501).
     assert build_forecast_service(Settings(app_env="test"), sessionmaker) is None  # type: ignore[arg-type]
+    blank = Settings(
+        app_env="test",
+        forecast_resolution_policy_hash="",
+        forecast_trusted_availability_rule_set_hash="   ",
+    )
+    assert build_forecast_service(blank, sessionmaker) is None  # type: ignore[arg-type]
 
     # Partially or malformed configured -> loud operator error, not silent 501.
     for overrides in (

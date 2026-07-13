@@ -1,8 +1,8 @@
-"""/v1/forecast endpoints: probabilistic forecasts with calibrated intervals.
+"""/v1/forecast endpoints: snapshot-pinned probabilistic baseline forecasts.
 
 The Pydantic request/response contract is locked early so model work can evolve
 behind a stable API surface. Both routes delegate through an injectable service;
-the default remains fail-closed until immutable snapshot resolution exists.
+serving stays fail-closed until policy/trust hashes are explicitly pinned.
 """
 
 from __future__ import annotations
@@ -27,10 +27,26 @@ from app.services.forecasting import ForecastService, get_forecast_service
 router = APIRouter(prefix="/forecast", tags=["forecast"])
 
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    422: {
+        "model": ErrorResponse,
+        "description": "The request shape, symbol, horizon, or query values are invalid.",
+    },
+    404: {
+        "model": ErrorResponse,
+        "description": "No verified sealed snapshot matches the requested series.",
+    },
+    409: {
+        "model": ErrorResponse,
+        "description": "The snapshot/request is incompatible or the forecast is not computable.",
+    },
+    503: {
+        "model": ErrorResponse,
+        "description": "Snapshot trust evidence or forecast-serving configuration is invalid.",
+    },
     501: {
         "model": ErrorResponse,
-        "description": "Forecast execution is planned for Phase 3.",
-    }
+        "description": "Serving is disabled or the selected model is not implemented.",
+    },
 }
 
 
@@ -57,12 +73,22 @@ async def get_forecast(
     ] = 5,
     horizon_unit: Annotated[
         ForecastHorizonUnit,
-        Query(description="Unit for each forecast horizon step."),
+        Query(
+            description=(
+                "Unit for each forecast horizon step. Policy v1 serves only trading_day; "
+                "other contract values currently return 409."
+            )
+        ),
     ] = "trading_day",
     target: Annotated[
         ForecastTarget,
-        Query(description="Forecast target. Price targets use the response currency."),
-    ] = "adjusted_close",
+        Query(
+            description=(
+                "Forecast target. Policy v1 serves only raw close; other contract values "
+                "currently return 409."
+            )
+        ),
+    ] = "close",
     as_of: Annotated[
         AwareDatetime | None,
         Query(description="Point-in-time cutoff. Defaults to the newest sealed data snapshot."),
@@ -77,7 +103,12 @@ async def get_forecast(
     ] = None,
     model: Annotated[
         ForecastModelSelector,
-        Query(description="Model selector. 'auto' routes to the promoted champion."),
+        Query(
+            description=(
+                "Model selector. Until a champion registry exists, 'auto' honestly routes "
+                "to baseline_naive."
+            )
+        ),
     ] = "auto",
     interval_coverages: Annotated[
         list[Coverage] | None,
@@ -120,7 +151,10 @@ async def create_forecast(
             alias="Idempotency-Key",
             min_length=1,
             max_length=128,
-            description="Stable request key for retry-safe forecast creation.",
+            description=(
+                "Reserved retry key. Requests carrying it return 501 until the persisted "
+                "forecast-run replay store exists."
+            ),
         ),
     ] = None,
 ) -> ForecastResponse:

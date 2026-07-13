@@ -280,6 +280,13 @@ def upgrade() -> None:
     op.execute("REVOKE ALL ON SEQUENCE bars_revisions_id_seq FROM PUBLIC")
     op.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
     op.execute(
+        "REVOKE ALL ON FUNCTION public.version_bar_write(), "
+        "public.reject_bar_history_mutation(), "
+        "public.require_bar_revision_version_evidence(), "
+        "public.stamp_forecast_input_snapshot_sealed_at(), "
+        "public.reject_forecast_input_snapshot_mutation() FROM PUBLIC"
+    )
+    op.execute(
         """
         DO $$
         DECLARE
@@ -304,14 +311,27 @@ def upgrade() -> None:
                 RAISE EXCEPTION 'stockapi_app has unsafe runtime attributes'
                     USING HINT = 'rerun scripts/db-init/02-runtime-role.sh before Alembic';
             END IF;
-            IF EXISTS (SELECT 1 FROM pg_auth_members WHERE member = runtime_role) THEN
+            IF EXISTS (
+                SELECT 1 FROM pg_auth_members
+                WHERE member = runtime_role OR roleid = runtime_role
+            ) THEN
                 RAISE EXCEPTION 'stockapi_app retains a cluster-role membership'
                     USING HINT = 'rerun scripts/db-init/02-runtime-role.sh before Alembic';
             END IF;
-            IF EXISTS (
-                SELECT 1 FROM pg_db_role_setting WHERE setrole = runtime_role
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_db_role_setting
+                WHERE setrole = runtime_role
+                  AND setdatabase = 0
+                  AND setconfig = ARRAY['search_path=pg_catalog, public']::text[]
+            ) OR EXISTS (
+                SELECT 1 FROM pg_db_role_setting
+                WHERE setrole = runtime_role
+                  AND (
+                    setdatabase <> 0
+                    OR setconfig <> ARRAY['search_path=pg_catalog, public']::text[]
+                  )
             ) THEN
-                RAISE EXCEPTION 'stockapi_app retains role-level database settings'
+                RAISE EXCEPTION 'stockapi_app does not have the pinned runtime search_path'
                     USING HINT = 'rerun scripts/db-init/02-runtime-role.sh before Alembic';
             END IF;
             IF EXISTS (SELECT 1 FROM pg_database WHERE datdba = runtime_role)
@@ -329,11 +349,35 @@ def upgrade() -> None:
                          'forecast_input_snapshots'
                      )
                      AND object.relowner = runtime_role
+               )
+               OR EXISTS (
+                   SELECT 1
+                   FROM pg_proc AS object
+                   WHERE object.proowner = runtime_role
                ) THEN
                 RAISE EXCEPTION 'stockapi_app owns protected database objects'
                     USING HINT = 'transfer ownership to the migration owner before Alembic';
             END IF;
 
+            IF EXISTS (
+                SELECT 1
+                FROM pg_shdepend
+                WHERE refclassid = 'pg_authid'::regclass
+                  AND refobjid = runtime_role
+                  AND deptype = 'o'
+            ) THEN
+                RAISE EXCEPTION 'stockapi_app owns an object in the cluster'
+                    USING HINT = 'transfer ownership before Alembic';
+            END IF;
+
+            -- REVOKE by one grantor cannot remove a grant issued by another.
+            -- Ownership is empty, so this safely scrubs every current-DB ACL
+            -- dependency before the exact runtime boundary is rebuilt.
+            EXECUTE 'DROP OWNED BY stockapi_app';
+            EXECUTE format(
+                'REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC',
+                current_database()
+            );
             EXECUTE format(
                 'REVOKE ALL PRIVILEGES ON DATABASE %I FROM stockapi_app',
                 current_database()
@@ -344,6 +388,12 @@ def upgrade() -> None:
             );
             EXECUTE 'REVOKE ALL PRIVILEGES ON SCHEMA public FROM stockapi_app';
             EXECUTE 'GRANT USAGE ON SCHEMA public TO stockapi_app';
+            EXECUTE 'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public '
+                    'FROM stockapi_app';
+            EXECUTE 'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public '
+                    'FROM stockapi_app';
+            EXECUTE 'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public '
+                    'FROM stockapi_app';
             EXECUTE 'REVOKE ALL PRIVILEGES ON TABLE public.bars FROM stockapi_app';
             EXECUTE 'REVOKE ALL PRIVILEGES ON TABLE public.bars_revisions '
                     'FROM stockapi_app';
@@ -354,6 +404,85 @@ def upgrade() -> None:
             EXECUTE 'GRANT SELECT, INSERT, UPDATE ON TABLE public.bars TO stockapi_app';
             EXECUTE 'GRANT SELECT ON TABLE public.bars_revisions TO stockapi_app';
             EXECUTE 'GRANT SELECT ON TABLE public.forecast_input_snapshots TO stockapi_app';
+
+            IF NOT has_database_privilege(
+                runtime_role, current_database(), 'CONNECT'
+            ) OR has_database_privilege(
+                runtime_role, current_database(), 'TEMPORARY'
+            ) THEN
+                RAISE EXCEPTION 'stockapi_app database privileges are not exact';
+            END IF;
+            IF NOT has_schema_privilege(runtime_role, 'public', 'USAGE')
+               OR has_schema_privilege(runtime_role, 'public', 'CREATE') THEN
+                RAISE EXCEPTION 'stockapi_app schema privileges are not exact';
+            END IF;
+            IF NOT has_table_privilege(runtime_role, 'public.bars', 'SELECT')
+               OR NOT has_table_privilege(runtime_role, 'public.bars', 'INSERT')
+               OR NOT has_table_privilege(runtime_role, 'public.bars', 'UPDATE')
+               OR has_table_privilege(runtime_role, 'public.bars', 'DELETE')
+               OR has_table_privilege(runtime_role, 'public.bars', 'TRUNCATE')
+               OR has_table_privilege(runtime_role, 'public.bars', 'REFERENCES')
+               OR has_table_privilege(runtime_role, 'public.bars', 'TRIGGER') THEN
+                RAISE EXCEPTION 'stockapi_app bars privileges are not exact';
+            END IF;
+            IF NOT has_table_privilege(
+                runtime_role, 'public.bars_revisions', 'SELECT'
+            ) OR has_table_privilege(
+                runtime_role, 'public.bars_revisions', 'INSERT'
+            ) OR has_table_privilege(
+                runtime_role, 'public.bars_revisions', 'UPDATE'
+            ) OR has_table_privilege(
+                runtime_role, 'public.bars_revisions', 'DELETE'
+            ) OR has_table_privilege(
+                runtime_role, 'public.bars_revisions', 'TRUNCATE'
+            ) OR has_any_column_privilege(
+                runtime_role, 'public.bars_revisions', 'INSERT'
+            ) OR has_any_column_privilege(
+                runtime_role, 'public.bars_revisions', 'UPDATE'
+            ) THEN
+                RAISE EXCEPTION 'stockapi_app revision privileges are not exact';
+            END IF;
+            IF NOT has_table_privilege(
+                runtime_role, 'public.forecast_input_snapshots', 'SELECT'
+            ) OR has_table_privilege(
+                runtime_role, 'public.forecast_input_snapshots', 'INSERT'
+            ) OR has_table_privilege(
+                runtime_role, 'public.forecast_input_snapshots', 'UPDATE'
+            ) OR has_table_privilege(
+                runtime_role, 'public.forecast_input_snapshots', 'DELETE'
+            ) OR has_table_privilege(
+                runtime_role, 'public.forecast_input_snapshots', 'TRUNCATE'
+            ) THEN
+                RAISE EXCEPTION 'stockapi_app snapshot privileges are not exact';
+            END IF;
+            IF has_sequence_privilege(
+                runtime_role, 'public.bars_revisions_id_seq', 'USAGE'
+            ) OR has_sequence_privilege(
+                runtime_role, 'public.bars_revisions_id_seq', 'SELECT'
+            ) OR has_sequence_privilege(
+                runtime_role, 'public.bars_revisions_id_seq', 'UPDATE'
+            ) THEN
+                RAISE EXCEPTION 'stockapi_app retains revision-sequence privileges';
+            END IF;
+            IF has_function_privilege(
+                runtime_role, 'public.version_bar_write()', 'EXECUTE'
+            ) OR has_function_privilege(
+                runtime_role, 'public.reject_bar_history_mutation()', 'EXECUTE'
+            ) OR has_function_privilege(
+                runtime_role,
+                'public.require_bar_revision_version_evidence()',
+                'EXECUTE'
+            ) OR has_function_privilege(
+                runtime_role,
+                'public.stamp_forecast_input_snapshot_sealed_at()',
+                'EXECUTE'
+            ) OR has_function_privilege(
+                runtime_role,
+                'public.reject_forecast_input_snapshot_mutation()',
+                'EXECUTE'
+            ) THEN
+                RAISE EXCEPTION 'stockapi_app can directly execute a trigger function';
+            END IF;
         END;
         $$
         """

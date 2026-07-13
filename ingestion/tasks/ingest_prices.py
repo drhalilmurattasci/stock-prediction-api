@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
@@ -11,7 +10,7 @@ from typing import Any
 
 import structlog
 from celery import shared_task
-from sqlalchemy import Select, func, select, text
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.config import Settings, get_settings
@@ -20,12 +19,20 @@ from app.db.session import build_engine, build_sessionmaker
 from data_sources.base import MarketDataProvider, OHLCVBar, ProviderHTTPError, SymbolNotFoundError
 from data_sources.guards import InMemoryCostRateGuard
 from data_sources.polygon import PolygonProvider
-from ingestion.upsert import BarUpsertPlan, upsert_bars
+from ingestion.locks import acquire_advisory_xact_lock, bar_series_lock_id
+from ingestion.upsert import (
+    BarUpsertPlan,
+    finalize_bar_version_availability,
+    upsert_bars,
+)
 
 log = structlog.get_logger(__name__)
 
 DEFAULT_SYMBOLS: tuple[str, ...] = ("AAPL", "MSFT", "NVDA", "SPY", "QQQ")
-DEFAULT_LOOKBACK_DAYS = 7
+# Enough calendar history to supply the snapshot policy's 512-session window
+# on a first ingest; subsequent watermark runs stay incremental.
+DEFAULT_LOOKBACK_DAYS = 800
+DEFAULT_TRAILING_OVERLAP_DAYS = 7
 ProviderFactory = Callable[[Settings], MarketDataProvider]
 UpsertFn = Callable[[AsyncSession, Sequence[OHLCVBar]], Awaitable[BarUpsertPlan]]
 
@@ -298,8 +305,9 @@ async def _effective_start_date(
         return requested_start
     next_start = last_ts.date() + timedelta(days=1)
     if next_start > end:
-        return requested_start
-    return min(requested_start, next_start)
+        return end - timedelta(days=DEFAULT_TRAILING_OVERLAP_DAYS)
+    trailing_start = end - timedelta(days=DEFAULT_TRAILING_OVERLAP_DAYS)
+    return min(trailing_start, next_start)
 
 
 async def _latest_bar_ts(
@@ -341,7 +349,16 @@ async def _upsert_symbol_bars(
 ) -> BarUpsertPlan:
     async with sessionmaker() as session, session.begin():
         await _advisory_xact_lock(session, symbol, source, timespan)
-        return await upsert_fn(session, bars)
+        plan = await upsert_fn(session, bars)
+    if not plan.rows:
+        return plan
+    # A receipt in the bar-write transaction would only repeat its pre-commit
+    # timestamp problem. Reacquire the series lane in a new transaction; the DB
+    # trigger rejects same-transaction receipts and stamps publication itself.
+    async with sessionmaker() as session, session.begin():
+        await _advisory_xact_lock(session, symbol, source, timespan)
+        await finalize_bar_version_availability(session, plan.rows)
+    return plan
 
 
 async def _advisory_xact_lock(
@@ -351,18 +368,11 @@ async def _advisory_xact_lock(
     timespan: str,
 ) -> None:
     """Serialize writers for one logical symbol/source/timespan lane."""
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:lock_id)"),
-        {"lock_id": _lock_id(symbol, source, timespan)},
-    )
+    await acquire_advisory_xact_lock(session, _lock_id(symbol, source, timespan))
 
 
 def _lock_id(symbol: str, source: str, timespan: str) -> int:
-    digest = hashlib.blake2b(
-        f"{source}:{timespan}:{symbol}".encode(),
-        digest_size=8,
-    ).digest()
-    return int.from_bytes(digest, byteorder="big", signed=True)
+    return bar_series_lock_id(symbol, source, timespan)
 
 
 def _adjustment_basis(adjusted: bool) -> str:

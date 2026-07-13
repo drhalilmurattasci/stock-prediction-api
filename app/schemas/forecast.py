@@ -93,12 +93,15 @@ class ForecastRequest(ForecastBaseModel):
     )
     horizon_unit: ForecastHorizonUnit = Field(
         default="trading_day",
-        description="Unit for each forecast horizon step.",
+        description=(
+            "Unit for each forecast horizon step. Snapshot policy v1 serves trading_day only."
+        ),
     )
     target: ForecastTarget = Field(
-        default="adjusted_close",
+        default="close",
         description=(
-            "Forecast target. Price targets use the response currency; return targets are unitless."
+            "Forecast target. Price targets use the response currency; return targets are "
+            "unitless. Snapshot policy v1 serves raw close only."
         ),
     )
     as_of: AwareDatetime | None = Field(
@@ -114,7 +117,8 @@ class ForecastRequest(ForecastBaseModel):
     model: ForecastModelSelector = Field(
         default="auto",
         description=(
-            "Model selector. 'auto' routes to the promoted champion for the requested target."
+            "Model selector. 'auto' routes to baseline_naive until a promoted-champion "
+            "registry is implemented."
         ),
     )
     interval_coverages: list[Coverage] = Field(
@@ -263,7 +267,12 @@ class DataSourceLineage(ForecastBaseModel):
 class ForecastProvenance(ForecastBaseModel):
     """Reproducibility and data-lineage fields for a forecast response."""
 
-    forecast_id: UUID = Field(description="Stable identifier for this exact forecast payload.")
+    forecast_id: UUID = Field(
+        description=(
+            "Per-run forecast UUID. Repeating an identical request without persisted "
+            "idempotency creates a new identifier."
+        )
+    )
     snapshot_id: str = Field(
         min_length=1,
         max_length=128,
@@ -272,7 +281,9 @@ class ForecastProvenance(ForecastBaseModel):
     model_version: str = Field(
         min_length=1,
         max_length=128,
-        description="Versioned model identity, including router/champion version when model=auto.",
+        description=(
+            "Exact model implementation that ran. Current model=auto resolves to baseline-naive@1."
+        ),
     )
     series_basis: ForecastSeriesBasis = Field(
         description="Exact raw or adjusted target-series convention used by the model."
@@ -281,7 +292,10 @@ class ForecastProvenance(ForecastBaseModel):
         min_length=64,
         max_length=71,
         pattern=r"^(sha256:)?[A-Fa-f0-9]{64}$",
-        description="SHA-256 hash of the resolved feature-set definition.",
+        description=(
+            "Content-addressed snapshot ID used as the feature-set identity by the current "
+            "close-only baseline path."
+        ),
     )
     max_available_at: AwareDatetime = Field(
         description="Newest data availability timestamp used across every feature."
@@ -344,14 +358,19 @@ class IntervalCalibration(ForecastBaseModel):
 
 
 class ForecastCalibration(ForecastBaseModel):
-    """Calibration metadata attached to every forecast response."""
+    """Calibration status and any empirical evidence attached to a forecast."""
 
     calibration_set_version: str = Field(
         min_length=1,
         max_length=128,
-        description="Versioned calibration residual/coverage set used for this payload.",
+        description=("Calibration identity. Current serving emits uncalibrated:<model-version>."),
     )
-    method: CalibrationMethod = Field(description="Interval calibration method.")
+    method: CalibrationMethod = Field(
+        description=(
+            "Interval calibration method. Current baseline serving emits none until held-out "
+            "coverage evidence is persisted."
+        )
+    )
     window_start: date | None = Field(
         default=None,
         description="First realized forecast date included in the calibration window.",
@@ -421,7 +440,10 @@ class ForecastResponse(ForecastBaseModel):
         )
     )
     calibration: ForecastCalibration = Field(
-        description="Calibration version and empirical interval coverage evidence."
+        description=(
+            "Calibration status and evidence. Current baseline responses use method=none, "
+            "sample_count=0, and no interval evidence."
+        )
     )
     disclaimer: str = Field(
         default=DISCLAIMER,

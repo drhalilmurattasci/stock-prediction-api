@@ -365,5 +365,5 @@ def test_lineage_order_fields_and_offsets_are_canonicalized() -> None:
 
 @pytest.mark.asyncio
 async def test_default_service_remains_fail_closed() -> None:
-    with pytest.raises(NotImplementedYet, match="immutable snapshot resolver"):
+    with pytest.raises(NotImplementedYet, match="not enabled"):
         await UnavailableForecastService().forecast(_request(), idempotency_key="fixture-key")

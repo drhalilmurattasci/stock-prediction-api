@@ -62,7 +62,7 @@ def create_app(
     app = FastAPI(
         title=settings.project_name,
         version=__version__,
-        summary="Probabilistic stock-market analytics & forecasts with calibrated intervals.",
+        summary="Probabilistic stock-market analytics with explicit uncertainty metadata.",
         description=f"{DISCLAIMER}\n\nSee STOCK_API_MASTER_PLAN.md for scope and doctrine.",
         lifespan=lifespan,
     )

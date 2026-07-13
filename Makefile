@@ -1,4 +1,4 @@
-.PHONY: help install install-ml lock up up-app down logs api worker beat lint fmt type test migrate revision
+.PHONY: help install install-ml lock up up-app down logs api worker snapshot-builder beat lint fmt type test migrate revision
 
 help:
 	@echo "Targets:"
@@ -9,7 +9,8 @@ help:
 	@echo "  up-app      docker compose --profile app up -d --build (full stack; needs uv.lock)"
 	@echo "  down        docker compose down"
 	@echo "  api         run the API with reload"
-	@echo "  worker      run the Celery worker"
+	@echo "  worker      run the ordinary Celery worker (one process)"
+	@echo "  snapshot-builder  run the least-privilege snapshot worker (one process)"
 	@echo "  beat        run the Celery Beat scheduler"
 	@echo "  lint/fmt/type/test   ruff / ruff format / mypy / pytest"
 	@echo "  migrate     alembic upgrade head"
@@ -40,7 +41,10 @@ api:
 	uvicorn app.main:app --reload
 
 worker:
-	celery -A ingestion.celery_app.celery_app worker --loglevel=INFO
+	celery -A ingestion.celery_app.celery_app worker --loglevel=INFO --concurrency=1
+
+snapshot-builder:
+	celery -A ingestion.snapshot_celery_app.snapshot_celery_app worker --loglevel=INFO --concurrency=1 --queues=snapshot-builder
 
 beat:
 	celery -A ingestion.celery_app.celery_app beat --loglevel=INFO

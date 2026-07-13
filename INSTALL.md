@@ -1,8 +1,10 @@
-# INSTALL — Stock Market Analysis & Price Prediction API
+# INSTALL — Stock Market Price Forecast API
 
 > Start-to-finish installation guide for the stack defined in [STOCK_API_MASTER_PLAN.md](STOCK_API_MASTER_PLAN.md).
 > **Target machine:** Windows 11 Pro (build 26200), PowerShell. **Detected 2026-06-23.**
-> Infra (TimescaleDB, Redis, MLflow) runs in **Docker containers**; dev tooling (Git, Python, uv) and the Celery worker/beat install **natively**.
+> Infra (TimescaleDB, Redis, MLflow) runs in **Docker containers**; dev tooling
+> (Git, Python, uv), the ordinary Celery worker, the least-privilege snapshot
+> worker, and Beat can run **natively**.
 
 ---
 
@@ -17,7 +19,7 @@
 | Containers | **Docker Desktop** + WSL2 | winget + GUI | native host |
 | Database | **TimescaleDB** (PostgreSQL 17) | Docker image | container |
 | Cache/limits + broker | **Redis 7** (split instances) | Docker image | container |
-| Orchestration | **Celery + Beat** (Redis broker) | uv pip | native process |
+| Orchestration | **Celery workers + Beat** (Redis broker) | uv pip | native processes |
 | ML tracking | **MLflow** | Docker image | container |
 | API + ML libs | FastAPI, Pydantic, SQLAlchemy, pandas, torch, LightGBM, StatsForecast, Chronos | uv pip | native venv |
 
@@ -128,7 +130,7 @@ Create **`A:\tansel\pyproject.toml`** with dependency groups (core always; `ml` 
 [project]
 name = "stock-prediction-api"
 version = "0.1.0"
-description = "Stock market analysis & probabilistic price-prediction API"
+description = "Versioned market-data ingestion and baseline price-forecast REST API"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   # --- API & web ---
@@ -153,6 +155,7 @@ dependencies = [
   # --- analytics core ---
   "pandas>=2.2",
   "numpy>=1.26",
+  "exchange-calendars==4.13.2",
   "scikit-learn>=1.5",
   "statsmodels>=0.14",
   # --- tracking client ---
@@ -234,8 +237,10 @@ POSTGRES_USER=stockapi_owner
 POSTGRES_PASSWORD=change_me_owner_strong
 POSTGRES_DB=stockapi
 POSTGRES_APP_PASSWORD=change_me_app_strong
+POSTGRES_SNAPSHOT_BUILDER_PASSWORD=change_me_snapshot_builder_strong
 # Percent-encoded form for compose DATABASE_URL interpolation.
 POSTGRES_APP_URL_PASSWORD=change_me_app_strong
+POSTGRES_SNAPSHOT_BUILDER_URL_PASSWORD=change_me_snapshot_builder_strong
 # Runtime is non-owner; only Alembic uses the owner credential.
 # Percent-encode reserved characters in each password embedded in these URLs.
 DATABASE_URL=postgresql+asyncpg://stockapi_app:change_me_app_strong@localhost:5432/stockapi
@@ -244,6 +249,12 @@ DATABASE_POOL_SIZE=5
 DATABASE_MAX_OVERFLOW=5
 DATABASE_POOL_TIMEOUT=30
 API_STATEMENT_TIMEOUT_MS=5000
+
+# Blank keeps snapshot creation and /v1/forecast fail-closed. Print the exact
+# current values with the command documented below before enabling.
+FORECAST_RESOLUTION_POLICY_HASH=
+FORECAST_TRUSTED_AVAILABILITY_RULE_SET_HASH=
+FORECAST_SEASONAL_PERIOD=5
 
 # ---- Redis (cache + rate-limit counters) ----
 REDIS_CACHE_URL=redis://localhost:6379/0
@@ -320,6 +331,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      POSTGRES_SNAPSHOT_BUILDER_PASSWORD: ${POSTGRES_SNAPSHOT_BUILDER_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -347,7 +359,7 @@ services:
         "allkeys-lru",
       ]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -366,7 +378,7 @@ services:
         "noeviction",
       ]
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     volumes:
       - ./data/redis-celery:/data
     healthcheck:
@@ -391,10 +403,11 @@ services:
     volumes:
       - ./data/mlflow:/mlflow
 
-  # The app tier (api / worker / beat) lives under the `app` compose profile so
+  # The app tier (api / worker / snapshot-builder / beat) lives under the
+  # `app` compose profile so
   # `docker compose up` stays infra-only. Start the full stack with:
   #   docker compose --profile app up -d --build   (requires a committed uv.lock)
-  # See docker-compose.yml in the repo for the api/worker/beat service definitions.
+  # See docker-compose.yml in the repo for all app-tier service definitions.
 ```
 
 ### 5.5 TimescaleDB init script
@@ -456,10 +469,10 @@ docker compose ps           # all services should be "running"/"healthy"
 
 First run pulls images (TimescaleDB, Redis) and the MLflow container pip-installs MLflow on boot (~1–2 min the first time).
 
-Fresh databases create the fixed, non-owner `stockapi_app` runtime role through
-`scripts/db-init/02-runtime-role.sh`. Existing initialized database directories
-do not rerun Docker init scripts; bootstrap the role once before applying
-migration `0006`:
+Fresh databases create the fixed, non-owner `stockapi_app` and
+`stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
+Existing initialized database directories do not rerun Docker init scripts;
+bootstrap both roles once before applying migrations `0007` and `0008`:
 
 ```powershell
 docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh
@@ -467,9 +480,22 @@ alembic upgrade head
 ```
 
 The migration fails with a clear error if this one-time bootstrap was missed.
-Only Alembic receives `MIGRATION_DATABASE_URL`; API, worker, and Beat containers
-receive an explicit runtime-variable allowlist and never inherit owner database
-credentials from `.env`.
+No Compose service receives the owner URL. The host-run Alembic command selects
+`MIGRATION_DATABASE_URL`; Compose API and ingestion services use `stockapi_app`,
+the queue-isolated snapshot worker alone receives the builder credential, and
+Beat receives neither database credential.
+
+The native `.env` workflow is a convenience boundary, not hard secret
+isolation: every local Python process can read that file. Use Compose or inject
+per-process environments when validating credential separation.
+
+Print the content-derived policy identities, copy both values into `.env`, then
+start the full app tier when you are ready to enable raw-close forecasts:
+
+```powershell
+uv run python -m ingestion.tasks.build_forecast_snapshots --print-policy-hashes
+docker compose --profile app up -d --build
+```
 
 For an existing volume, retain the `POSTGRES_USER`, `POSTGRES_DB`, and owner
 password that originally initialized that database (older local volumes often
@@ -495,25 +521,41 @@ docker compose logs -f mlflow
 | Redis cache | `docker exec stockapi-redis-cache redis-cli ping` | `PONG` |
 | Redis Celery | `docker exec stockapi-redis-celery redis-cli ping` | `PONG` |
 | MLflow UI | open `http://localhost:5000` | MLflow dashboard |
-| Celery worker | `celery -A ingestion.celery_app.celery_app inspect ping` (after starting a worker) | `pong` from one node |
+| Ordinary Celery worker | `celery -A ingestion.celery_app.celery_app inspect ping` (after starting it) | `pong` from one node |
+| Snapshot-builder worker | `celery -A ingestion.snapshot_celery_app.snapshot_celery_app inspect ping` (after starting it with its isolated environment) | `pong` from one node |
 | DB from Python | see snippet below | `db OK` |
 
 ```powershell
 python -c "import os,sqlalchemy as sa; from dotenv import load_dotenv; load_dotenv(); url=os.environ['DATABASE_URL'].replace('+asyncpg','+psycopg'); e=sa.create_engine(url); c=e.connect(); print('db OK', c.execute(sa.text('select 1')).scalar())"
 ```
 
-✅ When all rows pass, the platform is fully installed and running.
+The empirical database gate is intentionally destructive and must only target
+a specifically designated throwaway TimescaleDB. It drops/recreates the project
+tables before proving migrations, role ACLs, bar revisions, snapshot creation,
+and read-only serving:
+
+```powershell
+$env:TEST_DATABASE_URL = 'postgresql+asyncpg://<owner>:<encoded-secret>@localhost:5432/<throwaway-db>'
+$env:TEST_RUNTIME_DATABASE_URL = 'postgresql+asyncpg://stockapi_app:<encoded-secret>@localhost:5432/<throwaway-db>'
+$env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = 'postgresql+asyncpg://stockapi_snapshot_builder:<encoded-secret>@localhost:5432/<throwaway-db>'
+$env:TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET = 'stockapi-test-only'
+uv run pytest tests/integration -v
+```
+
+✅ When all rows pass, the database migration, privilege, revision, snapshot,
+and read-only serving boundaries are proven. Polygon credentials, Celery/Beat,
+and the authenticated HTTP route still require their separate smoke checks.
 
 ---
 
 ## 9. Step 8 — Run the API and workers
 
-The FastAPI app spine is present (Phase 0). Apply migrations, then run the API and,
-in separate terminals, the Celery worker and Beat scheduler:
+Apply all migrations, then run the API, ordinary Celery worker, least-privilege
+snapshot worker, and Beat scheduler in separate terminals:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-alembic upgrade head                 # create the timescaledb extension baseline
+alembic upgrade head                 # apply the complete migration chain
 uvicorn app.main:app --reload --port 8000
 # Swagger docs: http://localhost:8000/docs
 # Liveness:     http://localhost:8000/healthz
@@ -522,6 +564,11 @@ uvicorn app.main:app --reload --port 8000
 # In separate terminals (needed for scheduled Polygon price ingestion):
 celery -A ingestion.celery_app.celery_app worker --loglevel=INFO --concurrency=1
 celery -A ingestion.celery_app.celery_app beat   --loglevel=INFO
+
+# Snapshot creation must be a separate process with DATABASE_URL temporarily
+# set to the stockapi_snapshot_builder URL; never give this URL to the API or
+# ordinary worker. Compose's `snapshot-builder` service wires this safely.
+celery -A ingestion.snapshot_celery_app.snapshot_celery_app worker --loglevel=INFO --concurrency=1 --queues=snapshot-builder
 ```
 
 ---
@@ -534,6 +581,7 @@ docker compose up -d                 # infra
 .\.venv\Scripts\Activate.ps1         # python env
 uvicorn app.main:app --reload        # api
 # (optional) celery -A ingestion.celery_app.celery_app worker --loglevel=INFO --concurrency=1
+# (optional, isolated builder env) celery -A ingestion.snapshot_celery_app.snapshot_celery_app worker --loglevel=INFO --concurrency=1 --queues=snapshot-builder
 
 # Stop
 docker compose stop                  # stop containers, keep data
@@ -620,3 +668,4 @@ Image tags (`latest-pg17`) and `>=` ranges favor a smooth first install. **Befor
 - [ ] `docker compose up -d` → all services healthy
 - [ ] Smoke-test matrix all green (DB, Redis, MLflow)
 - [ ] `alembic upgrade head` → `uvicorn` serves `/docs`, `/healthz` returns 200
+- [ ] Ordinary worker, isolated snapshot-builder worker, and Beat are running

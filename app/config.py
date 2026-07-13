@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -70,6 +70,17 @@ class Settings(BaseSettings):
     forecast_resolution_policy_hash: str | None = None
     forecast_trusted_availability_rule_set_hash: str | None = None
     forecast_seasonal_period: int = Field(default=5, ge=2)
+
+    @field_validator(
+        "forecast_resolution_policy_hash",
+        "forecast_trusted_availability_rule_set_hash",
+        mode="before",
+    )
+    @classmethod
+    def _blank_forecast_hash_is_unset(cls, value: object) -> object:
+        # Compose must expose these optional variables to the API and dedicated
+        # builder worker. An empty .env value retains the deliberate 501 state.
+        return None if isinstance(value, str) and not value.strip() else value
 
     # --- vendor keys ---
     polygon_api_key: str | None = None

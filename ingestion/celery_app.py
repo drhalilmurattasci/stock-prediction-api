@@ -25,6 +25,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "ingestion.tasks.ingest_prices",
+        "ingestion.tasks.ingest_forecast_closes",
         "ingestion.tasks.ingest_fundamentals",
         "ingestion.tasks.ingest_news",
     ],
@@ -39,13 +40,26 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     result_expires=3600,
+    task_routes={
+        "forecasting.build_forecast_snapshots": {"queue": "snapshot-builder"},
+    },
 )
 
 # Placeholder cadences — real windows/universe finalized in Phase 1.
 celery_app.conf.beat_schedule = {
+    "ingest-forecast-closes-eod": {
+        "task": "ingestion.ingest_forecast_closes",
+        # At 16:00 UTC the task resolves the latest *completed* XNYS session;
+        # during the US session that is deliberately the preceding close.
+        "schedule": crontab(hour=16, minute=0),
+    },
     "ingest-prices-eod": {
         "task": "ingestion.ingest_prices",
         "schedule": crontab(hour=22, minute=30),  # after US close (UTC)
+    },
+    "build-forecast-snapshots-eod": {
+        "task": "forecasting.build_forecast_snapshots",
+        "schedule": crontab(hour=17, minute=0),
     },
     "ingest-fundamentals-daily": {
         "task": "ingestion.ingest_fundamentals",

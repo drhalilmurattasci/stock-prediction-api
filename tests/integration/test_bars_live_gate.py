@@ -3,14 +3,15 @@
 Skipped unless ``TEST_DATABASE_URL`` points at a **throwaway** TimescaleDB
 through an owner/admin account. The fixture RESETS the target database (bars
 tables and alembic_version are dropped) before applying migrations. It never
-creates or mutates the cluster-global ``stockapi_app`` role: bootstrap that role
-first and provide its URL through ``TEST_RUNTIME_DATABASE_URL`` or the normal
-``DATABASE_URL`` in ``.env``. Never point this gate at shared data. Run with::
+creates or mutates the cluster-global runtime roles: bootstrap them first and
+provide both least-privilege URLs. Never point this gate at shared data. Run with::
 
     docker compose up -d timescaledb          # needs .env credentials
     $env:TEST_DATABASE_URL = "postgresql+asyncpg://<user>:<pass>@localhost:5432/<db>"
     # Optional when .env DATABASE_URL does not target the same throwaway DB:
     $env:TEST_RUNTIME_DATABASE_URL = "postgresql+asyncpg://stockapi_app:<pass>@localhost:5432/<db>"
+    $env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = "postgresql+asyncpg://stockapi_snapshot_builder:<pass>@localhost:5432/<db>"
+    $env:TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET = "stockapi-test-only"
     uv run pytest tests/integration -v
 
 This is the empirical proof the unit suite cannot give: the Alembic chain
@@ -33,6 +34,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import exchange_calendars
 import pytest
 from sqlalchemy import create_engine, func, make_url, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -45,6 +47,18 @@ from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.db.session import build_engine, build_sessionmaker
 from app.schemas.forecast import ForecastRequest
 from app.schemas.prices import PriceFilters
+from app.services.forecast_serving import (
+    ForecastServingPolicy,
+    SnapshotForecastService,
+    SqlForecastInputSnapshotRepository,
+)
+from app.services.forecast_snapshot_builder import (
+    DEFAULT_AVAILABILITY_RULE_SET_HASH,
+    DEFAULT_RESOLUTION_POLICY_HASH,
+    ForecastSnapshotBuilder,
+    SnapshotBuildSpec,
+    database_snapshot_cutoff,
+)
 from app.services.forecast_snapshots import (
     ForecastInputSnapshotPayload,
     ForecastInputSnapshotRecord,
@@ -56,11 +70,20 @@ from app.services.forecast_snapshots import (
 )
 from app.services.prices import read_prices
 from data_sources.base import OHLCVBar
-from ingestion.upsert import BarVersionConflictError, upsert_bars
+from ingestion.upsert import (
+    BarVersionConflictError,
+    finalize_bar_version_availability,
+    upsert_bars,
+)
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
 if not TEST_DATABASE_URL:
     pytest.skip("TEST_DATABASE_URL not set - live-DB gate skipped", allow_module_level=True)
+if os.environ.get("TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET") != "stockapi-test-only":
+    raise RuntimeError(
+        "set TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET=stockapi-test-only only for the "
+        "owner-designated throwaway database"
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -69,6 +92,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 class LiveDatabaseUrls:
     owner: str
     runtime: str
+    snapshot_builder: str
 
 
 def _async_url(url: str) -> str:
@@ -96,17 +120,35 @@ def _runtime_url_for(owner_url: str) -> str:
     return runtime_url.render_as_string(hide_password=False)
 
 
+def _snapshot_builder_url_for(owner_url: str) -> str:
+    configured = os.environ.get("TEST_SNAPSHOT_BUILDER_DATABASE_URL", "")
+    if not configured:
+        raise ValueError(
+            "TEST_SNAPSHOT_BUILDER_DATABASE_URL must name the dedicated throwaway-DB role"
+        )
+    builder_url = make_url(_async_url(configured))
+    owner = make_url(owner_url)
+    if builder_url.username != "stockapi_snapshot_builder":
+        raise ValueError("live gate builder URL must use stockapi_snapshot_builder")
+    owner_target = (owner.host, owner.port or 5432, owner.database)
+    builder_target = (builder_url.host, builder_url.port or 5432, builder_url.database)
+    if builder_target != owner_target:
+        raise ValueError("live gate owner and builder URLs must target the same throwaway database")
+    return builder_url.render_as_string(hide_password=False)
+
+
 @pytest.fixture(scope="module")
 def migrated_database_url() -> LiveDatabaseUrls:
     """Reset the throwaway database, then apply the full migration chain."""
     url = _async_url(TEST_DATABASE_URL)
     runtime_url = _runtime_url_for(url)
+    snapshot_builder_url = _snapshot_builder_url_for(url)
     sync_engine = create_engine(_sync_url(url))
     with sync_engine.begin() as conn:
         conn.execute(
             text(
-                "DROP TABLE IF EXISTS forecast_input_snapshots, bars_revisions, "
-                "bars, alembic_version CASCADE"
+                "DROP TABLE IF EXISTS forecast_input_snapshots, "
+                "bar_version_availability, bars_revisions, bars, alembic_version CASCADE"
             )
         )
         conn.execute(text("DROP FUNCTION IF EXISTS reject_forecast_input_snapshot_mutation()"))
@@ -114,6 +156,7 @@ def migrated_database_url() -> LiveDatabaseUrls:
         conn.execute(text("DROP FUNCTION IF EXISTS reject_bar_history_mutation()"))
         conn.execute(text("DROP FUNCTION IF EXISTS require_bar_revision_version_evidence()"))
         conn.execute(text("DROP FUNCTION IF EXISTS version_bar_write()"))
+        conn.execute(text("DROP FUNCTION IF EXISTS stamp_bar_version_availability()"))
     sync_engine.dispose()
 
     result = subprocess.run(  # fresh process: env.py resolves DATABASE_URL uncached
@@ -125,9 +168,25 @@ def migrated_database_url() -> LiveDatabaseUrls:
         timeout=300,
     )
     assert result.returncode == 0, f"alembic upgrade failed:\n{result.stdout}\n{result.stderr}"
+    for direction, target in (
+        ("downgrade", "0007_snapshot_builder_privileges"),
+        ("upgrade", "head"),
+    ):
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", direction, target],
+            cwd=REPO_ROOT,
+            env={**os.environ, "DATABASE_URL": url, "MIGRATION_DATABASE_URL": url},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, (
+            f"alembic {direction} {target} failed:\n{result.stdout}\n{result.stderr}"
+        )
     return LiveDatabaseUrls(
         owner=url,
         runtime=runtime_url,
+        snapshot_builder=snapshot_builder_url,
     )
 
 
@@ -141,6 +200,15 @@ async def engine(migrated_database_url: LiveDatabaseUrls) -> AsyncEngine:
 @pytest.fixture
 async def owner_engine(migrated_database_url: LiveDatabaseUrls) -> AsyncEngine:
     engine = create_async_engine(migrated_database_url.owner)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def snapshot_builder_engine(
+    migrated_database_url: LiveDatabaseUrls,
+) -> AsyncEngine:
+    engine = create_async_engine(migrated_database_url.snapshot_builder)
     yield engine
     await engine.dispose()
 
@@ -175,7 +243,7 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0006_bar_version_history"
+        assert version == "0008_bar_version_availability"
         hypertables = (
             await conn.execute(
                 text(
@@ -227,13 +295,15 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
         role_settings = (
             await conn.execute(
                 text(
-                    "SELECT count(*) FROM pg_db_role_setting AS setting "
+                    "SELECT setting.setdatabase, setting.setconfig "
+                    "FROM pg_db_role_setting AS setting "
                     "JOIN pg_roles AS role ON role.oid = setting.setrole "
                     "WHERE role.rolname = 'stockapi_app'"
                 )
             )
-        ).scalar_one()
-        assert role_settings == 0
+        ).one()
+        assert role_settings.setdatabase == 0
+        assert role_settings.setconfig == ["search_path=pg_catalog, public"]
         privileges = {
             name: (
                 await conn.execute(
@@ -255,6 +325,13 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
                 ("revision_update", "bars_revisions", "UPDATE"),
                 ("revision_delete", "bars_revisions", "DELETE"),
                 ("revision_truncate", "bars_revisions", "TRUNCATE"),
+                ("availability_select", "bar_version_availability", "SELECT"),
+                ("availability_insert", "bar_version_availability", "INSERT"),
+                ("availability_update", "bar_version_availability", "UPDATE"),
+                ("availability_delete", "bar_version_availability", "DELETE"),
+                ("availability_references", "bar_version_availability", "REFERENCES"),
+                ("availability_trigger", "bar_version_availability", "TRIGGER"),
+                ("availability_maintain", "bar_version_availability", "MAINTAIN"),
                 ("snapshot_select", "forecast_input_snapshots", "SELECT"),
                 ("snapshot_insert", "forecast_input_snapshots", "INSERT"),
                 ("snapshot_update", "forecast_input_snapshots", "UPDATE"),
@@ -276,6 +353,13 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
             "revision_update": False,
             "revision_delete": False,
             "revision_truncate": False,
+            "availability_select": True,
+            "availability_insert": True,
+            "availability_update": False,
+            "availability_delete": False,
+            "availability_references": False,
+            "availability_trigger": False,
+            "availability_maintain": False,
             "snapshot_select": True,
             "snapshot_insert": False,
             "snapshot_update": False,
@@ -309,6 +393,97 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
             )
         ).scalar_one()
         assert can_execute_version_trigger is False
+
+        builder_role = (
+            await conn.execute(
+                text(
+                    "SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, "
+                    "rolbypassrls, rolinherit, rolcanlogin "
+                    "FROM pg_roles WHERE rolname = 'stockapi_snapshot_builder'"
+                )
+            )
+        ).one()
+        assert tuple(builder_role) == (False, False, False, False, False, False, True)
+        builder_memberships = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_auth_members AS membership "
+                    "JOIN pg_roles AS member_role ON member_role.oid = membership.member "
+                    "JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid "
+                    "WHERE member_role.rolname = 'stockapi_snapshot_builder' "
+                    "OR granted_role.rolname = 'stockapi_snapshot_builder'"
+                )
+            )
+        ).scalar_one()
+        assert builder_memberships == 0
+        builder_settings = (
+            await conn.execute(
+                text(
+                    "SELECT setting.setdatabase, setting.setconfig "
+                    "FROM pg_db_role_setting AS setting "
+                    "JOIN pg_roles AS role ON role.oid = setting.setrole "
+                    "WHERE role.rolname = 'stockapi_snapshot_builder'"
+                )
+            )
+        ).one()
+        assert builder_settings.setdatabase == 0
+        assert builder_settings.setconfig == ["search_path=pg_catalog, public"]
+        builder_privileges = {
+            name: (
+                await conn.execute(
+                    text(
+                        "SELECT has_table_privilege("
+                        "'stockapi_snapshot_builder', :table_name, :privilege)"
+                    ),
+                    {"table_name": table_name, "privilege": privilege},
+                )
+            ).scalar_one()
+            for name, table_name, privilege in (
+                ("bars_select", "bars", "SELECT"),
+                ("bars_insert", "bars", "INSERT"),
+                ("bars_update", "bars", "UPDATE"),
+                ("revision_select", "bars_revisions", "SELECT"),
+                ("revision_insert", "bars_revisions", "INSERT"),
+                ("availability_select", "bar_version_availability", "SELECT"),
+                ("availability_insert", "bar_version_availability", "INSERT"),
+                ("availability_references", "bar_version_availability", "REFERENCES"),
+                ("availability_trigger", "bar_version_availability", "TRIGGER"),
+                ("availability_maintain", "bar_version_availability", "MAINTAIN"),
+                ("snapshot_select", "forecast_input_snapshots", "SELECT"),
+                ("snapshot_insert", "forecast_input_snapshots", "INSERT"),
+                ("snapshot_update", "forecast_input_snapshots", "UPDATE"),
+                ("snapshot_delete", "forecast_input_snapshots", "DELETE"),
+                ("snapshot_truncate", "forecast_input_snapshots", "TRUNCATE"),
+            )
+        }
+        assert builder_privileges == {
+            "bars_select": True,
+            "bars_insert": False,
+            "bars_update": False,
+            "revision_select": True,
+            "revision_insert": False,
+            "availability_select": True,
+            "availability_insert": False,
+            "availability_references": False,
+            "availability_trigger": False,
+            "availability_maintain": False,
+            "snapshot_select": True,
+            "snapshot_insert": True,
+            "snapshot_update": False,
+            "snapshot_delete": False,
+            "snapshot_truncate": False,
+        }
+        for role in ("stockapi_app", "stockapi_snapshot_builder"):
+            can_execute_receipt_trigger = (
+                await conn.execute(
+                    text(
+                        "SELECT has_function_privilege("
+                        ":role, 'stamp_bar_version_availability()', 'EXECUTE')"
+                    ),
+                    {"role": role},
+                )
+            ).scalar_one()
+            assert can_execute_receipt_trigger is False
 
 
 async def test_upsert_replay_is_noop_and_restatement_writes_revision(engine: AsyncEngine) -> None:
@@ -358,7 +533,29 @@ async def test_upsert_replay_is_noop_and_restatement_writes_revision(engine: Asy
         assert revision.incoming_close == 102.5
         assert revision.previous_recorded_at is not None
         assert revision.previous_recorded_at < row.recorded_at
-        assert revision.incoming_recorded_at == revision.revised_at == row.recorded_at
+    assert revision.incoming_recorded_at == revision.revised_at == row.recorded_at
+
+
+async def test_receipt_rejects_version_written_in_same_outer_transaction_savepoint(
+    engine: AsyncEngine,
+) -> None:
+    """A subxid must not bypass the top-level post-commit boundary."""
+
+    maker = build_sessionmaker(engine)
+    async with maker() as session, session.begin():
+        async with session.begin_nested():
+            plan = await upsert_bars(
+                session,
+                [_bar(day, symbol="RCPT", close=100.0 + day) for day in (1, 2, 3)],
+            )
+        with pytest.raises(DBAPIError, match="finalized after its write commits"):
+            async with session.begin_nested():
+                await finalize_bar_version_availability(session, plan.rows[-1:])
+
+    async with maker() as session, session.begin():
+        # A trailing-only retry reconciles the two earlier versions whose
+        # hypothetical first finalizer never committed.
+        assert await finalize_bar_version_availability(session, plan.rows[-1:]) == 3
 
 
 async def test_stale_conflicts_and_history_mutation_fail_closed(
@@ -652,3 +849,85 @@ async def test_snapshot_insert_hash_resolution_and_immutability(
                 )
                 await conn.execute(text(mutation), parameters)
             await transaction.rollback()
+
+
+async def test_bars_to_verified_snapshot_to_served_forecast(
+    engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+) -> None:
+    """Prove the complete privileged-write/read-only-serving chain."""
+
+    runtime_maker = build_sessionmaker(engine)
+    builder_maker = build_sessionmaker(snapshot_builder_engine)
+    initial_cutoff = await database_snapshot_cutoff(builder_maker)
+    calendar = exchange_calendars.get_calendar("XNYS", start="1990-01-01", end="2100-12-31")
+    latest = calendar.date_to_session(initial_cutoff.date(), direction="previous")
+    if calendar.session_close(latest).to_pydatetime() > initial_cutoff:
+        latest = calendar.previous_session(latest)
+    sessions = calendar.sessions_window(latest, -258)
+    bars = []
+    for index, label in enumerate(sessions):
+        timestamp = label.to_pydatetime().replace(tzinfo=UTC)
+        fetched_at = calendar.session_close(label).to_pydatetime()
+        close = 100.0 + index * 0.05 + (index % 7) * 0.2
+        bars.append(
+            OHLCVBar(
+                symbol="AAPL",
+                timestamp=timestamp,
+                timespan="day",
+                multiplier=1,
+                open=close - 0.5,
+                high=close + 1.0,
+                low=close - 1.0,
+                close=close,
+                volume=10_000.0 + index,
+                source="polygon_open_close",
+                adjustment_basis="raw",
+                fetched_at=fetched_at,
+            )
+        )
+    async with runtime_maker() as session, session.begin():
+        plan = await upsert_bars(session, bars)
+    async with runtime_maker() as session, session.begin():
+        await finalize_bar_version_availability(session, plan.rows)
+
+    cutoff = await database_snapshot_cutoff(builder_maker)
+    spec = SnapshotBuildSpec(
+        symbol="AAPL",
+        target="close",
+        horizon_unit="trading_day",
+        as_of=cutoff,
+    )
+    builder = ForecastSnapshotBuilder(builder_maker)
+    created = await builder.build(spec)
+    replayed = await builder.build(spec)
+    assert created.created is True
+    assert replayed.created is False
+    assert replayed.snapshot_id == created.snapshot_id
+    assert replayed.availability_checked_at == created.availability_checked_at
+
+    service = SnapshotForecastService(
+        repository=SqlForecastInputSnapshotRepository(
+            runtime_maker,
+            trusted_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        ),
+        policy=ForecastServingPolicy(
+            resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+            trusted_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        ),
+    )
+    response = await service.forecast(
+        ForecastRequest(
+            symbol="AAPL",
+            horizon=2,
+            horizon_unit="trading_day",
+            target="close",
+            snapshot_id=created.snapshot_id,
+            model="baseline_naive",
+            interval_coverages=[0.8],
+        )
+    )
+    assert response.symbol == "AAPL"
+    assert response.provenance.snapshot_id == created.snapshot_id
+    assert response.provenance.lookahead_check.status == "passed"
+    assert len(response.forecasts) == 2

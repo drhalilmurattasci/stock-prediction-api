@@ -15,11 +15,12 @@ from datetime import UTC
 from typing import Any, Self, cast
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, model_validator
-from sqlalchemy import Select, func, select, tuple_
+from sqlalchemy import Select, and_, func, select, tuple_, union
 from sqlalchemy.dialects.postgresql import Insert, insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models.bars import Bar, BarRevision
+from app.db.models.bars import Bar, BarRevision, BarVersionAvailability
 from data_sources.base import AdjustmentBasis, OHLCVBar, Timespan
 
 #: Columns forming the unique conflict key for an OHLCV upsert.
@@ -31,6 +32,10 @@ BAR_CONFLICT_KEY: tuple[str, ...] = (
     "source",
     "adjustment_basis",
 )
+BAR_VERSION_LANE_KEY: tuple[str, ...] = tuple(
+    column for column in BAR_CONFLICT_KEY if column != "ts"
+)
+BAR_VERSION_KEY: tuple[str, ...] = (*BAR_CONFLICT_KEY, "version_recorded_at")
 BAR_VALUE_COLUMNS: tuple[str, ...] = (
     "open",
     "high",
@@ -44,6 +49,97 @@ BAR_VALUE_COLUMNS: tuple[str, ...] = (
 
 class BarVersionConflictError(ValueError):
     """A changed value did not carry strictly newer availability evidence."""
+
+
+async def finalize_bar_version_availability(
+    session: AsyncSession,
+    rows: Iterable[BarUpsertRow],
+) -> int:
+    """Publish receipts for every committed version in the supplied rows' lanes.
+
+    This must run in a transaction that begins after the bar-upsert transaction
+    commits. The database trigger rejects a same-transaction attempt and stamps
+    ``available_at`` itself. Finalizing every still-unreceipted version across
+    each full symbol/timespan/multiplier/source/adjustment lane also repairs the
+    safe failure mode where a worker committed a bootstrap batch and died
+    before writing its receipts, even when a later retry only refetches a
+    trailing window.
+    """
+
+    row_list = _dedupe_rows(rows)
+    if not row_list:
+        return 0
+    statement = build_bar_version_availability_statement(row_list)
+    raw_result = await session.execute(statement)
+    # Lightweight unit fakes do not emulate a CursorResult; production async
+    # sessions always return one for this INSERT.
+    return 0 if raw_result is None else cast(CursorResult[Any], raw_result).rowcount
+
+
+def build_bar_version_availability_statement(rows: Iterable[BarUpsertRow]) -> Insert:
+    """Build a lane-wide, concurrency-safe missing-receipt reconciliation."""
+
+    row_list = _dedupe_rows(rows)
+    if not row_list:
+        raise ValueError("at least one bar row is required")
+    lanes = sorted(
+        {tuple(getattr(row, column) for column in BAR_VERSION_LANE_KEY) for row in row_list}
+    )
+    current = select(
+        Bar.symbol,
+        Bar.timespan,
+        Bar.multiplier,
+        Bar.ts,
+        Bar.source,
+        Bar.adjustment_basis,
+        Bar.recorded_at.label("version_recorded_at"),
+    ).where(tuple_(*(getattr(Bar, column) for column in BAR_VERSION_LANE_KEY)).in_(lanes))
+    previous = select(
+        BarRevision.symbol,
+        BarRevision.timespan,
+        BarRevision.multiplier,
+        BarRevision.ts,
+        BarRevision.source,
+        BarRevision.adjustment_basis,
+        BarRevision.previous_recorded_at.label("version_recorded_at"),
+    ).where(
+        tuple_(*(getattr(BarRevision, column) for column in BAR_VERSION_LANE_KEY)).in_(lanes),
+        BarRevision.previous_recorded_at.is_not(None),
+    )
+    incoming = select(
+        BarRevision.symbol,
+        BarRevision.timespan,
+        BarRevision.multiplier,
+        BarRevision.ts,
+        BarRevision.source,
+        BarRevision.adjustment_basis,
+        BarRevision.incoming_recorded_at.label("version_recorded_at"),
+    ).where(
+        tuple_(*(getattr(BarRevision, column) for column in BAR_VERSION_LANE_KEY)).in_(lanes),
+        BarRevision.incoming_recorded_at.is_not(None),
+    )
+    versions = union(current, previous, incoming).subquery("bar_versions")
+    receipt_exists = (
+        select(1)
+        .select_from(BarVersionAvailability)
+        .where(
+            and_(
+                *(
+                    BarVersionAvailability.__table__.c[column] == versions.c[column]
+                    for column in BAR_VERSION_KEY
+                )
+            )
+        )
+        .exists()
+    )
+    missing_versions = select(*(versions.c[column] for column in BAR_VERSION_KEY)).where(
+        ~receipt_exists
+    )
+    return (
+        insert(BarVersionAvailability)
+        .from_select(BAR_VERSION_KEY, missing_versions)
+        .on_conflict_do_nothing()
+    )
 
 
 class BarUpsertRow(BaseModel):

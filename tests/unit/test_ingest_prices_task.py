@@ -187,9 +187,19 @@ async def test_ingest_prices_fetches_locks_and_upserts_per_symbol():
     assert result["status"] == "ok"
     assert result["symbols"] == ["AAPL", "MSFT"]
     assert result["rows_upserted"] == 2
-    assert len(sessionmaker.sessions) == 4
+    # Per symbol: watermark read, bar-write transaction, then a distinct
+    # post-commit availability-finalization transaction.
+    assert len(sessionmaker.sessions) == 6
     assert all(
-        "pg_advisory_xact_lock" in session.executed[0][0] for session in sessionmaker.sessions
+        any("pg_advisory_xact_lock" in statement for statement, _ in session.executed)
+        for session in sessionmaker.sessions
+    )
+    assert (
+        sum(
+            any("bar_version_availability" in statement for statement, _ in session.executed)
+            for session in sessionmaker.sessions
+        )
+        == 2
     )
 
 
@@ -209,9 +219,27 @@ async def test_ingest_prices_refetches_trailing_overlap_when_watermark_is_recent
     )
 
     assert provider.calls == [("AAPL", date(2026, 6, 29), date(2026, 7, 6), False)]
-    assert result["requested_start"] == "2026-06-29"
+    assert result["requested_start"] == "2024-04-27"
     assert result["watermark_enabled"] is True
     assert result["per_symbol"][0]["fetch_start"] == "2026-06-29"
+
+
+@pytest.mark.asyncio
+async def test_first_ingest_bootstraps_enough_history_for_snapshot_baselines() -> None:
+    sessionmaker = FakeSessionmaker(latest_ts=None)
+    provider = FakeProvider(sessionmaker=sessionmaker)
+
+    result = await ingest_prices_async(
+        symbols=["AAPL"],
+        end=date(2026, 7, 6),
+        settings=Settings(app_env="test", polygon_api_key="unused"),
+        provider_factory=lambda _settings: provider,
+        sessionmaker=sessionmaker,  # type: ignore[arg-type]
+        upsert_fn=_fake_upsert,  # type: ignore[arg-type]
+    )
+
+    assert provider.calls == [("AAPL", date(2024, 4, 27), date(2026, 7, 6), False)]
+    assert result["requested_start"] == "2024-04-27"
 
 
 @pytest.mark.asyncio
