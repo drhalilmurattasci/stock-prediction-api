@@ -12,7 +12,9 @@ param(
 # The API key is read from ignored .env and is never accepted on the command line.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$mutex = [System.Threading.Mutex]::new($false, "Local\StockApiVendorSmoke")
+# Global\ scope: exclusion must hold machine-wide across logon sessions
+# (console + RDP + scheduled task), not just within one session.
+$mutex = [System.Threading.Mutex]::new($false, "Global\StockApiVendorSmoke")
 $mutexHeld = $false
 
 Push-Location -LiteralPath $PSScriptRoot

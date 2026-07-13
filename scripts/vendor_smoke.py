@@ -24,6 +24,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 from app.config import Settings, get_settings
+from app.core.logging import configure_logging
 from app.db.models.bars import Bar, BarVersionAvailability
 from app.db.session import build_engine
 from data_sources.guards import AsyncPacingCostRateGuard
@@ -267,6 +268,12 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    # Pin structlog to plain, locals-free tracebacks BEFORE any vendor work:
+    # unconfigured structlog with `rich` importable (dev/ml extras) renders
+    # exception locals on failure — including PolygonProvider._request's
+    # Authorization header — to the operator console. The app configuration
+    # formats exceptions as plain text with no locals.
+    configure_logging("INFO", json_logs=False)
     try:
         result = asyncio.run(
             run_vendor_smoke(
