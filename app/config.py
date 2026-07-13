@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     rate_limit_storage_uri: str = "memory://"
     rate_limit_default: str = "120/minute"
     rate_limit_enabled: bool = True
+    # Storage outage posture: False (default) refuses requests with 503 rather
+    # than silently lifting every quota while Redis is down.
+    rate_limit_fail_open: bool = False
 
     # --- services ---
     mlflow_tracking_uri: str = "http://localhost:5000"

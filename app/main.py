@@ -5,15 +5,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, cast
 
 import redis.asyncio as aioredis
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
-from slowapi import _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
 
 from app import __version__
 from app.api.router import api_router
@@ -21,7 +17,7 @@ from app.api.v1 import health
 from app.config import Settings, get_settings
 from app.core.exceptions import install_exception_handlers
 from app.core.logging import configure_logging
-from app.core.rate_limit import build_limiter
+from app.core.rate_limit import RateLimitMiddleware, build_rate_limiter
 from app.db.session import build_engine, build_sessionmaker
 from app.observability.metrics import PrometheusMiddleware, metrics_endpoint
 from app.observability.sentry import init_sentry
@@ -44,11 +40,11 @@ async def lifespan(app: FastAPI):
         encoding="utf-8",
         decode_responses=True,
     )
-    app.state.limiter = build_limiter(settings)
     log.info("startup", env=settings.app_env, version=__version__)
     try:
         yield
     finally:
+        await app.state.rate_limiter.backend.aclose()
         await app.state.redis_cache.aclose()
         await app.state.engine.dispose()
         log.info("shutdown")
@@ -75,9 +71,9 @@ def create_app(
     if readiness_probes is not None:
         app.state.readiness_probes = tuple(readiness_probes)
 
-    # --- rate limiting (slowapi) ---
-    app.add_exception_handler(RateLimitExceeded, cast(Any, _rate_limit_exceeded_handler))
-    app.add_middleware(SlowAPIMiddleware)
+    # --- rate limiting (owned; prefix-scoped so every nested /v1 route counts) ---
+    app.state.rate_limiter = build_rate_limiter(settings)
+    app.add_middleware(RateLimitMiddleware)
 
     # --- metrics ---
     app.add_middleware(PrometheusMiddleware)

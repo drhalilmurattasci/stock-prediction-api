@@ -11,7 +11,6 @@ dependencies = [
   "pydantic-settings>=2.6",
   "httpx>=0.28",
   "tenacity>=9.0",
-  "slowapi>=0.1.9",
   "PyJWT[crypto]>=2.10",
   "bcrypt>=4.2",
   "python-dotenv>=1.0",

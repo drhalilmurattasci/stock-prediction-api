@@ -42,7 +42,7 @@ def test_lifespan_creates_app_owned_resources():
 
     with TestClient(app) as test_client:
         assert app.state.settings is settings
-        assert app.state.limiter.enabled is False
+        assert app.state.rate_limiter.enabled is False
         assert app.state.engine is not None
         assert app.state.sessionmaker is not None
         assert app.state.redis_cache is not None
@@ -67,7 +67,7 @@ def test_database_engine_uses_explicit_pool_settings():
 
 
 def test_rate_limit_disabled_in_test_factory(client: Any):
-    assert client.app.state.limiter.enabled is False
+    assert client.app.state.rate_limiter.enabled is False
 
 
 def test_statement_timeout_is_a_server_side_budget_and_opt_in():
