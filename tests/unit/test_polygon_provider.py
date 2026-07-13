@@ -14,12 +14,13 @@ import pytest
 import tenacity
 
 from data_sources.base import (
+    CostBudgetExceeded,
     OHLCVBar,
     ProviderHTTPError,
     SymbolNotFoundError,
     VendorRateLimitError,
 )
-from data_sources.guards import InMemoryCostRateGuard
+from data_sources.guards import AsyncPacingCostRateGuard, InMemoryCostRateGuard
 from data_sources.polygon import PolygonProvider
 
 FIXED_NOW = datetime(2026, 7, 6, 12, 0, tzinfo=UTC)
@@ -124,6 +125,28 @@ async def test_transient_500_is_retried_then_succeeds():
 
     assert bars == []
     assert attempts["n"] == 3  # two failures, then success
+
+
+async def test_total_budget_one_blocks_retry_before_a_second_http_attempt():
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, json={"error": "temporarily unavailable"})
+
+    guard = AsyncPacingCostRateGuard(
+        max_calls_per_window=1,
+        window_seconds=60,
+        total_budget=1,
+    )
+    provider = _provider(handler, guard=guard, max_attempts=4)
+    with pytest.raises(CostBudgetExceeded):
+        await provider.get_daily_bars("AAPL", date(2026, 7, 1), date(2026, 7, 6))
+    await provider.aclose()
+
+    assert attempts == 1
+    assert guard.snapshot("polygon") == {"window_count": 1, "spent": 1}
 
 
 async def test_429_honors_retry_after_without_sleeping():

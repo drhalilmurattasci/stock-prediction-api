@@ -84,7 +84,7 @@ extend-immutable-calls = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["app", "ai_dispatcher", "data_sources", "ingestion", "ml", "tests"]
+known-first-party = ["app", "ai_dispatcher", "data_sources", "ingestion", "ml", "scripts", "tests"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -93,7 +93,7 @@ ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 check_untyped_defs = true
-files = ["app", "ai_dispatcher", "data_sources", "ingestion", "ml"]
+files = ["app", "ai_dispatcher", "data_sources", "ingestion", "ml", "scripts"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

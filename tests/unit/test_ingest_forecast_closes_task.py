@@ -131,6 +131,7 @@ async def test_default_provider_paces_per_session_vendor_calls() -> None:
             polygon_api_key="test-key",
             polygon_max_calls_per_window=7,
             polygon_rate_window_seconds=30,
+            polygon_total_call_budget=11,
         ),
         None,
     )
@@ -139,6 +140,7 @@ async def test_default_provider_paces_per_session_vendor_calls() -> None:
         assert isinstance(provider._guard, AsyncPacingCostRateGuard)  # noqa: SLF001
         assert provider._guard.max_calls == 7  # noqa: SLF001
         assert provider._guard.window == 30  # noqa: SLF001
+        assert provider._guard.total_budget == 11  # noqa: SLF001
     finally:
         await provider.aclose()
 

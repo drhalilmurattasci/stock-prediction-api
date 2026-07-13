@@ -548,6 +548,28 @@ afterward. It never makes a vendor call.
 and read-only serving boundaries are proven. Polygon credentials, Celery/Beat,
 and the authenticated HTTP route still require their separate smoke checks.
 
+### Separately authorized first vendor request
+
+The first Massive/Polygon request is a distinct owner gate. After placing the
+key in ignored `.env`, authorize an exact session and run only the bounded
+smoke below (replace the date with the latest completed XNYS session named in
+that authorization):
+
+```powershell
+.\run-vendor-smoke.ps1 `
+  -Session 2026-07-10 `
+  -Authorization stockapi-vendor-smoke-only
+```
+
+The harness is hard-bound to `MSFT`, `stockapi_app`, and the local
+`stockapi_test` database. It refuses a pre-existing target row and forces one
+total HTTP attempt with retries disabled. Keep the ordinary ingestion worker and
+Beat stopped; the wrapper checks the local process/container state before
+starting and serializes concurrent wrapper invocations. Success requires both
+the exact bar and its DB-stamped post-commit availability receipt. It does not
+build a snapshot or serve a forecast; those remain a later, separately budgeted
+backfill gate.
+
 ---
 
 ## 9. Step 8 — Run the API and workers
