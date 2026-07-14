@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from app.api.v1.health import UNAVAILABLE_DETAIL
 from app.config import Settings
 from app.main import create_app
 
@@ -61,11 +62,39 @@ def test_readyz_reports_degraded_probe():
 
     assert resp.status_code == 503
     assert resp.json()["status"] == "degraded"
+    # The failing check is named so an operator knows WHAT is unhealthy, but the
+    # dependency's own message is never reflected to an unauthenticated caller.
     assert resp.json()["checks"][1] == {
         "name": "redis",
         "ok": False,
-        "detail": "redis unavailable",
+        "detail": UNAVAILABLE_DETAIL,
     }
+
+
+def test_readyz_never_reflects_dependency_exception_text():
+    # /readyz is public and unmetered. A real asyncpg failure renders internal
+    # topology and credentials; none of it may reach the response body.
+    secret_rendering = (
+        'connection to server at "timescaledb" (172.18.0.2), port 5432 failed: '
+        'FATAL: password authentication failed for user "stockapi_app"'
+    )
+
+    async def leaking_probe(_request: Request) -> None:
+        raise ConnectionError(secret_rendering)
+
+    app = create_app(
+        Settings(app_env="test", rate_limit_enabled=False),
+        readiness_probes=(("database", leaking_probe),),
+    )
+    with TestClient(app) as test_client:
+        resp = test_client.get("/readyz")
+
+    body = resp.text
+    assert resp.status_code == 503
+    assert resp.json()["checks"][0]["detail"] == UNAVAILABLE_DETAIL
+    for disclosed in ("timescaledb", "172.18.0.2", "5432", "stockapi_app", "password"):
+        assert disclosed not in body
+    assert "ConnectionError" not in body
 
 
 def test_test_factory_disables_default_rate_limit(client):

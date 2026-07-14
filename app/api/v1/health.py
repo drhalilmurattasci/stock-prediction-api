@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 
+import structlog
 from fastapi import APIRouter, Request, Response, status
 
 from app import __version__
@@ -12,8 +13,15 @@ from app.dependencies import check_redis
 from app.schemas.common import HealthResponse, ReadinessCheck, ReadinessResponse
 
 router = APIRouter(tags=["health"])
+log = structlog.get_logger(__name__)
 
 SERVICE_NAME = "stock-prediction-api"
+#: ``/readyz`` is public and unauthenticated. A dependency's own exception text
+#: discloses internal topology and credentials -- asyncpg, for instance, renders
+#: 'connection to server at "timescaledb" (172.18.0.2), port 5432 failed: FATAL:
+#: password authentication failed for user "stockapi_app"'. Probes therefore
+#: report only WHICH check failed; the cause stays in server-side logs.
+UNAVAILABLE_DETAIL = "dependency check failed"
 ReadinessProbe = Callable[[Request], Awaitable[None]]
 
 
@@ -50,7 +58,16 @@ async def readyz(request: Request, response: Response) -> ReadinessResponse:
             await probe(request)
             checks.append(ReadinessCheck(name=name, ok=True))
         except Exception as exc:  # noqa: BLE001 - report failure, never crash the probe
-            checks.append(ReadinessCheck(name=name, ok=False, detail=str(exc)))
+            # Never reflect the dependency's exception text to an unauthenticated
+            # caller (see UNAVAILABLE_DETAIL). The request-id is already bound to
+            # the log context, so operators can correlate this with the request.
+            log.warning(
+                "readiness_probe_failed",
+                check=name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            checks.append(ReadinessCheck(name=name, ok=False, detail=UNAVAILABLE_DETAIL))
 
     all_ok = all(c.ok for c in checks)
     if not all_ok:
