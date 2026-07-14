@@ -127,6 +127,15 @@ time. No unattended collector,
 scoreboard, or interval recalibrator is enabled; those actors still require
 explicit policy artifacts and the same automation controls before use.
 
+The repository now includes dependency-free, versioned offline kernels for
+finite-sample split conformal, signed CQR, and projected ACI, with golden and
+fail-closed tests. This is math infrastructure, not calibration evidence. It is
+not connected to serving or persistence; there is no immutable fitted
+calibration artifact, and ACI-to-quantile discretization remains deliberately
+undefined. Forecast responses therefore continue to report
+`calibration.method=none` until prospective fit and held-out cohorts mature and
+the resulting artifact is durably bound to the served forecast.
+
 See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Persistent workers
 and Beat are intentionally not safe-by-default startup conveniences: inspect or
 purge the durable queue, set the explicit automation gates and finite vendor

@@ -172,3 +172,14 @@ credential/secret rotation, a reproducible model registry/leaderboard, and
 models that empirically beat the baselines. Daily
 forecast manifests/external anchoring remain beyond the per-run SHA-256 archive.
 Later endpoint families remain phased backlog.
+
+Versioned offline conformal kernels implement the finite-sample corrected-rank
+selector, symmetric absolute-residual intervals, signed CQR corrections, and a
+projected ACI state transition. They intentionally have no API, database,
+scheduler, or serving adapter. In particular, ACI state can leave the canonical
+thousandth grid accepted by the v1 finite-sample selector; any future composition
+must pin an explicit discretization policy. A serving-grade calibration artifact
+must also bind distinct prospective fit and held-out cohorts, their complete
+outcome receipts, algorithm and composition identities, and post-commit
+persistence evidence. Until that boundary exists and real outcomes mature,
+serving remains `method=none`.
