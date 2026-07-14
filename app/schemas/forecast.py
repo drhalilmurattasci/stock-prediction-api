@@ -101,7 +101,7 @@ class ForecastRequest(ForecastBaseModel):
         default="close",
         description=(
             "Forecast target. Price targets use the response currency; return targets are "
-            "unitless. Snapshot policy v1 serves raw close only."
+            "unitless. Serving requires a separately pinned snapshot policy for each target."
         ),
     )
     as_of: AwareDatetime | None = Field(

@@ -119,14 +119,15 @@ builder primitive: `ingestion.tasks.seal_adjusted_forecast_snapshot`. Inside an
 exact revision-attested `stockapi_snapshot_builder` image, it can publish or
 exact-replay one MSFT factor set at an operator-plan-bound cutoff and seal or
 replay one adjusted-close snapshot at the later factor-receipt time. It performs
-no vendor I/O and does not enable Celery. It also is not yet a complete host
-operator: no read-only adjusted-seal planner or PowerShell attestation wrapper
-currently binds the cutoff, detached image, actor exclusions, and HTTP proof.
-Do not invoke the primitive ad hoc. The raw-close demo remains the only complete
-end-to-end host proof, and adjusted outcomes, cohorts, and calibration remain
-excluded.
+no vendor I/O and does not enable Celery. Do not invoke the primitive ad hoc.
+The adjusted lane of `run-forecast-demo.ps1` prepares that exact factor artifact
+read-only, binds its content ID and stable evidence-derived cutoff, then uses the
+same detached-image, actor-exclusion, and API attestation controls as the raw
+lane. Its authenticated POST uses a plan-derived idempotency key and must replay
+the same archived forecast on retry. Adjusted outcomes, cohorts, and calibration
+remain separately excluded.
 
-The final raw-close, no-vendor step is also scaffolded: a read-only plan binds the
+The raw-close, no-vendor lane is also scaffolded: a read-only plan binds the
 completed price acquisition, clean commit, database clock, raw policy hashes,
 and API auth configuration;
 its separately authorized execution uses one short-lived least-privilege builder
@@ -155,10 +156,11 @@ The `app` Compose profile serves the API only; it never starts a worker, the
 privileged snapshot builder, or Beat. Persistent actors live behind the separate
 `automation` profile, the default-off `AUTOMATION_ENABLED` task gate, and (for
 Polygon lanes) a positive finite process budget. See [INSTALL.md](INSTALL.md)
-for role bootstrap and the live database gate. For the bounded milestone proof,
-use `run-forecast-demo.ps1`; its one-shot builder does not enable Celery
-automation and remains deliberately raw-close-only. Compose publishes the API
-on loopback only. That proof builds from
+for role bootstrap and the live database gate. For the bounded raw or adjusted
+milestone proof, run `run-forecast-demo.ps1` in plan mode with an exact end date
+and either `-Target close` (the default) or `-Target adjusted_close`. Its
+one-shot builder does not enable Celery automation. Compose publishes the API
+on loopback only. The proof builds from
 the exact reviewed Git commit and pins both API and one-shot builder execution
 to revision-labelled immutable image IDs.
 

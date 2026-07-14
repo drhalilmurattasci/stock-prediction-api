@@ -126,6 +126,7 @@ class AdjustmentFactorSet:
 
     factor_set_id: str
     canonical_payload: bytes
+    format: str
     policy_version: str
     policy_hash: str
     symbol: str
@@ -376,6 +377,7 @@ def build_adjustment_factor_set(
     return AdjustmentFactorSet(
         factor_set_id=factor_set_id,
         canonical_payload=canonical_payload,
+        format=ADJUSTMENT_FACTOR_SET_FORMAT,
         policy_version=ADJUSTMENT_FACTOR_POLICY_VERSION,
         policy_hash=ADJUSTMENT_FACTOR_POLICY_HASH,
         symbol=normalized_symbol,

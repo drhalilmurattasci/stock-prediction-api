@@ -256,6 +256,7 @@ async def _require_exact_factor_lineage(
 async def seal_once(
     *,
     factor_cutoff: datetime,
+    expected_factor_set_id: str,
     end_session: date,
     authorization: str,
     settings: Settings | None = None,
@@ -264,6 +265,10 @@ async def seal_once(
 
     if authorization != AUTHORIZATION_SENTINEL:
         raise OneShotAdjustedSealRefused(f"authorization must be exactly {AUTHORIZATION_SENTINEL}")
+    if _CONTENT_ID_PATTERN.fullmatch(expected_factor_set_id) is None:
+        raise OneShotAdjustedSealRefused(
+            "expected_factor_set_id must be the exact planned sha256 identity"
+        )
     safe_settings = _safe_settings(settings or get_settings())
     coverage_dates = _coverage_dates(end_session)
     planned_factor_cutoff = _aware(factor_cutoff, "factor_cutoff")
@@ -289,10 +294,11 @@ async def seal_once(
             end_session,
             phase="preflight",
         )
-        factor_result = await AdjustmentFactorBuilder(
+        factor_builder = AdjustmentFactorBuilder(
             maker,
             SqlAdjustmentFactorSetStore(engine),
-        ).build(
+        )
+        artifact = await factor_builder.prepare(
             AdjustmentFactorBuildSpec(
                 symbol=SYMBOL,
                 coverage_start=coverage_dates[0],
@@ -300,7 +306,11 @@ async def seal_once(
                 cutoff=planned_factor_cutoff,
             )
         )
-        artifact = factor_result.artifact
+        if artifact.factor_set_id != expected_factor_set_id:
+            raise OneShotAdjustedSealRefused(
+                "prepared factor identity differs from the read-only plan"
+            )
+        factor_result = await factor_builder.publish(artifact)
         publication = factor_result.publication
         if (
             artifact.symbol != SYMBOL
@@ -393,6 +403,7 @@ async def seal_once(
             "coverage_end": coverage_dates[-1].isoformat(),
             "factor_cutoff": _timestamp(planned_factor_cutoff),
             "factor_set_id": artifact.factor_set_id,
+            "factor_set_recorded_at": _timestamp(factor_recorded_at),
             "factor_available_at": _timestamp(factor_available_at),
             "factor_input_count": publication.input_count,
             "snapshot_as_of": _timestamp(snapshot_as_of),
@@ -412,6 +423,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--end", required=True, type=_parse_date)
     parser.add_argument("--factor-cutoff", required=True, type=_parse_timestamp)
+    parser.add_argument("--expected-factor-set-id", required=True)
     parser.add_argument("--tool-revision", required=True)
     parser.add_argument("--authorization", required=True)
     return parser
@@ -425,6 +437,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = asyncio.run(
                 seal_once(
                     factor_cutoff=args.factor_cutoff,
+                    expected_factor_set_id=args.expected_factor_set_id,
                     end_session=args.end,
                     authorization=args.authorization,
                 )

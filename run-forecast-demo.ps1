@@ -7,17 +7,35 @@ param(
     [ValidatePattern("^\d{4}-\d{2}-\d{2}$")]
     [string]$End,
 
+    [ValidateSet("close", "adjusted_close")]
+    [string]$Target = "close",
+
     [ValidatePattern("^sha256:[0-9a-f]{64}$")]
     [string]$PlanId,
 
-    [ValidateSet("stockapi-msft-seal-serve-only")]
+    [ValidateSet(
+        "stockapi-msft-seal-serve-only",
+        "stockapi-msft-adjusted-seal-serve-only"
+    )]
     [string]$Authorization
 )
 
-# One-command, no-vendor seal-and-serve proof. API_KEYS and database passwords
-# remain in ignored .env; no secret is accepted on the command line.
+# One-command, no-vendor raw or adjusted seal-and-serve proof. API_KEYS and
+# database passwords remain in ignored .env; no secret is accepted on the
+# command line. The target maps to one fixed controller and authorization;
+# arbitrary modules and cross-lane grants are never accepted.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$controllerModule = switch ($Target) {
+    "close" { "scripts.forecast_demo" }
+    "adjusted_close" { "scripts.adjusted_forecast_demo" }
+    default { throw "unsupported forecast proof target" }
+}
+$expectedAuthorization = switch ($Target) {
+    "close" { "stockapi-msft-seal-serve-only" }
+    "adjusted_close" { "stockapi-msft-adjusted-seal-serve-only" }
+    default { throw "unsupported forecast proof target" }
+}
 $mutex = [System.Threading.Mutex]::new($false, "Global\StockApiMutatingOperator")
 $mutexHeld = $false
 $commandExitCode = 0
@@ -119,14 +137,17 @@ try {
 
     if ($Mode -eq "plan") {
         if ($PlanId -or $Authorization) {
-            throw "plan mode accepts only -Mode plan and -End"
+            throw "plan mode accepts only -Mode plan, -End, and optional -Target"
         }
-        uv run python -m scripts.forecast_demo plan --end $End
+        uv run python -m $controllerModule plan --end $End
         $commandExitCode = $LASTEXITCODE
     }
     else {
         if (-not $PlanId -or -not $Authorization) {
             throw "execute mode requires -PlanId and -Authorization"
+        }
+        if ($Authorization -cne $expectedAuthorization) {
+            throw "authorization does not match the selected forecast target"
         }
         $conflictingServices = @(
             $runningServices | Where-Object { $_ -in @("worker", "beat", "snapshot-builder") }
@@ -151,7 +172,7 @@ try {
             throw "execute requires a clean reviewed Git worktree"
         }
         $reviewedPlanOutput = @(
-            uv run python -m scripts.forecast_demo plan --end $End
+            uv run python -m $controllerModule plan --end $End
         )
         if ($LASTEXITCODE -ne 0 -or $reviewedPlanOutput.Count -ne 1) {
             throw "could not revalidate the authorized plan before service changes"
@@ -162,7 +183,12 @@ try {
         catch {
             throw "the plan revalidation output is malformed"
         }
-        if ($reviewedPlan.status -cne "ready" -or $reviewedPlan.plan_id -cne $PlanId) {
+        if (
+            $reviewedPlan.status -cne "ready" -or
+            $reviewedPlan.plan_id -cne $PlanId -or
+            $reviewedPlan.request.target -cne $Target -or
+            $reviewedPlan.tool_revision -cnotmatch "^[0-9a-f]{40}$"
+        ) {
             throw "database or configuration no longer matches the authorized plan"
         }
 
@@ -281,7 +307,7 @@ try {
         $env:STOCKAPI_FORECAST_DEMO_BUILDER_IMAGE_ID = $builderImageId
         $env:STOCKAPI_FORECAST_DEMO_API_CONTAINER_ID = $runningApiFacts[0]
 
-        uv run python -m scripts.forecast_demo execute `
+        uv run python -m $controllerModule execute `
             --end $End `
             --plan-id $PlanId `
             --authorization $Authorization

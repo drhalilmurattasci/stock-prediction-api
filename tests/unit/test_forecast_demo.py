@@ -943,6 +943,14 @@ def test_wrapper_uses_one_shot_builder_and_never_starts_vendor_workers() -> None
     live_gate = (root / "tests/integration/test_bars_live_gate.py").read_text(encoding="utf-8")
 
     assert "git worktree add --detach" in wrapper
+    assert '[string]$Target = "close"' in wrapper
+    assert '"close" { "scripts.forecast_demo" }' in wrapper
+    assert '"adjusted_close" { "scripts.adjusted_forecast_demo" }' in wrapper
+    assert '"close" { "stockapi-msft-seal-serve-only" }' in wrapper
+    assert '"adjusted_close" { "stockapi-msft-adjusted-seal-serve-only" }' in wrapper
+    assert "$Authorization -cne $expectedAuthorization" in wrapper
+    assert "$reviewedPlan.request.target -cne $Target" in wrapper
+    assert '$reviewedPlan.tool_revision -cnotmatch "^[0-9a-f]{40}$"' in wrapper
     assert "docker @dockerArgs build" in wrapper
     assert "--tag stock-api-api" in wrapper
     assert "--tag stock-api-snapshot-builder" in wrapper

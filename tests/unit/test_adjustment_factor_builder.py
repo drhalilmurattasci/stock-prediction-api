@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 
+import app.services.adjustment_factor_builder as builder_module
 from app.services.adjustment_factor_builder import (
     AdjustmentFactorBuilder,
     AdjustmentFactorBuildError,
@@ -189,3 +190,51 @@ async def test_builder_releases_resolver_session_before_calculation_publish() ->
     assert result.publication.factor_set_id == result.artifact.factor_set_id
     assert result.artifact.anchor_date == date(2026, 7, 13)
     assert publisher.published is True
+
+
+@pytest.mark.asyncio
+async def test_prepare_is_read_only_and_calculates_after_resolver_session_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    split_header = SimpleNamespace(
+        collection_id=_hash("1"),
+        recorded_at=datetime(2026, 7, 14, 10, tzinfo=UTC),
+        available_at=datetime(2026, 7, 14, 10, 1, tzinfo=UTC),
+        event_count=0,
+    )
+    dividend_header = SimpleNamespace(
+        collection_id=_hash("2"),
+        recorded_at=datetime(2026, 7, 14, 10, 2, tzinfo=UTC),
+        available_at=datetime(2026, 7, 14, 10, 3, tzinfo=UTC),
+        event_count=0,
+    )
+    session = _Session(
+        [
+            datetime(2026, 7, 14, 12, 1, tzinfo=UTC),
+            split_header,
+            [],
+            dividend_header,
+            [],
+            [_raw_row(date(2026, 7, 10)), _raw_row(date(2026, 7, 13))],
+        ]
+    )
+    original = builder_module.build_adjustment_factor_set
+
+    def checked_calculation(**kwargs: object):
+        assert session.closed is True
+        return original(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        builder_module,
+        "build_adjustment_factor_set",
+        checked_calculation,
+    )
+    builder = AdjustmentFactorBuilder(
+        sessionmaker=cast(Any, _Maker(session)),
+    )
+
+    artifact = await builder.prepare(_spec())
+
+    assert artifact.anchor_date == date(2026, 7, 13)
+    assert artifact.factor_set_id.startswith("sha256:")
+    assert session.closed is True

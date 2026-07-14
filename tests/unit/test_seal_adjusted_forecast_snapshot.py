@@ -133,9 +133,14 @@ class _SealHarness:
                 assert isinstance(publisher, FakeStore)
                 harness.events.append("factor_builder")
 
-            async def build(self, spec: AdjustmentFactorBuildSpec) -> SimpleNamespace:
+            async def prepare(self, spec: AdjustmentFactorBuildSpec) -> SimpleNamespace:
                 harness.factor_specs.append(spec)
-                harness.events.append("factor_build")
+                harness.events.append("factor_prepare")
+                return harness.factor_result.artifact
+
+            async def publish(self, artifact: object) -> SimpleNamespace:
+                assert artifact is harness.factor_result.artifact
+                harness.events.append("factor_publish")
                 return harness.factor_result
 
         async def fake_database_clock(maker: object) -> datetime:
@@ -224,6 +229,7 @@ async def test_seal_binds_factor_cutoff_receipt_as_of_and_exact_lineage(
 
     result = await seal.seal_once(
         factor_cutoff=FACTOR_CUTOFF,
+        expected_factor_set_id=FACTOR_SET_ID,
         end_session=END,
         authorization=seal.AUTHORIZATION_SENTINEL,
         settings=_settings(),
@@ -253,7 +259,8 @@ async def test_seal_binds_factor_cutoff_receipt_as_of_and_exact_lineage(
         "database_clock",
         "factor_store",
         "factor_builder",
-        "factor_build",
+        "factor_prepare",
+        "factor_publish",
         "database_clock",
         "snapshot_builder",
         "snapshot_build",
@@ -263,6 +270,7 @@ async def test_seal_binds_factor_cutoff_receipt_as_of_and_exact_lineage(
     assert result["factor_cutoff"] == "2026-07-13T21:00:00.000000Z"
     assert result["snapshot_as_of"] == "2026-07-13T21:02:00.000000Z"
     assert result["factor_set_id"] == FACTOR_SET_ID
+    assert result["factor_set_recorded_at"] == "2026-07-13T21:01:00.000000Z"
     assert result["snapshot_id"] == SNAPSHOT_ID
     assert result["snapshot_status"] == "created"
     assert "secret-canary" not in json.dumps(result)
@@ -277,6 +285,7 @@ async def test_retry_replays_exact_factor_and_snapshot_identities(
     first.install(monkeypatch)
     created = await seal.seal_once(
         factor_cutoff=FACTOR_CUTOFF,
+        expected_factor_set_id=FACTOR_SET_ID,
         end_session=END,
         authorization=seal.AUTHORIZATION_SENTINEL,
         settings=_settings(),
@@ -286,6 +295,7 @@ async def test_retry_replays_exact_factor_and_snapshot_identities(
     retry.install(monkeypatch)
     replayed = await seal.seal_once(
         factor_cutoff=FACTOR_CUTOFF,
+        expected_factor_set_id=FACTOR_SET_ID,
         end_session=END,
         authorization=seal.AUTHORIZATION_SENTINEL,
         settings=_settings(),
@@ -298,6 +308,30 @@ async def test_retry_replays_exact_factor_and_snapshot_identities(
     assert replayed["snapshot_status"] == "replayed"
     assert first.factor_specs[0].cutoff == retry.factor_specs[0].cutoff
     assert first.snapshot_specs[0].as_of == retry.snapshot_specs[0].as_of
+
+
+@pytest.mark.asyncio
+async def test_prepared_factor_must_match_plan_before_any_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factor_result = _factor_result()
+    factor_result.artifact.factor_set_id = "sha256:" + "d" * 64
+    harness = _SealHarness(factor_result=factor_result)
+    harness.install(monkeypatch)
+
+    with pytest.raises(seal.OneShotAdjustedSealRefused, match="differs from the read-only plan"):
+        await seal.seal_once(
+            factor_cutoff=FACTOR_CUTOFF,
+            expected_factor_set_id=FACTOR_SET_ID,
+            end_session=END,
+            authorization=seal.AUTHORIZATION_SENTINEL,
+            settings=_settings(),
+        )
+
+    assert "factor_prepare" in harness.events
+    assert "factor_publish" not in harness.events
+    assert "snapshot_build" not in harness.events
+    assert harness.events[-1] == "dispose"
 
 
 @pytest.mark.asyncio
@@ -393,6 +427,7 @@ async def test_later_database_clock_and_publication_visibility_fail_closed(
     with pytest.raises(seal.OneShotAdjustedSealRefused, match="did not advance"):
         await seal.seal_once(
             factor_cutoff=FACTOR_CUTOFF,
+            expected_factor_set_id=FACTOR_SET_ID,
             end_session=END,
             authorization=seal.AUTHORIZATION_SENTINEL,
             settings=_settings(),
@@ -407,6 +442,7 @@ async def test_later_database_clock_and_publication_visibility_fail_closed(
     with pytest.raises(seal.OneShotAdjustedSealRefused, match="not visible"):
         await seal.seal_once(
             factor_cutoff=FACTOR_CUTOFF,
+            expected_factor_set_id=FACTOR_SET_ID,
             end_session=END,
             authorization=seal.AUTHORIZATION_SENTINEL,
             settings=_settings(),
@@ -427,12 +463,14 @@ async def test_stale_end_or_future_cutoff_refuses_before_factor_publication(
     with pytest.raises(seal.OneShotAdjustedSealRefused, match="newer XNYS session"):
         await seal.seal_once(
             factor_cutoff=FACTOR_CUTOFF,
+            expected_factor_set_id=FACTOR_SET_ID,
             end_session=END,
             authorization=seal.AUTHORIZATION_SENTINEL,
             settings=_settings(),
         )
     assert "factor_builder" not in stale.events
-    assert "factor_build" not in stale.events
+    assert "factor_prepare" not in stale.events
+    assert "factor_publish" not in stale.events
     assert stale.events[-1] == "dispose"
 
     future = _SealHarness(
@@ -443,12 +481,14 @@ async def test_stale_end_or_future_cutoff_refuses_before_factor_publication(
     with pytest.raises(seal.OneShotAdjustedSealRefused, match="later than the preflight"):
         await seal.seal_once(
             factor_cutoff=FACTOR_CUTOFF,
+            expected_factor_set_id=FACTOR_SET_ID,
             end_session=END,
             authorization=seal.AUTHORIZATION_SENTINEL,
             settings=_settings(),
         )
     assert "factor_builder" not in future.events
-    assert "factor_build" not in future.events
+    assert "factor_prepare" not in future.events
+    assert "factor_publish" not in future.events
     assert future.events[-1] == "dispose"
 
 
@@ -468,6 +508,7 @@ async def test_wrong_authorization_refuses_before_database_construction(
     with pytest.raises(seal.OneShotAdjustedSealRefused, match="authorization"):
         await seal.seal_once(
             factor_cutoff=FACTOR_CUTOFF,
+            expected_factor_set_id=FACTOR_SET_ID,
             end_session=END,
             authorization="not-authorized",
             settings=_settings(),
@@ -483,6 +524,7 @@ def test_cli_emits_one_sanitized_json_line_and_hides_library_output(
 
     async def successful(**kwargs: object) -> dict[str, object]:
         assert kwargs["factor_cutoff"] == FACTOR_CUTOFF
+        assert kwargs["expected_factor_set_id"] == FACTOR_SET_ID
         print("vendor-secret-canary")
         return {"status": "ok", "snapshot_id": SNAPSHOT_ID}
 
@@ -493,6 +535,8 @@ def test_cli_emits_one_sanitized_json_line_and_hides_library_output(
             END.isoformat(),
             "--factor-cutoff",
             FACTOR_CUTOFF.isoformat(),
+            "--expected-factor-set-id",
+            FACTOR_SET_ID,
             "--tool-revision",
             REVISION,
             "--authorization",
@@ -524,6 +568,8 @@ def test_cli_never_echoes_unexpected_exception_text(
             END.isoformat(),
             "--factor-cutoff",
             FACTOR_CUTOFF.isoformat(),
+            "--expected-factor-set-id",
+            FACTOR_SET_ID,
             "--tool-revision",
             REVISION,
             "--authorization",

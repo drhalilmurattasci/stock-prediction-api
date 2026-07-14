@@ -104,6 +104,7 @@ execution, adds:
 ```text
 --end YYYY-MM-DD
 --factor-cutoff <aware-ISO-8601-plan-cutoff>
+--expected-factor-set-id <sha256:exact-read-only-plan-identity>
 --tool-revision <40-hex-reviewed-commit>
 --authorization stockapi-msft-adjusted-seal-only
 ```
@@ -111,18 +112,22 @@ execution, adds:
 The image must contain that exact baked revision, and pre/post database-clock
 checks enforce cutoff freshness, receipt visibility, and session currency. The
 sentinel is only a refusal check, and acquisition authority does not authorize
-this local DB write. There is no read-only adjusted-seal planner or complete
-PowerShell host attestation/HTTP controller yet; do not invoke the primitive ad
-hoc. The public adjusted-price route requires a resulting exact factor ID and
-never resolves “latest.”
+this local DB write. Do not invoke the primitive ad hoc. Instead use the
+`adjusted_close` lane of `run-forecast-demo.ps1`: its read-only plan requires a
+complete exact acquisition, prepares the real factor artifact without publishing,
+and binds the resulting factor ID. Execute requires the distinct owner-facing
+`stockapi-msft-adjusted-seal-serve-only` authorization. The public adjusted-price
+route requires a resulting exact factor ID; it never resolves “latest.”
 
-`forecast_demo.py` is the final raw-close local seal-and-serve lane behind
-`run-forecast-demo.ps1`. Its `plan` mode is read-only and requires the exact
+`forecast_demo.py` is the raw-close local seal-and-serve lane behind
+`run-forecast-demo.ps1`; `adjusted_forecast_demo.py` is the adjusted-close lane,
+and the wrapper selects only those fixed modules from `-Target`. Plan mode is
+read-only and requires the exact
 258-session MSFT price coverage produced by the typed acquisition (or proven by
 the shared lower-level planner), database-clock session currency, all exact
 current-version receipts, one configured API key, the code-derived policy pins,
-and a clean Git commit. `execute` requires that content-addressed plan plus the exact
-`stockapi-msft-seal-serve-only` sentinel. It starts only the loopback API and
+and a clean Git commit. Raw `execute` requires that content-addressed plan plus
+the exact `stockapi-msft-seal-serve-only` sentinel. It starts only the loopback API and
 runs one short-lived container with the `stockapi_snapshot_builder` credential;
 it never starts a persistent queue consumer, ordinary worker, or Beat. The
 wrapper builds from an exact detached Git worktree, binds both roles to the
@@ -139,5 +144,6 @@ vendor call. It also proves a wrong key returns `401`, disables ambient HTTP
 proxies, binds API-key identity with a nonpublic JWT-keyed HMAC inside the plan,
 and compares the response's exact XNYS schedule, deterministic naïve values,
 0.8 interval bucket, and source-manifest lineage to the sealed bytes.
-It does not publish an adjustment factor, build an adjusted-close snapshot, or
-authorize adjusted outcome/cohort evidence.
+The adjusted lane separately proves exact raw/split/dividend/factor lineage and
+uses a deterministic plan-bound POST idempotency key so retry must replay one
+archived run. Neither lane authorizes adjusted outcome/cohort evidence.

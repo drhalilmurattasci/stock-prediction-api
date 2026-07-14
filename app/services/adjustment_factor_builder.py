@@ -202,9 +202,11 @@ class AdjustmentFactorBuilder:
     """Resolve exact evidence, calculate without a connection, then publish."""
 
     sessionmaker: async_sessionmaker[AsyncSession]
-    publisher: AdjustmentFactorPublisher
+    publisher: AdjustmentFactorPublisher | None = None
 
-    async def build(self, spec: AdjustmentFactorBuildSpec) -> AdjustmentFactorBuildResult:
+    async def prepare(self, spec: AdjustmentFactorBuildSpec) -> AdjustmentFactorSet:
+        """Resolve and calculate one artifact without publishing any writes."""
+
         normalized = _validate_spec(spec)
         async with self.sessionmaker() as session:
             database_now = _utc(
@@ -235,6 +237,22 @@ class AdjustmentFactorBuilder:
             raise AdjustmentFactorBuildError(
                 "resolved evidence violates the pinned adjustment policy"
             ) from exc
+        return artifact
+
+    async def build(self, spec: AdjustmentFactorBuildSpec) -> AdjustmentFactorBuildResult:
+        artifact = await self.prepare(spec)
+        return await self.publish(artifact)
+
+    async def publish(
+        self,
+        artifact: AdjustmentFactorSet,
+    ) -> AdjustmentFactorBuildResult:
+        """Publish one already-prepared artifact through the explicit writer."""
+
+        if not isinstance(artifact, AdjustmentFactorSet):
+            raise TypeError("artifact must be an AdjustmentFactorSet")
+        if self.publisher is None:
+            raise AdjustmentFactorBuildError("factor publication requires an explicit publisher")
         publication = await self.publisher.publish(artifact)
         if publication.factor_set_id != artifact.factor_set_id:
             raise AdjustmentFactorBuildError("factor publisher returned a different identity")

@@ -96,8 +96,9 @@ The adjusted-close snapshot policy is independently content-addressed and
 operator-pinned. It admits only `split_dividend_adjusted/day/1` observations
 derived from a factor receipt visible by the snapshot cutoff. Raw-close and
 adjusted-close services are routed by target and cannot borrow each other's
-resolution or availability hashes. The existing local seal-and-serve operator
-remains raw-close-only. The separate low-level
+resolution or availability hashes. The local seal-and-serve wrapper exposes
+fixed raw and adjusted targets while sharing the same host attestation and actor
+exclusions. The separate low-level
 `ingestion.tasks.seal_adjusted_forecast_snapshot` primitive performs no vendor
 I/O and is not a Celery task: in an exact revision-attested
 `stockapi_snapshot_builder` image, it publishes or replays one MSFT factor set
@@ -107,9 +108,11 @@ current XNYS window, builder-role `stockapi_test` database, two adjusted policy
 pins, explicit end session, aware cutoff, and reviewed revision. Pre/post
 database-clock checks enforce cutoff freshness and session currency. The fixed
 sentinel is a code-level refusal check, not owner authority for the local writes.
-No read-only adjusted-seal planner or complete host attestation/HTTP controller
-exists yet, so this primitive is not an operator runbook. No adjusted factor set
-or snapshot has yet been published from real vendor data.
+The adjusted host plan prepares the exact artifact read-only, binds its content
+ID and stable input-receipt cutoff, and keeps publication state outside the plan
+identity so a partial seal can replay safely. Its final authenticated POST uses
+a deterministic plan-bound idempotency key. No adjusted factor set or snapshot
+has yet been published from real vendor data.
 
 The current serving identity is equally explicit. `model=auto` executes
 `baseline-naive@1`; every unkeyed invocation receives a new archived forecast UUID,
