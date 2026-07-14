@@ -1990,7 +1990,16 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     assert contended_key not in contended.text
 
     async with runtime_maker() as session:
-        archived = (await session.execute(select(ForecastRun))).scalars().all()
+        # Scope to API-origin runs. forecast_runs is insert-only by design, so the
+        # precommitted scheduled_evaluation run sealed by the cohort test earlier
+        # in this module cannot be cleaned between tests -- and it also carries a
+        # NULL idempotency digest, so an unscoped query would both inflate the
+        # count and let ``unkeyed`` bind to the wrong row.
+        archived = (
+            (await session.execute(select(ForecastRun).where(ForecastRun.origin_kind == "api")))
+            .scalars()
+            .all()
+        )
     assert len(archived) == 2  # one GET run plus one keyed POST; replay adds none
     keyed = next(row for row in archived if row.idempotency_token_digest is not None)
     unkeyed = next(row for row in archived if row.idempotency_token_digest is None)
@@ -2013,7 +2022,6 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     for mutation in (
         "UPDATE forecast_runs SET symbol = symbol WHERE forecast_id = :forecast_id",
         "DELETE FROM forecast_runs WHERE forecast_id = :forecast_id",
-        "TRUNCATE forecast_runs",
     ):
         async with owner_engine.connect() as conn:
             transaction = await conn.begin()
@@ -2022,6 +2030,28 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
                     {"forecast_id": keyed.forecast_id} if ":forecast_id" in mutation else {}
                 )
                 await conn.execute(text(mutation), parameters)
+            await transaction.rollback()
+
+    # The evidence substrate's FK (forecast_outcome_cohort_members -> forecast_runs)
+    # now rejects a PLAIN truncate before any trigger can run, which would mask the
+    # immutability guarantee. CASCADE is precisely how that obstacle is bypassed, so
+    # it -- not the plain form -- is what actually proves the archive cannot be
+    # emptied. The referencing evidence table must be insert-only in its own right,
+    # or the cohort evidence could be destroyed even while the runs survive.
+    async with owner_engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(DBAPIError, match="foreign key"):
+            await conn.execute(text("TRUNCATE forecast_runs"))
+        await transaction.rollback()
+
+    for truncation in (
+        "TRUNCATE forecast_runs CASCADE",
+        "TRUNCATE forecast_outcome_cohort_members",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match="insert-only"):
+                await conn.execute(text(truncation))
             await transaction.rollback()
 
     # Block the real service after its snapshot SELECT. Under the former design
