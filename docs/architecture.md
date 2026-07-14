@@ -100,16 +100,20 @@ All four evidence tables reject update, delete, and truncate. `stockapi_app` has
 `SELECT`/`INSERT` on outcomes, manifests, and availability receipts but
 `SELECT` only on materialized members; the snapshot-builder role has no access.
 
-Migration `0010` and the pure canonical validators establish this storage and
-validation boundary. Its assertions pass the one-command throwaway-database
-gate on real PostgreSQL 17. No unattended
-outcome resolver, cohort publisher, scoreboard, or interval recalibrator is
-enabled yet; those operational actors must receive explicit policy artifacts
-and automation controls before use.
+Migration `0010`, the pure canonical validators, and the default-off scheduled
+evaluation service establish this storage and publication boundary. A scheduled
+spec must pin the snapshot, concrete model version, build revision, selected
+steps, and all forecast/selection/outcome policy hashes. The service archives
+the run, rereads and validates the committed row, derives membership only from
+those persisted bytes, and publishes the manifest and seal in distinct
+transactions. Exact replay, deadline refusal, and real manifest/seal races pass
+the one-command throwaway-database gate on PostgreSQL 17. No Celery task, Beat
+entry, default selection policy, unattended outcome resolver, scoreboard, or
+interval recalibrator is enabled yet.
 
-The remaining Phase 3 trust gaps are the controlled outcome-resolution and
-cohort-publication write paths, scored calibration artifacts, stable
-idempotency identity across credential/secret rotation, a reproducible model
-registry/leaderboard, and models that empirically beat the baselines. Daily
+The remaining Phase 3 trust gaps are the controlled outcome-resolution write
+path, scored calibration artifacts, stable idempotency identity across
+credential/secret rotation, a reproducible model registry/leaderboard, and
+models that empirically beat the baselines. Daily
 forecast manifests/external anchoring remain beyond the per-run SHA-256 archive.
 Later endpoint families remain phased backlog.

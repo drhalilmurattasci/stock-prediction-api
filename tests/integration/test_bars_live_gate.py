@@ -38,6 +38,7 @@ import threading
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any, Self
 from uuid import UUID
 
 import exchange_calendars
@@ -46,7 +47,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, make_url, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    AsyncSessionTransaction,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.config import Settings
 from app.core.exceptions import AppError
@@ -73,8 +80,10 @@ from app.schemas.forecast import (
     LookaheadCheck,
 )
 from app.schemas.prices import PriceFilters
+from app.services.forecast_cohort_store import SqlForecastCohortStore
 from app.services.forecast_cohorts import (
     ForecastCohortManifest,
+    ForecastCohortMember,
     canonical_cohort_manifest,
     cohort_id_for_manifest,
     member_from_scheduled_run,
@@ -118,6 +127,10 @@ from app.services.forecast_snapshots import (
     validate_and_resolve_snapshot,
 )
 from app.services.prices import read_prices
+from app.services.scheduled_evaluation import (
+    ScheduledEvaluationService,
+    ScheduledEvaluationSpec,
+)
 from data_sources.base import OHLCVBar
 from ingestion.locks import (
     VendorOperationBusy,
@@ -146,6 +159,69 @@ if os.environ.get("TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET") != "stockapi-test-onl
     )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+class _MissingReadBarrier:
+    """Release two real sessions only after both observed one row missing."""
+
+    def __init__(self, model: type[Any]) -> None:
+        self.model = model
+        self.arrivals = 0
+        self._lock = asyncio.Lock()
+        self._release = asyncio.Event()
+
+    async def arrive(self) -> None:
+        async with self._lock:
+            self.arrivals += 1
+            if self.arrivals == 2:
+                self._release.set()
+        await asyncio.wait_for(self._release.wait(), timeout=5)
+
+
+class _BarrierSession:
+    """Minimal AsyncSession proxy used to force a live primary-key race."""
+
+    def __init__(self, session: AsyncSession, barrier: _MissingReadBarrier) -> None:
+        self._session = session
+        self._barrier = barrier
+
+    async def __aenter__(self) -> Self:
+        await self._session.__aenter__()
+        return self
+
+    async def __aexit__(self, *error: object) -> bool | None:
+        return await self._session.__aexit__(*error)
+
+    def begin(self) -> AsyncSessionTransaction:
+        return self._session.begin()
+
+    async def get(self, model: type[Any], identity: object) -> Any:
+        row = await self._session.get(model, identity)
+        if model is self._barrier.model and row is None:
+            await self._barrier.arrive()
+        return row
+
+    def add(self, row: object) -> None:
+        self._session.add(row)
+
+    async def flush(self) -> None:
+        await self._session.flush()
+
+    async def refresh(self, row: object) -> None:
+        await self._session.refresh(row)
+
+
+class _BarrierSessionMaker:
+    def __init__(
+        self,
+        maker: async_sessionmaker[AsyncSession],
+        barrier: _MissingReadBarrier,
+    ) -> None:
+        self._maker = maker
+        self._barrier = barrier
+
+    def __call__(self) -> _BarrierSession:
+        return _BarrierSession(self._maker(), self._barrier)
 
 
 @dataclass(frozen=True)
@@ -1177,6 +1253,36 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
             await session.execute(select(ForecastRun).where(ForecastRun.forecast_id == forecast_id))
         ).scalar_one()
         member = member_from_scheduled_run(scheduled_run, step=1)
+
+    async def _insert_scheduled_member(
+        new_forecast_id: UUID,
+        target_time: datetime,
+    ) -> ForecastCohortMember:
+        new_response = _scheduled_response(
+            forecast_id=new_forecast_id,
+            snapshot=snapshot,
+            target_time=target_time,
+        )
+        new_output = canonical_output(new_response)
+        new_values = {
+            **run_values,
+            "forecast_id": new_forecast_id,
+            "opportunity_hash": opportunity_hash(
+                new_response,
+                resolution_policy_hash=resolution_policy_hash,
+                availability_rule_set_hash=availability_rule_set_hash,
+                origin_kind="scheduled_evaluation",
+            ),
+            "output_hash": output_hash(new_output),
+            "canonical_output": new_output,
+        }
+        async with engine.begin() as conn:
+            await conn.execute(pg_insert(ForecastRun).values(**new_values))
+        async with runtime_maker() as session:
+            row = await session.get(ForecastRun, new_forecast_id)
+            assert row is not None
+            return member_from_scheduled_run(row, step=1)
+
     manifest = ForecastCohortManifest(
         purpose="heldout_evaluation",
         selection_policy_hash="sha256:" + "9" * 64,
@@ -1236,8 +1342,11 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
             )
         await transaction.rollback()
 
-    async with engine.begin() as conn:
-        stored_manifest = (await conn.execute(manifest_insert)).one()
+    cohort_store = SqlForecastCohortStore(runtime_maker)
+    proof = await cohort_store.publish(manifest)
+    replayed_proof = await cohort_store.publish(manifest)
+    assert replayed_proof == proof
+    stored_manifest = proof.record
     assert stored_manifest.recorded_at != caller_timestamp
     assert stored_manifest.creator_xid > 0
     assert stored_manifest.recorded_at < earliest_target
@@ -1256,29 +1365,114 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     assert projected_member.opportunity_hash == run_opportunity_hash
     assert projected_member.output_hash == output_hash(canonical_output_bytes)
 
-    async with engine.begin() as conn:
-        sealer_xid = (await conn.execute(select(func.txid_current()))).scalar_one()
-        seal = (
-            await conn.execute(
-                pg_insert(ForecastOutcomeCohortAvailability)
-                .values(
-                    cohort_id=cohort_id,
-                    manifest_recorded_at=caller_timestamp,
-                    sealed_at=caller_timestamp,
-                    sealer_xid=0,
-                )
-                .returning(
-                    ForecastOutcomeCohortAvailability.manifest_recorded_at,
-                    ForecastOutcomeCohortAvailability.sealed_at,
-                    ForecastOutcomeCohortAvailability.sealer_xid,
-                )
-            )
-        ).one()
-    assert sealer_xid != stored_manifest.creator_xid
-    assert seal.sealer_xid == sealer_xid
+    seal = proof.seal
+    assert seal.sealer_xid != stored_manifest.creator_xid
     assert seal.manifest_recorded_at == stored_manifest.recorded_at
     assert stored_manifest.recorded_at <= seal.sealed_at < earliest_target
     assert seal.sealed_at != caller_timestamp
+
+    expired_member = await _insert_scheduled_member(
+        UUID("44444444-4444-4444-4444-444444444444"),
+        database_now - timedelta(minutes=1),
+    )
+    expired_manifest = replace(
+        manifest,
+        selection_policy_hash="sha256:" + "b" * 64,
+        members=(expired_member,),
+    )
+    expired_cohort_id = cohort_id_for_manifest(expired_manifest)
+    with pytest.raises(AppError) as expired_error:
+        await cohort_store.publish(expired_manifest)
+    assert expired_error.value.code == "forecast_cohort_deadline_expired"
+    assert expired_error.value.status_code == 409
+    assert expired_error.value.details == {
+        "retryable": False,
+        "stage": "manifest",
+    }
+    async with runtime_maker() as session:
+        assert (await session.get(ForecastOutcomeCohortManifest, expired_cohort_id)) is None
+
+    manifest_race_member = await _insert_scheduled_member(
+        UUID("55555555-5555-5555-5555-555555555555"),
+        earliest_target + timedelta(minutes=10),
+    )
+    manifest_race = replace(
+        manifest,
+        selection_policy_hash="sha256:" + "c" * 64,
+        members=(manifest_race_member,),
+    )
+    manifest_barrier = _MissingReadBarrier(ForecastOutcomeCohortManifest)
+    manifest_race_maker = _BarrierSessionMaker(runtime_maker, manifest_barrier)
+    manifest_race_results = await asyncio.wait_for(
+        asyncio.gather(
+            SqlForecastCohortStore(  # type: ignore[arg-type]
+                manifest_race_maker
+            ).publish(manifest_race),
+            SqlForecastCohortStore(  # type: ignore[arg-type]
+                manifest_race_maker
+            ).publish(manifest_race),
+        ),
+        timeout=10,
+    )
+    assert manifest_barrier.arrivals == 2
+    assert manifest_race_results[0] == manifest_race_results[1]
+
+    seal_race_member = await _insert_scheduled_member(
+        UUID("66666666-6666-6666-6666-666666666666"),
+        earliest_target + timedelta(minutes=20),
+    )
+    seal_race = replace(
+        manifest,
+        selection_policy_hash="sha256:" + "d" * 64,
+        members=(seal_race_member,),
+    )
+    seal_race_canonical = canonical_cohort_manifest(seal_race)
+    seal_race_id = cohort_id_for_manifest(seal_race_canonical)
+    async with engine.begin() as conn:
+        await conn.execute(
+            pg_insert(ForecastOutcomeCohortManifest).values(
+                cohort_id=seal_race_id,
+                recorded_at=caller_timestamp,
+                creator_xid=0,
+                canonical_manifest=seal_race_canonical,
+            )
+        )
+    seal_barrier = _MissingReadBarrier(ForecastOutcomeCohortAvailability)
+    seal_race_maker = _BarrierSessionMaker(runtime_maker, seal_barrier)
+    seal_race_results = await asyncio.wait_for(
+        asyncio.gather(
+            SqlForecastCohortStore(  # type: ignore[arg-type]
+                seal_race_maker
+            ).publish(seal_race),
+            SqlForecastCohortStore(  # type: ignore[arg-type]
+                seal_race_maker
+            ).publish(seal_race),
+        ),
+        timeout=10,
+    )
+    assert seal_barrier.arrivals == 2
+    assert seal_race_results[0] == seal_race_results[1]
+
+    async with runtime_maker() as session:
+        for race_proof in (manifest_race_results[0], seal_race_results[0]):
+            manifest_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ForecastOutcomeCohortManifest)
+                    .where(ForecastOutcomeCohortManifest.cohort_id == race_proof.record.cohort_id)
+                )
+            ).scalar_one()
+            seal_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ForecastOutcomeCohortAvailability)
+                    .where(
+                        ForecastOutcomeCohortAvailability.cohort_id == race_proof.record.cohort_id
+                    )
+                )
+            ).scalar_one()
+            assert manifest_count == seal_count == 1
+            assert race_proof.record.creator_xid != race_proof.seal.sealer_xid
 
     async with engine.connect() as conn:
         transaction = await conn.begin()
@@ -1890,6 +2084,68 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     assert response.provenance.snapshot_id == current_created.snapshot_id
     assert response.provenance.lookahead_check.status == "passed"
     assert len(response.forecasts) == 2
+
+    # Exercise the default-off scheduling seam against the real runtime role:
+    # the response is archived first, membership is derived from a validated
+    # reread, and the content-addressed cohort is sealed in a later transaction.
+    scheduled_store = SqlForecastRunStore(
+        sessionmaker=runtime_maker,
+        identity_secret="live-gate-scheduled-archive-secret",
+        resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+        availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        origin_kind="scheduled_evaluation",
+    )
+    scheduled_forecast_service = SnapshotForecastService(
+        repository=SqlForecastInputSnapshotRepository(
+            runtime_maker,
+            trusted_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        ),
+        policy=ForecastServingPolicy(
+            resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+            trusted_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        ),
+        code_version="live-gate-scheduled-1",
+        run_store=scheduled_store,
+    )
+    scheduled_request = ForecastRequest(
+        symbol="AAPL",
+        horizon=2,
+        horizon_unit="trading_day",
+        target="close",
+        snapshot_id=current_created.snapshot_id,
+        model="baseline_naive",
+        interval_coverages=[0.8],
+    )
+    scheduled_spec = ScheduledEvaluationSpec(
+        request=scheduled_request,
+        purpose="heldout_evaluation",
+        selected_steps=(1, 2),
+        model_version="baseline-naive@1",
+        code_version="live-gate-scheduled-1",
+        forecast_resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+        forecast_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        selection_policy_hash="sha256:" + "d" * 64,
+        outcome_resolution_policy_hash="sha256:" + "e" * 64,
+        outcome_availability_rule_set_hash="sha256:" + "f" * 64,
+    )
+    scheduled_evaluation = ScheduledEvaluationService(
+        forecast_service=scheduled_forecast_service,
+        run_store=scheduled_store,
+        cohort_store=SqlForecastCohortStore(runtime_maker),
+    )
+    scheduled_proof = await scheduled_evaluation.publish(scheduled_spec)
+    scheduled_replay = await scheduled_evaluation.publish(scheduled_spec)
+    assert scheduled_replay == scheduled_proof
+    assert scheduled_proof.run.origin_kind == "scheduled_evaluation"
+    assert scheduled_proof.run.recorded_at is not None
+    assert scheduled_proof.cohort_record.member_count == 2
+    assert scheduled_proof.cohort_record.creator_xid != scheduled_proof.cohort_seal.sealer_xid
+    assert (
+        scheduled_proof.run.recorded_at
+        <= scheduled_proof.cohort_record.recorded_at
+        <= scheduled_proof.cohort_seal.sealed_at
+        < scheduled_proof.cohort_record.earliest_target_time
+    )
 
     # Complete the real HTTP chain as the runtime role: aggregate-router auth
     # must short-circuit first, then the same immutable row must serve through

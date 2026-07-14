@@ -48,11 +48,20 @@ class ForecastCohortValidationError(ValueError):
 class ScheduledForecastRunSource(Protocol):
     """Read shape required to derive a cohort member from ``forecast_runs``."""
 
-    forecast_id: UUID
-    origin_kind: str
-    opportunity_hash: str
-    output_hash: str
-    canonical_output: bytes
+    @property
+    def forecast_id(self) -> UUID: ...
+
+    @property
+    def origin_kind(self) -> str: ...
+
+    @property
+    def opportunity_hash(self) -> str: ...
+
+    @property
+    def output_hash(self) -> str: ...
+
+    @property
+    def canonical_output(self) -> bytes: ...
 
 
 @dataclass(frozen=True)

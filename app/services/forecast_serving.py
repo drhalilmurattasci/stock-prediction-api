@@ -299,7 +299,7 @@ class SnapshotForecastService:
             # Clamp: host clock skew must not turn a verified snapshot into a
             # 500 via assemble's generated_at >= as_of invariant.
             generated_at=max(self.clock(), resolved.as_of),
-            model_version=factory().model_version,
+            model_version=self.model_version_for(request.model),
             feature_set_hash=record.snapshot_id,
             code_version=self.code_version,
         )
@@ -393,6 +393,11 @@ class SnapshotForecastService:
             f"model selector {model!r} is not implemented for serving yet",
             details={"model": model},
         )
+
+    def model_version_for(self, model: str) -> str:
+        """Resolve the concrete model identity without reading data or forecasting."""
+
+        return self._forecaster_factory(model)().model_version
 
 
 def build_forecast_service(

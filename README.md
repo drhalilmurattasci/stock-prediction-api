@@ -83,10 +83,13 @@ the exact reviewed Git commit and pins both API and one-shot builder execution
 to revision-labelled immutable image IDs.
 
 The evidence schema and strict canonical validators are a foundation, not a
-claim of calibration: no unattended outcome resolver, cohort publisher,
-scoreboard, or interval recalibrator is enabled yet. Those actors must bind an
-explicit resolution/selection policy and remain behind the same automation and
-budget controls before they can publish evidence.
+claim of calibration. A default-off internal scheduled-evaluation seam can now
+archive one explicitly versioned forecast and publish its selected cohort with
+a distinct post-commit seal; the throwaway PostgreSQL gate proves that complete
+path and exact replay. It is not wired to Celery, Beat, or a default selection
+policy. No unattended outcome resolver, scoreboard, or interval recalibrator
+is enabled; those actors still require explicit policy artifacts and the same
+automation and budget controls before use.
 
 See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Persistent workers
 and Beat are intentionally not safe-by-default startup conveniences: inspect or

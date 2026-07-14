@@ -35,8 +35,10 @@ from app.services.forecast_runs import (
 ForecastProducer = Callable[[], Awaitable[ForecastResponse]]
 
 _IDEMPOTENCY_UNIQUE = "uq_forecast_runs_idempotency_token_digest"
+_SCHEDULED_OPPORTUNITY_UNIQUE = "uq_forecast_runs_scheduled_opportunity"
 _SNAPSHOT_FOREIGN_KEY = "fk_forecast_runs_snapshot_id_forecast_input_snapshots"
 _TIME_ORDER_CHECK = "ck_forecast_runs_time_order"
+_SCHEDULED_ORIGIN_KIND = "scheduled_evaluation"
 
 
 class _ForecastRunClockError(ForecastRunValidationError):
@@ -161,6 +163,45 @@ class SqlForecastRunStore:
             expected_request_hash=request_identity,
         )
 
+    async def read_validated(
+        self,
+        forecast_id: UUID,
+        *,
+        expected_request: ForecastRequest,
+        expected_origin_kind: str,
+    ) -> ArchivedForecastRun:
+        """Return one persisted run only after validating its complete evidence."""
+
+        try:
+            request_payload = canonical_request(expected_request)
+            request_identity = request_hash(request_payload)
+        except (ForecastRunValidationError, ValueError, TypeError) as exc:
+            raise AppError(
+                "Forecast archive read expectations are invalid.",
+                code="forecast_archive_validation_failed",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                details={"retryable": False},
+            ) from exc
+        try:
+            async with self.sessionmaker() as session:
+                existing = await self._find_forecast(session, forecast_id)
+        except SQLAlchemyTimeoutError as exc:
+            raise _archive_unavailable(retryable=True) from exc
+        except DBAPIError as exc:
+            raise _database_error(exc) from exc
+        if existing is None:
+            raise _archive_unavailable(retryable=True)
+        return await anyio.to_thread.run_sync(
+            partial(
+                self._validated_read,
+                existing,
+                expected_forecast_id=forecast_id,
+                expected_origin_kind=expected_origin_kind,
+                expected_request=request_payload,
+                expected_request_hash=request_identity,
+            )
+        )
+
     async def _preflight_retry(
         self,
         retry_identity: str | None,
@@ -225,6 +266,7 @@ class SqlForecastRunStore:
             return await self._handle_integrity_error(
                 exc,
                 retry_identity=retry_identity,
+                expected_opportunity_hash=row.opportunity_hash,
                 expected_request=expected_request,
                 expected_request_hash=expected_request_hash,
             )
@@ -251,7 +293,9 @@ class SqlForecastRunStore:
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     details={
                         "outcome_unknown": True,
-                        "retryable": retry_identity is not None,
+                        "retryable": (
+                            retry_identity is not None or self.origin_kind == _SCHEDULED_ORIGIN_KIND
+                        ),
                     },
                 ) from exc
             raise _database_error(exc) from exc
@@ -269,11 +313,30 @@ class SqlForecastRunStore:
         exc: IntegrityError,
         *,
         retry_identity: str | None,
+        expected_opportunity_hash: str,
         expected_request: bytes,
         expected_request_hash: str,
     ) -> ForecastResponse:
         constraint = _db_error_attribute(exc, "constraint_name")
         sqlstate = _db_error_attribute(exc, "sqlstate")
+        if (
+            constraint == _SCHEDULED_OPPORTUNITY_UNIQUE
+            and self.origin_kind == _SCHEDULED_ORIGIN_KIND
+        ):
+            existing = await self._lookup_scheduled_opportunity(expected_opportunity_hash)
+            if existing is not None:
+                return await self._replay_scheduled_async(
+                    existing,
+                    expected_opportunity_hash=expected_opportunity_hash,
+                    expected_request=expected_request,
+                    expected_request_hash=expected_request_hash,
+                )
+            raise AppError(
+                "Scheduled forecast conflict could not be reconciled.",
+                code="forecast_archive_write_conflict",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                details={"retryable": True},
+            ) from exc
         if constraint == _IDEMPOTENCY_UNIQUE and retry_identity is not None:
             existing = await self._lookup_retry(retry_identity)
             if existing is not None:
@@ -318,6 +381,18 @@ class SqlForecastRunStore:
         except DBAPIError as exc:
             raise _database_error(exc) from exc
 
+    async def _lookup_scheduled_opportunity(
+        self,
+        opportunity_identity: str,
+    ) -> ArchivedForecastRun | None:
+        try:
+            async with self.sessionmaker() as session:
+                return await self._find_scheduled_opportunity(session, opportunity_identity)
+        except SQLAlchemyTimeoutError as exc:
+            raise _archive_unavailable(retryable=True) from exc
+        except DBAPIError as exc:
+            raise _database_error(exc) from exc
+
     async def _reconcile_unknown_commit(
         self,
         row: ForecastRun,
@@ -328,15 +403,26 @@ class SqlForecastRunStore:
     ) -> ForecastResponse | None:
         try:
             async with self.sessionmaker() as session:
-                existing = (
-                    await self._find_retry(session, retry_identity)
-                    if retry_identity is not None
-                    else await self._find_forecast(session, row.forecast_id)
-                )
+                if self.origin_kind == _SCHEDULED_ORIGIN_KIND:
+                    existing = await self._find_scheduled_opportunity(
+                        session,
+                        row.opportunity_hash,
+                    )
+                elif retry_identity is not None:
+                    existing = await self._find_retry(session, retry_identity)
+                else:
+                    existing = await self._find_forecast(session, row.forecast_id)
         except (DBAPIError, SQLAlchemyTimeoutError):
             return None
         if existing is None:
             return None
+        if self.origin_kind == _SCHEDULED_ORIGIN_KIND:
+            return await self._replay_scheduled_async(
+                existing,
+                expected_opportunity_hash=row.opportunity_hash,
+                expected_request=expected_request,
+                expected_request_hash=expected_request_hash,
+            )
         return await self._replay_async(
             existing,
             expected_request=expected_request,
@@ -403,6 +489,143 @@ class SqlForecastRunStore:
     ) -> ArchivedForecastRun | None:
         row = await session.get(ForecastRun, forecast_id)
         return None if row is None else _detach(row)
+
+    async def _find_scheduled_opportunity(
+        self,
+        session: AsyncSession,
+        opportunity_identity: str,
+    ) -> ArchivedForecastRun | None:
+        result = await session.execute(
+            select(ForecastRun).where(
+                ForecastRun.origin_kind == _SCHEDULED_ORIGIN_KIND,
+                ForecastRun.opportunity_hash == opportunity_identity,
+            )
+        )
+        row = result.scalars().one_or_none()
+        return None if row is None else _detach(row)
+
+    async def _replay_scheduled_async(
+        self,
+        row: ArchivedForecastRun,
+        *,
+        expected_opportunity_hash: str,
+        expected_request: bytes,
+        expected_request_hash: str,
+    ) -> ForecastResponse:
+        return await anyio.to_thread.run_sync(
+            partial(
+                self._replay_scheduled,
+                row,
+                expected_opportunity_hash=expected_opportunity_hash,
+                expected_request=expected_request,
+                expected_request_hash=expected_request_hash,
+            )
+        )
+
+    def _replay_scheduled(
+        self,
+        row: ArchivedForecastRun,
+        *,
+        expected_opportunity_hash: str,
+        expected_request: bytes,
+        expected_request_hash: str,
+    ) -> ForecastResponse:
+        if (
+            row.origin_kind != _SCHEDULED_ORIGIN_KIND
+            or row.opportunity_hash != expected_opportunity_hash
+        ):
+            raise AppError(
+                "Persisted scheduled forecast evidence failed validation.",
+                code="forecast_archive_corrupt",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                details={
+                    "forecast_id": str(row.forecast_id),
+                    "retryable": False,
+                },
+            )
+        self._require_persisted(row)
+        if row.request_hash != expected_request_hash or row.canonical_request != expected_request:
+            raise AppError(
+                "Scheduled forecast opportunity was already archived for a different request.",
+                code="forecast_archive_scheduled_request_conflict",
+                status_code=status.HTTP_409_CONFLICT,
+                details={"retryable": False},
+            )
+        return self._replay(
+            row,
+            expected_request=expected_request,
+            expected_request_hash=expected_request_hash,
+        )
+
+    def _validated_read(
+        self,
+        row: ArchivedForecastRun,
+        *,
+        expected_forecast_id: UUID,
+        expected_origin_kind: str,
+        expected_request: bytes,
+        expected_request_hash: str,
+    ) -> ArchivedForecastRun:
+        self._require_persisted(row)
+        if (
+            row.forecast_id != expected_forecast_id
+            or self.origin_kind != expected_origin_kind
+            or row.origin_kind != expected_origin_kind
+        ):
+            raise AppError(
+                "Forecast archive row does not match the expected identity or origin.",
+                code="forecast_archive_read_conflict",
+                status_code=status.HTTP_409_CONFLICT,
+                details={"retryable": False},
+            )
+        if row.request_hash != expected_request_hash or row.canonical_request != expected_request:
+            raise AppError(
+                "Forecast archive row does not match the expected request.",
+                code="forecast_archive_read_conflict",
+                status_code=status.HTTP_409_CONFLICT,
+                details={"retryable": False},
+            )
+        response = self._replay(
+            row,
+            expected_request=expected_request,
+            expected_request_hash=expected_request_hash,
+        )
+        expected_opportunity = opportunity_hash(
+            response,
+            resolution_policy_hash=self.resolution_policy_hash,
+            availability_rule_set_hash=self.availability_rule_set_hash,
+            origin_kind=expected_origin_kind,
+        )
+        if (
+            row.resolution_policy_hash != self.resolution_policy_hash
+            or row.availability_rule_set_hash != self.availability_rule_set_hash
+            or row.opportunity_hash != expected_opportunity
+        ):
+            raise AppError(
+                "Forecast archive row does not match the store policy epoch.",
+                code="forecast_archive_read_conflict",
+                status_code=status.HTTP_409_CONFLICT,
+                details={"retryable": False},
+            )
+        return row
+
+    @staticmethod
+    def _require_persisted(row: ArchivedForecastRun) -> None:
+        try:
+            if row.recorded_at is None or _as_utc(row.recorded_at) < _as_utc(row.generated_at):
+                raise ForecastRunValidationError(
+                    "forecast archive row lacks a valid database persistence stamp"
+                )
+        except (ForecastRunValidationError, ValueError, TypeError) as exc:
+            raise AppError(
+                "Persisted forecast replay evidence failed validation.",
+                code="forecast_archive_corrupt",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                details={
+                    "forecast_id": str(row.forecast_id),
+                    "retryable": False,
+                },
+            ) from exc
 
     async def _replay_async(
         self,
@@ -740,4 +963,4 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-__all__ = ["ForecastRunStore", "SqlForecastRunStore"]
+__all__ = ["ArchivedForecastRun", "ForecastRunStore", "SqlForecastRunStore"]

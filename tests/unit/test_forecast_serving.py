@@ -213,6 +213,15 @@ async def test_explicit_baseline_selectors_route_and_stamp_versions(
     assert response.provenance.model_version == expected_version
 
 
+def test_model_version_resolution_exposes_parameterized_policy_without_io() -> None:
+    service, repository = _service(None, seasonal_period=7)
+
+    assert service.model_version_for("baseline_naive") == "baseline-naive@1"
+    assert service.model_version_for("baseline_seasonal_naive") == "baseline-seasonal-naive-s7@1"
+    assert repository.get_calls == []
+    assert repository.latest_calls == []
+
+
 async def test_pinned_snapshot_id_is_loaded_by_get_and_bound() -> None:
     record = _record()
     service, repository = _service(record)
