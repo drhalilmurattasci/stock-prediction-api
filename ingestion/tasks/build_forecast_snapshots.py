@@ -271,6 +271,13 @@ def _as_utc(value: datetime) -> datetime:
 def _main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
+    # Keep the scheduled raw-close Celery lane independent from the adjusted
+    # builder. The latter is imported only for this read-only operator command.
+    from app.services.adjusted_forecast_snapshot_builder import (
+        ADJUSTED_AVAILABILITY_RULE_SET_HASH,
+        ADJUSTED_RESOLUTION_POLICY_HASH,
+    )
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--print-policy-hashes",
@@ -282,6 +289,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
         parser.error("--print-policy-hashes is required; run builds through Celery")
     print(f"FORECAST_RESOLUTION_POLICY_HASH={DEFAULT_RESOLUTION_POLICY_HASH}")
     print(f"FORECAST_TRUSTED_AVAILABILITY_RULE_SET_HASH={DEFAULT_AVAILABILITY_RULE_SET_HASH}")
+    print(f"FORECAST_ADJUSTED_CLOSE_RESOLUTION_POLICY_HASH={ADJUSTED_RESOLUTION_POLICY_HASH}")
+    print(
+        "FORECAST_ADJUSTED_CLOSE_TRUSTED_AVAILABILITY_RULE_SET_HASH="
+        f"{ADJUSTED_AVAILABILITY_RULE_SET_HASH}"
+    )
     return 0
 
 

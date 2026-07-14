@@ -2,6 +2,11 @@
 
 Operational scripts. `db-init/*.sql` runs on first TimescaleDB boot (see docker-compose.yml).
 
+No real vendor-to-forecast proof is recorded yet; the ordinary database gate
+uses labelled synthetic evidence and cleans it before returning. Every command
+below is documentation, not authorization; date scope and call budgets must
+come from a fresh owner grant where required.
+
 `vendor_smoke.py` is the deliberately narrow first-live-vendor harness behind
 `run-vendor-smoke.ps1`. It accepts only MSFT, the latest completed XNYS session,
 the local `stockapi_test` database, and the exact
@@ -28,16 +33,95 @@ worker/Beat processes and serializes concurrent wrapper invocations. The ignored
   one bar plus its post-commit receipt before the next request.
 
 All three modes require a clean Git worktree; the commit is part of the plan.
-Smoke, backfill, ordinary close ingestion, and ordinary Polygon price ingestion
+Smoke, typed acquisition, the lower-level backfill, ordinary close ingestion,
+and ordinary Polygon price ingestion
 share one PostgreSQL vendor-operation lock, so no controlled Polygon lane can
 overlap an authorized run. See `INSTALL.md` for the owner authorization and
 failure/recovery runbook.
 
-`forecast_demo.py` is the final local seal-and-serve lane behind
+`vendor_acquisition.py` and `run-vendor-acquisition.ps1` are the preferred
+typed action-plus-price lane for the adjusted-data milestone. They compose the
+proven price coverage/checkpoint machinery with immutable split and dividend
+collection publication under one content-addressed plan, one advisory lock, one
+5-calls-per-60-seconds pacer, and one non-renewing global call ceiling:
+
+- `plan` is read-only, needs no `POLYGON_API_KEY`, accepts only `-End`, and
+  reports the exact `plan_id`, call-set digest, typed allocation, receipt-only
+  repairs, prior-attempt ambiguity, and whether the one-bar smoke anchor exists.
+- `repair` accepts only that current plan ID. It may publish missing database
+  receipts for already committed price/action content but admits zero outbound
+  requests.
+- `execute` requires the current plan plus exact global and per-kind ceilings,
+  the `stockapi-msft-acquisition-only` sentinel, and a fresh lowercase
+  authorization ID. The sentinel is only a mechanical check; it never replaces
+  an owner grant naming the reviewed plan and allocation.
+
+From a zero-data database, `plan` is correctly `blocked` until the separately
+authorized one-request smoke has established the latest-session receipt. After
+that smoke, with no action collections or other bars present, the expected plan
+is exactly **259 calls**: `split_page=1`, `dividend_page=1`, and
+`open_close=257`. Execution must pass those exact values:
+
+```powershell
+.\run-vendor-acquisition.ps1 `
+  -Mode execute `
+  -End YYYY-MM-DD `
+  -PlanId sha256:<64-hex-plan-id> `
+  -MaxCalls 259 `
+  -SplitCalls 1 `
+  -DividendCalls 1 `
+  -OpenCloseCalls 257 `
+  -Authorization stockapi-msft-acquisition-only `
+  -AuthorizationId msft-acquisition-YYYYMMDD-a
+```
+
+The ordered call set sends the complete split page first, then the complete
+dividend page, then unique missing open-close sessions. Each attempt is reserved
+before HTTP in ignored, append-only
+`data/vendor_acquisition_attempts.jsonl`; HTTP retries are disabled, and the
+exact content plus its later receipt is checkpointed before the next call. The
+lane also reads the older `data/vendor_backfill_attempts.jsonl` ambiguity state,
+so preserve both ledgers. A consumed/ambiguous reservation has no clear switch:
+perform vendor/database forensics, re-plan, and obtain a new authorization for
+only an unambiguous remaining call set. Planning binds a clean local commit but
+does not require or perform a push.
+
+Factor calculation/publication is deliberately separate from acquisition.
+`AdjustmentFactorBuilder` selects exact cutoff-visible raw versions and action
+collections, the pure policy computes canonical Decimal34 factors, and
+`SqlAdjustmentFactorSetStore` publishes immutable content followed by a later
+receipt. The low-level one-shot primitive is
+`python -m ingestion.tasks.seal_adjusted_forecast_snapshot`. It performs no
+vendor I/O and is not a Celery task; inside one revision-attested
+`stockapi_snapshot_builder` image it publishes or replays one MSFT factor set at
+the operator-plan-bound cutoff and then creates or replays one adjusted-close
+snapshot at the later factor-receipt time.
+It requires the exact `stockapi-msft-adjusted-seal-only` sentinel, current
+258-session XNYS scope, and both adjusted policy hashes pinned to the running
+code. Its complete interface contract, shown for review rather than direct host
+execution, adds:
+
+```text
+--end YYYY-MM-DD
+--factor-cutoff <aware-ISO-8601-plan-cutoff>
+--tool-revision <40-hex-reviewed-commit>
+--authorization stockapi-msft-adjusted-seal-only
+```
+
+The image must contain that exact baked revision, and pre/post database-clock
+checks enforce cutoff freshness, receipt visibility, and session currency. The
+sentinel is only a refusal check, and acquisition authority does not authorize
+this local DB write. There is no read-only adjusted-seal planner or complete
+PowerShell host attestation/HTTP controller yet; do not invoke the primitive ad
+hoc. The public adjusted-price route requires a resulting exact factor ID and
+never resolves “latest.”
+
+`forecast_demo.py` is the final raw-close local seal-and-serve lane behind
 `run-forecast-demo.ps1`. Its `plan` mode is read-only and requires the exact
-258-session MSFT backfill, database-clock session currency, all exact current
-version receipts, one configured API key, the code-derived policy pins, and a
-clean Git commit. `execute` requires that content-addressed plan plus the exact
+258-session MSFT price coverage produced by the typed acquisition (or proven by
+the shared lower-level planner), database-clock session currency, all exact
+current-version receipts, one configured API key, the code-derived policy pins,
+and a clean Git commit. `execute` requires that content-addressed plan plus the exact
 `stockapi-msft-seal-serve-only` sentinel. It starts only the loopback API and
 runs one short-lived container with the `stockapi_snapshot_builder` credential;
 it never starts a persistent queue consumer, ordinary worker, or Beat. The
@@ -55,3 +139,5 @@ vendor call. It also proves a wrong key returns `401`, disables ambient HTTP
 proxies, binds API-key identity with a nonpublic JWT-keyed HMAC inside the plan,
 and compares the response's exact XNYS schedule, deterministic naïve values,
 0.8 interval bucket, and source-manifest lineage to the sealed bytes.
+It does not publish an adjustment factor, build an adjusted-close snapshot, or
+authorize adjusted outcome/cohort evidence.

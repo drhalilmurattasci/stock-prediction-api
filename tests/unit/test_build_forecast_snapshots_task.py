@@ -7,6 +7,10 @@ from datetime import UTC, datetime
 import pytest
 
 from app.config import Settings
+from app.services.adjusted_forecast_snapshot_builder import (
+    ADJUSTED_AVAILABILITY_RULE_SET_HASH,
+    ADJUSTED_RESOLUTION_POLICY_HASH,
+)
 from app.services.forecast_snapshot_builder import (
     DEFAULT_AVAILABILITY_RULE_SET_HASH,
     DEFAULT_RESOLUTION_POLICY_HASH,
@@ -114,6 +118,14 @@ def test_operator_command_prints_the_exact_hashes(capsys: pytest.CaptureFixture[
     assert (
         "FORECAST_TRUSTED_AVAILABILITY_RULE_SET_HASH="
         f"{DEFAULT_AVAILABILITY_RULE_SET_HASH}" in output
+    )
+    assert (
+        "FORECAST_ADJUSTED_CLOSE_RESOLUTION_POLICY_HASH="
+        f"{ADJUSTED_RESOLUTION_POLICY_HASH}" in output
+    )
+    assert (
+        "FORECAST_ADJUSTED_CLOSE_TRUSTED_AVAILABILITY_RULE_SET_HASH="
+        f"{ADJUSTED_AVAILABILITY_RULE_SET_HASH}" in output
     )
 
 

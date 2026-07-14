@@ -11,6 +11,7 @@ from data_sources.guards import AsyncPacingCostRateGuard
 from data_sources.polygon_open_close import (
     OpenClosePayloadError,
     PolygonOpenCloseProvider,
+    open_close_endpoint_identity,
 )
 
 
@@ -96,6 +97,52 @@ async def test_rejects_adjusted_requests_without_calling_vendor() -> None:
     await provider.aclose()
 
     assert calls == 0
+
+
+async def test_guard_identity_binds_symbol_date_and_unadjusted_policy() -> None:
+    guard_calls: list[tuple[str, int, str | None]] = []
+
+    class Guard:
+        async def acquire(
+            self,
+            vendor: str,
+            *,
+            cost: int = 1,
+            endpoint: str | None = None,
+        ) -> None:
+            guard_calls.append((vendor, cost, endpoint))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "symbol": "MSFT",
+                "from": "2026-07-06",
+                "open": 100,
+                "high": 101,
+                "low": 99,
+                "close": 100,
+                "volume": 10,
+            },
+        )
+
+    provider = PolygonOpenCloseProvider(
+        "test-key",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        guard=Guard(),
+        clock=lambda: datetime(2026, 7, 6, 21, tzinfo=UTC),
+    )
+    await provider.get_daily_bars("MSFT", date(2026, 7, 6), date(2026, 7, 6))
+    await provider.aclose()
+
+    assert guard_calls == [
+        (
+            "polygon_open_close",
+            1,
+            open_close_endpoint_identity("MSFT", date(2026, 7, 6)),
+        )
+    ]
 
 
 async def test_rejects_response_received_before_official_session_close() -> None:

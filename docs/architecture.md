@@ -4,6 +4,12 @@ The authoritative product roadmap remains
 [STOCK_API_MASTER_PLAN.md](../STOCK_API_MASTER_PLAN.md). This page records the
 implemented first-forecast trust boundary.
 
+The schema head is `0013_adjustment_factors`. No real vendor-to-forecast proof is
+recorded yet; ordinary live-gate verification seeds only labelled synthetic
+throwaway evidence and cleans it before returning. The diagrams below describe
+enforced code and persistence boundaries, not populated production evidence or
+validated calibration.
+
 ```text
 Massive/Polygon `/v1/open-close` raw regular-session daily bars
   -> distinct `polygon_open_close` source (never the separate `afterHours` value)
@@ -19,6 +25,42 @@ Massive/Polygon `/v1/open-close` raw regular-session daily bars
   -> baseline model in an API-process worker thread
   -> /v1/forecast
 ```
+
+The split/dividend path is parallel and never rewrites the raw branch:
+
+```text
+typed operator acquisition (one splits page, one dividends page, then missing closes)
+  -> canonical content-addressed corporate_action_collections + immutable members
+  -> later corporate_action_collection_availability receipts
+  -> point-in-time factor builder selects exact action collections and exact
+     current-or-revision raw bar receipts at one cutoff
+  -> pure Decimal34 split/dividend policy + published binary64 factor bits
+  -> canonical adjustment_factor_sets + one adjustment_factor_entries row per raw input
+  -> later adjustment_factor_set_availability receipt
+  -> GET /v1/prices/{symbol}/adjusted?factor_set_id=sha256:...
+       validates the complete factor/raw window before range filtering or pagination
+  -> low-level revision-attested adjusted factor/snapshot primitive
+       (read-only host plan/controller still pending)
+  -> target-routed /v1/forecast?target=adjusted_close under separate policy pins
+```
+
+Corporate-action collections bind the exact provider query scope, complete
+single-page exhaustion, canonical event versions, database acceptance time, and
+a distinct post-commit receipt. Factor sets bind both exact collection receipts,
+every exact raw-bar version and receipt, the pinned policy/version hashes, the
+cutoff and anchor, canonical Decimal strings, and the exact IEEE-754 bits used by
+consumers. All collection, factor, entry, and receipt rows reject update, delete,
+and truncate. A later vendor correction creates new immutable action/version and
+factor identities; it cannot rewrite an older adjusted result.
+
+The public adjusted-price route requires the caller to name the immutable
+`factor_set_id`; “latest” is not an API selection rule. The loader locates every
+bound raw version across the current bar or either side of append-only revision
+history, rejects missing or conflicting candidates, and calls the pure adjustment
+kernel over the full factor window before it slices a page. Each response exposes
+factor/policy identities, exact split and dividend collection receipts, action
+version IDs, full raw coverage, and each returned row's raw version/availability
+receipt. Stored evidence failure returns an error and never falls back to raw.
 
 The same current `bars` table has a deliberately separate read-only analysis
 branch to `/v1/indicators`. Version one selects at most the newest 258 exact
@@ -50,8 +92,24 @@ From at most 512 candidates, the builder retains the newest contiguous finalized
 suffix through the latest completed session and still requires at least 258
 observations; an older gap therefore cannot poison an otherwise sufficient
 recent window. A change to any of those choices rotates the relevant hash.
-Adjusted prices require the planned versioned corporate-action
-factor ledger; vendor-rewritten history is not treated as that ledger.
+The adjusted-close snapshot policy is independently content-addressed and
+operator-pinned. It admits only `split_dividend_adjusted/day/1` observations
+derived from a factor receipt visible by the snapshot cutoff. Raw-close and
+adjusted-close services are routed by target and cannot borrow each other's
+resolution or availability hashes. The existing local seal-and-serve operator
+remains raw-close-only. The separate low-level
+`ingestion.tasks.seal_adjusted_forecast_snapshot` primitive performs no vendor
+I/O and is not a Celery task: in an exact revision-attested
+`stockapi_snapshot_builder` image, it publishes or replays one MSFT factor set
+at an operator-plan-bound cutoff and seals or replays one adjusted-close
+snapshot at the later factor-receipt time. It is bound to the exact 258-session
+current XNYS window, builder-role `stockapi_test` database, two adjusted policy
+pins, explicit end session, aware cutoff, and reviewed revision. Pre/post
+database-clock checks enforce cutoff freshness and session currency. The fixed
+sentinel is a code-level refusal check, not owner authority for the local writes.
+No read-only adjusted-seal planner or complete host attestation/HTTP controller
+exists yet, so this primitive is not an operator runbook. No adjusted factor set
+or snapshot has yet been published from real vendor data.
 
 The current serving identity is equally explicit. `model=auto` executes
 `baseline-naive@1`; every unkeyed invocation receives a new archived forecast UUID,
@@ -72,8 +130,10 @@ builder, and Beat live under profile `automation`, and every Celery task checks
 the default-off `AUTOMATION_ENABLED` flag before any I/O. Beat registers no jobs
 while disabled; its Polygon jobs additionally require a positive finite
 per-lane, per-process call cap. Fundamentals and news remain unscheduled until
-they receive owned budgets. The separately authorized smoke, backfill, and demo
-commands call bounded async/operator paths directly and do not enable Celery.
+they receive owned budgets. The separately authorized smoke, typed acquisition,
+lower-level backfill, and raw demo commands call bounded async/operator paths
+directly and do not enable Celery. The adjusted one-shot primitive is likewise
+non-Celery but remains behind the missing host plan/controller boundary above.
 
 Archive persistence uses an optimistic two-phase flow: a short keyed lookup,
 snapshot loading and pure forecast computation with no archive connection held,
@@ -183,3 +243,11 @@ must also bind distinct prospective fit and held-out cohorts, their complete
 outcome receipts, algorithm and composition identities, and post-commit
 persistence evidence. Until that boundary exists and real outcomes mature,
 serving remains `method=none`.
+
+Outcome and cohort evidence is intentionally narrower than adjusted serving.
+The current resolver, canonical outcome publisher, scheduled-evaluation cohort
+builder, and calibration kernels accept raw close only. Adjusted forecasts must
+not be enrolled into those tables or presented as scored calibration evidence
+until a separately policy-hashed adjusted outcome resolver and cohort contract
+exist. Migrations `0012`-`0013` establish corporate-action and factor evidence;
+they do not widen the `0010`-`0011` outcome/cohort policy.

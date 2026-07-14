@@ -22,7 +22,7 @@ actually reject NaN/Infinity under Postgres NaN ordering, and the API
 statement-timeout cancels a pathological statement.
 The same command also proves forecast-input snapshot SHA-256 enforcement,
 idempotent insertion, semantic collision rejection, pure resolution, and
-database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0011`` wire
+database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0013`` wire
 the same gate to check content-addressed realized outcomes, immutable policy
 registration, the direct receipt-writer cutoff fence, source-bound publication,
 and cohort manifests whose availability can be sealed only after the manifest
@@ -33,12 +33,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import subprocess
 import sys
 import threading
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Self
 from uuid import UUID
@@ -47,7 +49,7 @@ import exchange_calendars
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, make_url, select, text
+from sqlalchemy import ARRAY, LargeBinary, bindparam, create_engine, func, make_url, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -60,7 +62,17 @@ from sqlalchemy.ext.asyncio import (
 
 from app.config import Settings
 from app.core.exceptions import AppError
+from app.db.models.adjustment_factors import (
+    AdjustmentFactorEntry,
+    AdjustmentFactorSetAvailability,
+    AdjustmentFactorSetRecord,
+)
 from app.db.models.bars import Bar, BarRevision, BarVersionAvailability
+from app.db.models.corporate_actions import (
+    CorporateActionCollection,
+    CorporateActionCollectionMember,
+    CorporateActionVersion,
+)
 from app.db.models.forecast_evidence import (
     ForecastOutcomeCohortAvailability,
     ForecastOutcomeCohortManifest,
@@ -84,7 +96,34 @@ from app.schemas.forecast import (
     LookaheadCheck,
 )
 from app.schemas.indicators import IndicatorFilters
-from app.schemas.prices import PriceFilters
+from app.schemas.prices import AdjustedPriceFilters, PriceFilters
+from app.services.adjusted_forecast_snapshot_builder import (
+    ADJUSTED_AVAILABILITY_RULE_SET_HASH,
+    ADJUSTED_RESOLUTION_POLICY_HASH,
+    AdjustedForecastSnapshotBuilder,
+    AdjustedSnapshotBuildSpec,
+)
+from app.services.adjusted_price_store import read_adjusted_prices
+from app.services.adjustment_factor_builder import (
+    AdjustmentFactorBuilder,
+    AdjustmentFactorBuildSpec,
+)
+from app.services.adjustment_factor_store import SqlAdjustmentFactorSetStore
+from app.services.adjustment_factors import (
+    AdjustmentFactorSet,
+    DividendActionVersion,
+    RawCloseVersion,
+    build_adjustment_factor_set,
+)
+from app.services.corporate_action_store import SqlCorporateActionCollectionStore
+from app.services.corporate_actions import (
+    CORPORATE_ACTION_ORIGIN,
+    DIVIDENDS_ENDPOINT,
+    SPLITS_ENDPOINT,
+    CorporateActionCollectionRecord,
+    build_dividend_collection,
+    build_split_collection,
+)
 from app.services.forecast_cohort_store import ForecastCohortProof, SqlForecastCohortStore
 from app.services.forecast_cohorts import (
     ForecastCohortManifest,
@@ -147,7 +186,7 @@ from app.services.scheduled_evaluation import (
     ScheduledEvaluationService,
     ScheduledEvaluationSpec,
 )
-from data_sources.base import OHLCVBar
+from data_sources.base import Dividend, DividendPage, OHLCVBar, Split, SplitPage
 from ingestion.locks import (
     VendorOperationBusy,
     bar_series_lock_id,
@@ -176,6 +215,24 @@ if os.environ.get("TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET") != "stockapi-test-onl
     )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_PUBLISH_CORPORATE_ACTION_COLLECTION = text(
+    "SELECT public.publish_corporate_action_collection(:manifest, :events)"
+).bindparams(
+    bindparam("manifest", type_=LargeBinary()),
+    bindparam("events", type_=ARRAY(LargeBinary())),
+)
+_PUBLISH_CORPORATE_ACTION_RECEIPT = text(
+    "SELECT collection_id, collection_recorded_at, available_at "
+    "FROM public.publish_corporate_action_collection_receipt(:collection_id)"
+)
+_PUBLISH_ADJUSTMENT_FACTOR_SET = text(
+    "SELECT public.publish_adjustment_factor_set(:payload)"
+).bindparams(bindparam("payload", type_=LargeBinary()))
+_PUBLISH_ADJUSTMENT_FACTOR_RECEIPT = text(
+    "SELECT factor_set_id, factor_set_recorded_at, available_at "
+    "FROM public.publish_adjustment_factor_set_receipt(:factor_set_id)"
+)
 
 
 class _MissingReadBarrier:
@@ -334,7 +391,11 @@ def _drop_project_schema(url: str) -> None:
         with sync_engine.begin() as conn:
             conn.execute(
                 text(
-                    "DROP TABLE IF EXISTS forecast_outcome_cohort_availability, "
+                    "DROP TABLE IF EXISTS adjustment_factor_set_availability, "
+                    "adjustment_factor_entries, adjustment_factor_sets, "
+                    "corporate_action_collection_availability, "
+                    "corporate_action_collection_members, corporate_action_collections, "
+                    "corporate_action_versions, forecast_outcome_cohort_availability, "
                     "forecast_outcome_cohort_members, forecast_outcome_cohort_manifests, "
                     "forecast_realized_outcome_publications, forecast_realized_outcomes, "
                     "forecast_outcome_resolution_policies, forecast_runs, "
@@ -360,6 +421,14 @@ def _drop_project_schema(url: str) -> None:
                 "fence_bar_version_availability",
                 "stamp_forecast_outcome_resolution_policy",
                 "validate_forecast_realized_outcome_policy",
+                "stamp_corporate_action_evidence",
+                "stamp_corporate_action_collection_member",
+                "reject_corporate_action_mutation",
+                "stamp_corporate_action_collection_availability",
+                "stamp_adjustment_factor_set",
+                "stamp_adjustment_factor_entry",
+                "reject_adjustment_factor_mutation",
+                "stamp_adjustment_factor_set_availability",
             ):
                 conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
             conn.execute(
@@ -374,6 +443,32 @@ def _drop_project_schema(url: str) -> None:
                     "varchar, uuid, smallint, varchar, bytea)"
                 )
             )
+            conn.execute(
+                text("DROP FUNCTION IF EXISTS corporate_action_series_fence_id(text,text,text)")
+            )
+            conn.execute(
+                text("DROP FUNCTION IF EXISTS publish_corporate_action_collection(bytea,bytea[])")
+            )
+            conn.execute(
+                text("DROP FUNCTION IF EXISTS publish_corporate_action_collection_receipt(text)")
+            )
+            conn.execute(text("DROP FUNCTION IF EXISTS canonical_corporate_action_json(jsonb)"))
+            conn.execute(text("DROP FUNCTION IF EXISTS parse_corporate_action_date(text)"))
+            conn.execute(text("DROP FUNCTION IF EXISTS parse_corporate_action_timestamp(text)"))
+            conn.execute(text("DROP FUNCTION IF EXISTS parse_corporate_action_decimal(text)"))
+            for function_name in (
+                "canonical_adjustment_factor_json(jsonb)",
+                "adjustment_decimal34(numeric)",
+                "adjustment_divide34(numeric,numeric)",
+                "adjustment_decimal_text(numeric)",
+                "parse_adjustment_timestamp(text)",
+                "parse_adjustment_date(text)",
+                "parse_adjustment_decimal(text)",
+                "adjustment_factor_series_fence_id(text)",
+                "publish_adjustment_factor_set(bytea)",
+                "publish_adjustment_factor_set_receipt(text)",
+            ):
+                conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}"))
     finally:
         sync_engine.dispose()
 
@@ -503,12 +598,411 @@ def _bar(
     )
 
 
+def _dividend_collection(
+    *,
+    symbol: str,
+    request_id: str,
+    fetched_at: datetime,
+    cash_amount: str | None,
+) -> CorporateActionCollectionRecord:
+    start = date(2026, 1, 1)
+    end = date(2026, 7, 13)
+    results: tuple[Dividend, ...] = ()
+    if cash_amount is not None:
+        amount = Decimal(cash_amount)
+        results = (
+            Dividend(
+                provider_event_id="dividend-1",
+                symbol=symbol,
+                ex_dividend_date=date(2026, 5, 14),
+                cash_amount=amount,
+                split_adjusted_cash_amount=amount,
+                historical_adjustment_factor=Decimal("0.9975"),
+                currency="USD",
+                declaration_date=date(2026, 3, 10),
+                record_date=date(2026, 5, 15),
+                pay_date=date(2026, 6, 12),
+                frequency=4,
+                distribution_type="recurring",
+                source="polygon",
+                fetched_at=fetched_at,
+            ),
+        )
+    return build_dividend_collection(
+        DividendPage(
+            provider_request_id=request_id,
+            provider_origin=CORPORATE_ACTION_ORIGIN,
+            endpoint=DIVIDENDS_ENDPOINT,
+            symbol=symbol,
+            start=start,
+            end=end,
+            source="polygon",
+            fetched_at=fetched_at,
+            results=results,
+        )
+    )
+
+
+def _split_collection(
+    *,
+    symbol: str,
+    request_id: str,
+    fetched_at: datetime,
+) -> CorporateActionCollectionRecord:
+    start = date(2026, 1, 1)
+    end = date(2026, 7, 13)
+    return build_split_collection(
+        SplitPage(
+            provider_request_id=request_id,
+            provider_origin=CORPORATE_ACTION_ORIGIN,
+            endpoint=SPLITS_ENDPOINT,
+            symbol=symbol,
+            start=start,
+            end=end,
+            source="polygon",
+            fetched_at=fetched_at,
+            results=(
+                Split(
+                    provider_event_id="split-1",
+                    symbol=symbol,
+                    execution_date=date(2026, 4, 15),
+                    split_from=Decimal("1"),
+                    split_to=Decimal("2"),
+                    adjustment_type="forward_split",
+                    historical_adjustment_factor=Decimal("0.5"),
+                    source="polygon",
+                    fetched_at=fetched_at,
+                ),
+            ),
+        )
+    )
+
+
+async def _publish_corporate_action_content(
+    engine: AsyncEngine,
+    record: CorporateActionCollectionRecord,
+) -> str:
+    async with engine.begin() as conn:
+        return (
+            await conn.execute(
+                _PUBLISH_CORPORATE_ACTION_COLLECTION,
+                {
+                    "manifest": record.canonical_manifest,
+                    "events": [member.canonical_event for member in record.members],
+                },
+            )
+        ).scalar_one()
+
+
+def _canonical_bytes(document: object) -> bytes:
+    return json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _factor_split_collection(
+    *,
+    symbol: str,
+    request_id: str,
+    start: date,
+    end: date,
+    fetched_at: datetime,
+) -> CorporateActionCollectionRecord:
+    return build_split_collection(
+        SplitPage(
+            provider_request_id=request_id,
+            provider_origin=CORPORATE_ACTION_ORIGIN,
+            endpoint=SPLITS_ENDPOINT,
+            symbol=symbol,
+            start=start,
+            end=end,
+            source="polygon",
+            fetched_at=fetched_at,
+            results=(),
+        )
+    )
+
+
+def _factor_dividend_collection(
+    *,
+    symbol: str,
+    request_id: str,
+    start: date,
+    end: date,
+    ex_dividend_date: date,
+    cash_amount: str | None,
+    fetched_at: datetime,
+) -> CorporateActionCollectionRecord:
+    results: tuple[Dividend, ...] = ()
+    if cash_amount is not None:
+        amount = Decimal(cash_amount)
+        results = (
+            Dividend(
+                provider_event_id=f"{symbol.lower()}-dividend-1",
+                symbol=symbol,
+                ex_dividend_date=ex_dividend_date,
+                cash_amount=amount,
+                split_adjusted_cash_amount=amount,
+                historical_adjustment_factor=Decimal("1"),
+                currency="USD",
+                declaration_date=start,
+                record_date=ex_dividend_date,
+                pay_date=end,
+                frequency=4,
+                distribution_type="recurring",
+                source="polygon",
+                fetched_at=fetched_at,
+            ),
+        )
+    return build_dividend_collection(
+        DividendPage(
+            provider_request_id=request_id,
+            provider_origin=CORPORATE_ACTION_ORIGIN,
+            endpoint=DIVIDENDS_ENDPOINT,
+            symbol=symbol,
+            start=start,
+            end=end,
+            source="polygon",
+            fetched_at=fetched_at,
+            results=results,
+        )
+    )
+
+
+def _factor_dividend_versions(
+    collection: CorporateActionCollectionRecord,
+) -> tuple[DividendActionVersion, ...]:
+    versions: list[DividendActionVersion] = []
+    for member in collection.members:
+        assert member.cash_amount is not None
+        assert member.currency is not None
+        assert member.distribution_type is not None
+        versions.append(
+            DividendActionVersion(
+                provider_event_id=member.provider_event_id,
+                version_id=member.action_version_id,
+                ex_dividend_date=member.effective_date,
+                cash_amount=member.cash_amount,
+                currency=member.currency,
+                distribution_type=member.distribution_type,
+            )
+        )
+    return tuple(versions)
+
+
+async def _factor_database_now(engine: AsyncEngine) -> datetime:
+    async with engine.connect() as conn:
+        return (await conn.execute(select(func.clock_timestamp()))).scalar_one()
+
+
+async def _factor_raw_versions(
+    engine: AsyncEngine,
+    symbol: str,
+) -> tuple[RawCloseVersion, ...]:
+    async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+        rows = (
+            await session.execute(
+                select(Bar, BarVersionAvailability.available_at)
+                .join(
+                    BarVersionAvailability,
+                    (
+                        (BarVersionAvailability.symbol == Bar.symbol)
+                        & (BarVersionAvailability.timespan == Bar.timespan)
+                        & (BarVersionAvailability.multiplier == Bar.multiplier)
+                        & (BarVersionAvailability.ts == Bar.ts)
+                        & (BarVersionAvailability.source == Bar.source)
+                        & (BarVersionAvailability.adjustment_basis == Bar.adjustment_basis)
+                        & (BarVersionAvailability.version_recorded_at == Bar.recorded_at)
+                    ),
+                )
+                .where(
+                    Bar.symbol == symbol,
+                    Bar.timespan == "day",
+                    Bar.multiplier == 1,
+                    Bar.source == "polygon_open_close",
+                    Bar.adjustment_basis == "raw",
+                )
+                .order_by(Bar.ts)
+            )
+        ).all()
+    return tuple(
+        RawCloseVersion(
+            observation_date=bar.ts.astimezone(UTC).date(),
+            observed_at=bar.ts,
+            timespan=bar.timespan,
+            multiplier=bar.multiplier,
+            source=bar.source,
+            adjustment_basis=bar.adjustment_basis,
+            version_recorded_at=bar.recorded_at,
+            available_at=available_at,
+            close=Decimal(str(bar.close)),
+        )
+        for bar, available_at in rows
+    )
+
+
+async def _seed_factor_raw_series(
+    engine: AsyncEngine,
+    *,
+    symbol: str,
+    sessions: tuple[date, ...],
+    closes: tuple[float, ...],
+    fetched_at: datetime | None = None,
+    allow_receipt_reconciliation: bool = False,
+) -> tuple[RawCloseVersion, ...]:
+    calendar = exchange_calendars.get_calendar(
+        "XNYS",
+        start="1990-01-01",
+        end="2100-12-31",
+    )
+    bars = []
+    for session_date, close in zip(sessions, closes, strict=True):
+        observed_at = calendar.session_close(pd.Timestamp(session_date)).to_pydatetime()
+        bars.append(
+            OHLCVBar(
+                symbol=symbol,
+                timestamp=observed_at,
+                timespan="day",
+                multiplier=1,
+                open=close - 1,
+                high=close + 1,
+                low=close - 2,
+                close=close,
+                volume=1_000,
+                source="polygon_open_close",
+                adjustment_basis="raw",
+                fetched_at=fetched_at or observed_at + timedelta(minutes=1),
+            )
+        )
+    maker = build_sessionmaker(engine)
+    async with maker() as session, session.begin():
+        plan = await upsert_bars(session, bars)
+    async with maker() as session, session.begin():
+        finalized = await finalize_bar_version_availability(session, plan.rows)
+        if allow_receipt_reconciliation:
+            assert finalized >= len(bars)
+        else:
+            assert finalized == len(bars)
+    return await _factor_raw_versions(engine, symbol)
+
+
+async def _restate_factor_bar(
+    engine: AsyncEngine,
+    *,
+    symbol: str,
+    session_date: date,
+    close: float,
+) -> tuple[RawCloseVersion, ...]:
+    calendar = exchange_calendars.get_calendar(
+        "XNYS",
+        start="1990-01-01",
+        end="2100-12-31",
+    )
+    observed_at = calendar.session_close(pd.Timestamp(session_date)).to_pydatetime()
+    bar = OHLCVBar(
+        symbol=symbol,
+        timestamp=observed_at,
+        timespan="day",
+        multiplier=1,
+        open=close - 1,
+        high=close + 1,
+        low=close - 2,
+        close=close,
+        volume=1_001,
+        source="polygon_open_close",
+        adjustment_basis="raw",
+        fetched_at=observed_at + timedelta(minutes=2),
+    )
+    maker = build_sessionmaker(engine)
+    async with maker() as session, session.begin():
+        plan = await upsert_bars(session, [bar])
+    async with maker() as session, session.begin():
+        assert await finalize_bar_version_availability(session, plan.rows) == 1
+    return await _factor_raw_versions(engine, symbol)
+
+
+async def _factor_scenario(
+    engine: AsyncEngine,
+    *,
+    symbol: str,
+    cash_amount: str | None = "0.50",
+) -> tuple[
+    AdjustmentFactorSet,
+    CorporateActionCollectionRecord,
+    CorporateActionCollectionRecord,
+]:
+    sessions = (date(2026, 7, 8), date(2026, 7, 9), date(2026, 7, 10))
+    raw = await _seed_factor_raw_series(
+        engine,
+        symbol=symbol,
+        sessions=sessions,
+        closes=(100.0, 101.0, 102.0),
+    )
+    split_collection = _factor_split_collection(
+        symbol=symbol,
+        request_id=f"{symbol.lower()}-splits",
+        start=sessions[0],
+        end=sessions[-1],
+        fetched_at=datetime(2026, 7, 10, 21, tzinfo=UTC),
+    )
+    dividend_collection = _factor_dividend_collection(
+        symbol=symbol,
+        request_id=f"{symbol.lower()}-dividends",
+        start=sessions[0],
+        end=sessions[-1],
+        ex_dividend_date=sessions[1],
+        cash_amount=cash_amount,
+        fetched_at=datetime(2026, 7, 10, 21, 1, tzinfo=UTC),
+    )
+    action_store = SqlCorporateActionCollectionStore(engine)
+    await action_store.publish(split_collection)
+    await action_store.publish(dividend_collection)
+    cutoff = await _factor_database_now(engine)
+    artifact = build_adjustment_factor_set(
+        symbol=symbol,
+        cutoff=cutoff,
+        raw_closes=raw,
+        split_collection_id=split_collection.collection_id,
+        splits=(),
+        dividend_collection_id=dividend_collection.collection_id,
+        dividends=_factor_dividend_versions(dividend_collection),
+    )
+    return artifact, split_collection, dividend_collection
+
+
+async def _assert_immutability_triggers(
+    engine: AsyncEngine,
+    tables: tuple[str, ...],
+) -> None:
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT relation.relname, trigger.tgname "
+                    "FROM pg_trigger AS trigger "
+                    "JOIN pg_class AS relation ON relation.oid = trigger.tgrelid "
+                    "WHERE relation.relname::text = ANY(CAST(:tables AS text[])) "
+                    "AND NOT trigger.tgisinternal"
+                ),
+                {"tables": list(tables)},
+            )
+        ).all()
+    actual = {(row.relname, row.tgname) for row in rows}
+    for table_name in tables:
+        assert (table_name, f"{table_name}_no_row_mutation") in actual
+        assert (table_name, f"{table_name}_no_truncate") in actual
+
+
 async def test_migration_chain_applies_and_bars_is_a_hypertable(
     owner_engine: AsyncEngine,
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0011_outcome_policy_fence"
+        assert version == "0013_adjustment_factors"
         hypertables = (
             await conn.execute(
                 text(
@@ -842,7 +1336,1020 @@ async def test_nonempty_policy_registry_refuses_downgrade(
     assert "cannot downgrade nonempty outcome-policy evidence" in combined
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0011_outcome_policy_fence"
+    assert version == "0013_adjustment_factors"
+
+
+async def test_corporate_action_publication_replay_correction_and_withdrawal(
+    engine: AsyncEngine,
+) -> None:
+    """Prove complete sets, exact versions, replay, and omission withdrawal."""
+
+    first = _dividend_collection(
+        symbol="CACT",
+        request_id="ca-first",
+        fetched_at=datetime(2026, 7, 13, 12, tzinfo=UTC),
+        cash_amount="0.25",
+    )
+    corrected = _dividend_collection(
+        symbol="CACT",
+        request_id="ca-corrected",
+        fetched_at=datetime(2026, 7, 13, 13, tzinfo=UTC),
+        cash_amount="0.26",
+    )
+    withdrawn = _dividend_collection(
+        symbol="CACT",
+        request_id="ca-withdrawn",
+        fetched_at=datetime(2026, 7, 13, 14, tzinfo=UTC),
+        cash_amount=None,
+    )
+    assert first.members[0].action_version_id != corrected.members[0].action_version_id
+    assert withdrawn.members == ()
+
+    store = SqlCorporateActionCollectionStore(engine)
+    first_proof = await store.publish(first)
+    assert first_proof == await store.publish(first)
+    corrected_proof = await store.publish(corrected)
+    withdrawn_proof = await store.publish(withdrawn)
+    assert (first_proof.event_count, corrected_proof.event_count, withdrawn_proof.event_count) == (
+        1,
+        1,
+        0,
+    )
+
+    ids = (first.collection_id, corrected.collection_id, withdrawn.collection_id)
+    async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+        collections = {
+            value.collection_id: value
+            for value in (
+                await session.execute(
+                    select(CorporateActionCollection).where(
+                        CorporateActionCollection.collection_id.in_(ids)
+                    )
+                )
+            ).scalars()
+        }
+        assert set(collections) == set(ids)
+        for expected in (first, corrected, withdrawn):
+            stored = collections[expected.collection_id]
+            assert stored.canonical_manifest == expected.canonical_manifest
+            assert stored.event_count == expected.event_count
+            assert stored.provider_request_id == expected.provider_request_id
+
+        members = tuple(
+            (
+                value.collection_id,
+                value.ordinal,
+                value.action_version_id,
+            )
+            for value in (
+                await session.execute(
+                    select(CorporateActionCollectionMember)
+                    .where(CorporateActionCollectionMember.collection_id.in_(ids))
+                    .order_by(
+                        CorporateActionCollectionMember.collection_id,
+                        CorporateActionCollectionMember.ordinal,
+                    )
+                )
+            ).scalars()
+        )
+        assert members == tuple(
+            sorted(
+                (
+                    (first.collection_id, 0, first.members[0].action_version_id),
+                    (corrected.collection_id, 0, corrected.members[0].action_version_id),
+                )
+            )
+        )
+        stored_versions = {
+            value.action_version_id: value
+            for value in (
+                await session.execute(
+                    select(CorporateActionVersion).where(
+                        CorporateActionVersion.action_version_id.in_(
+                            (
+                                first.members[0].action_version_id,
+                                corrected.members[0].action_version_id,
+                            )
+                        )
+                    )
+                )
+            ).scalars()
+        }
+        assert {key: value.canonical_event for key, value in stored_versions.items()} == {
+            first.members[0].action_version_id: first.members[0].canonical_event,
+            corrected.members[0].action_version_id: corrected.members[0].canonical_event,
+        }
+        stored_dividend = stored_versions[first.members[0].action_version_id]
+        assert (
+            stored_dividend.source,
+            stored_dividend.action_type,
+            stored_dividend.provider_event_id,
+            stored_dividend.symbol,
+            stored_dividend.effective_date,
+            stored_dividend.status,
+            stored_dividend.split_from,
+            stored_dividend.split_to,
+            stored_dividend.adjustment_type,
+            stored_dividend.cash_amount,
+            stored_dividend.split_adjusted_cash_amount,
+            stored_dividend.currency,
+            stored_dividend.declaration_date,
+            stored_dividend.record_date,
+            stored_dividend.pay_date,
+            stored_dividend.frequency,
+            stored_dividend.distribution_type,
+            stored_dividend.historical_adjustment_factor,
+        ) == (
+            "polygon",
+            "dividend",
+            "dividend-1",
+            "CACT",
+            date(2026, 5, 14),
+            "active",
+            None,
+            None,
+            None,
+            Decimal("0.25"),
+            Decimal("0.25"),
+            "USD",
+            date(2026, 3, 10),
+            date(2026, 5, 15),
+            date(2026, 6, 12),
+            4,
+            "recurring",
+            Decimal("0.9975"),
+        )
+
+    async with engine.connect() as conn:
+        chronology = (
+            await conn.execute(
+                text(
+                    "SELECT collection.recorded_at, collection.creator_xid, "
+                    "member.creator_xid AS member_xid, "
+                    "version.creator_xid AS version_xid, receipt.available_at, "
+                    "(receipt.xmin::text)::bigint AS receipt_xid "
+                    "FROM corporate_action_collections AS collection "
+                    "JOIN corporate_action_collection_members AS member "
+                    "ON member.collection_id = collection.collection_id "
+                    "JOIN corporate_action_versions AS version "
+                    "ON version.action_version_id = member.action_version_id "
+                    "JOIN corporate_action_collection_availability AS receipt "
+                    "ON receipt.collection_id = collection.collection_id "
+                    "WHERE collection.collection_id = :collection_id"
+                ),
+                {"collection_id": first.collection_id},
+            )
+        ).one()
+    assert chronology.creator_xid == chronology.member_xid == chronology.version_xid
+    assert chronology.receipt_xid != chronology.creator_xid
+    assert chronology.available_at >= chronology.recorded_at
+
+
+async def test_corporate_action_runtime_boundary_and_canonical_bytes_fail_closed(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+) -> None:
+    await _assert_immutability_triggers(
+        engine,
+        (
+            "corporate_action_versions",
+            "corporate_action_collections",
+            "corporate_action_collection_members",
+            "corporate_action_collection_availability",
+        ),
+    )
+    record = _dividend_collection(
+        symbol="CABOUND",
+        request_id="ca-boundary",
+        fetched_at=datetime(2026, 7, 13, 15, tzinfo=UTC),
+        cash_amount="0.30",
+    )
+    other = _dividend_collection(
+        symbol="CABOUND",
+        request_id="ca-boundary-other",
+        fetched_at=datetime(2026, 7, 13, 16, tzinfo=UTC),
+        cash_amount="0.31",
+    )
+    noncanonical_event = record.members[0].canonical_event.replace(b"{", b"{ ", 1)
+    noncanonical_event_id = "sha256:" + hashlib.sha256(noncanonical_event).hexdigest()
+    noncanonical_event_manifest = json.loads(record.canonical_manifest)
+    noncanonical_event_manifest["event_version_ids"] = [noncanonical_event_id]
+    canonical_manifest_for_noncanonical_event = json.dumps(
+        noncanonical_event_manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+    tables_and_keys = {
+        "corporate_action_versions": "action_version_id",
+        "corporate_action_collections": "collection_id",
+        "corporate_action_collection_members": "collection_id",
+        "corporate_action_collection_availability": "collection_id",
+    }
+    for table_name, key_column in tables_and_keys.items():
+        for statement in (
+            f"INSERT INTO {table_name} SELECT * FROM {table_name} WHERE false",
+            f"UPDATE {table_name} SET {key_column} = {key_column} WHERE false",
+            f"DELETE FROM {table_name} WHERE false",
+            f"TRUNCATE {table_name}",
+        ):
+            async with engine.connect() as conn:
+                transaction = await conn.begin()
+                try:
+                    with pytest.raises(DBAPIError, match="permission denied"):
+                        await conn.execute(text(statement))
+                finally:
+                    await transaction.rollback()
+
+    invalid_publications: tuple[tuple[bytes, list[bytes]], ...] = (
+        (b"{}", []),
+        (record.canonical_manifest, [other.members[0].canonical_event]),
+        (
+            record.canonical_manifest.replace(b"{", b"{ ", 1),
+            [record.members[0].canonical_event],
+        ),
+        (canonical_manifest_for_noncanonical_event, [noncanonical_event]),
+    )
+    for manifest, events in invalid_publications:
+        async with engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(DBAPIError):
+                    await conn.execute(
+                        _PUBLISH_CORPORATE_ACTION_COLLECTION,
+                        {"manifest": manifest, "events": events},
+                    )
+            finally:
+                await transaction.rollback()
+
+    nan_payload = b'{"numeric_probe":"cash_nan"}'
+    nan_identity = "sha256:" + hashlib.sha256(nan_payload).hexdigest()
+    async with owner_engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            with pytest.raises(DBAPIError, match="cash_amount_finite_positive"):
+                await conn.execute(
+                    text(
+                        "INSERT INTO corporate_action_versions ("
+                        "action_version_id, schema_version, source, action_type, "
+                        "provider_event_id, symbol, effective_date, status, "
+                        "split_from, split_to, adjustment_type, cash_amount, "
+                        "split_adjusted_cash_amount, currency, declaration_date, "
+                        "record_date, pay_date, frequency, distribution_type, "
+                        "historical_adjustment_factor, canonical_event, creator_xid"
+                        ") VALUES ("
+                        ":identity, 1, 'polygon', 'dividend', 'nan-probe', 'CANAN', "
+                        "DATE '2026-07-09', 'active', NULL, NULL, NULL, "
+                        "'NaN'::numeric, 1, 'USD', NULL, NULL, NULL, 4, "
+                        "'recurring', 1, :payload, 1)"
+                    ),
+                    {"identity": nan_identity, "payload": nan_payload},
+                )
+        finally:
+            await transaction.rollback()
+
+
+async def test_corporate_action_membership_freeze_and_receipt_fence_contention(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+) -> None:
+    record = _split_collection(
+        symbol="CAFENCE",
+        request_id="ca-fence",
+        fetched_at=datetime(2026, 7, 13, 17, tzinfo=UTC),
+    )
+    assert await _publish_corporate_action_content(engine, record) == record.collection_id
+    async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+        stored_split = (
+            await session.execute(
+                select(CorporateActionVersion).where(
+                    CorporateActionVersion.action_version_id == record.members[0].action_version_id
+                )
+            )
+        ).scalar_one()
+    assert (
+        stored_split.source,
+        stored_split.action_type,
+        stored_split.provider_event_id,
+        stored_split.symbol,
+        stored_split.effective_date,
+        stored_split.status,
+        stored_split.split_from,
+        stored_split.split_to,
+        stored_split.adjustment_type,
+        stored_split.cash_amount,
+        stored_split.split_adjusted_cash_amount,
+        stored_split.currency,
+        stored_split.declaration_date,
+        stored_split.record_date,
+        stored_split.pay_date,
+        stored_split.frequency,
+        stored_split.distribution_type,
+        stored_split.historical_adjustment_factor,
+    ) == (
+        "polygon",
+        "split",
+        "split-1",
+        "CAFENCE",
+        date(2026, 4, 15),
+        "active",
+        Decimal("1"),
+        Decimal("2"),
+        "forward_split",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Decimal("0.5"),
+    )
+
+    async def assert_membership_frozen() -> None:
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(DBAPIError, match="must be inserted with their collection"):
+                    await conn.execute(
+                        text(
+                            "INSERT INTO corporate_action_collection_members "
+                            "(collection_id, ordinal, action_version_id, creator_xid) "
+                            "VALUES (:collection_id, 99, :action_version_id, 1)"
+                        ),
+                        {
+                            "collection_id": record.collection_id,
+                            "action_version_id": record.members[0].action_version_id,
+                        },
+                    )
+            finally:
+                await transaction.rollback()
+
+    await assert_membership_frozen()
+
+    async with owner_engine.connect() as holder, engine.connect() as waiter:
+        holder_transaction = await holder.begin()
+        waiter_transaction = await waiter.begin()
+        wait_task: asyncio.Task[Any] | None = None
+        try:
+            lock_id = (
+                await holder.execute(
+                    text(
+                        "SELECT public.corporate_action_series_fence_id("
+                        "'polygon', 'CAFENCE', 'split')"
+                    )
+                )
+            ).scalar_one()
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lock_id},
+            )
+            waiter_pid = (await waiter.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            wait_task = asyncio.create_task(
+                waiter.execute(
+                    _PUBLISH_CORPORATE_ACTION_RECEIPT,
+                    {"collection_id": record.collection_id},
+                )
+            )
+
+            waiting = False
+            for _ in range(40):
+                async with owner_engine.connect() as probe:
+                    waiting = bool(
+                        (
+                            await probe.execute(
+                                text(
+                                    "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                                    "WHERE pid = :pid AND locktype = 'advisory' "
+                                    "AND NOT granted)"
+                                ),
+                                {"pid": waiter_pid},
+                            )
+                        ).scalar_one()
+                    )
+                if waiting:
+                    break
+                await asyncio.sleep(0.05)
+            assert waiting
+            assert not wait_task.done()
+
+            await holder_transaction.commit()
+            receipt = (await asyncio.wait_for(wait_task, timeout=5)).one()
+            await waiter_transaction.commit()
+        finally:
+            if holder_transaction.is_active:
+                await holder_transaction.rollback()
+            if wait_task is not None and not wait_task.done():
+                wait_task.cancel()
+            if waiter_transaction.is_active:
+                await waiter_transaction.rollback()
+
+    assert receipt.collection_id == record.collection_id
+    assert receipt.available_at >= receipt.collection_recorded_at
+    await assert_membership_frozen()
+
+    for mutation in (
+        "UPDATE corporate_action_collections SET symbol = symbol "
+        "WHERE collection_id = :collection_id",
+        "DELETE FROM corporate_action_collection_members WHERE collection_id = :collection_id",
+        "TRUNCATE corporate_action_collection_members",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(DBAPIError, match="corporate-action evidence is append-only"):
+                    await conn.execute(text(mutation), {"collection_id": record.collection_id})
+            finally:
+                await transaction.rollback()
+
+
+async def test_adjustment_factor_publication_replay_receipt_projection_and_lock(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+    migrated_database_url: LiveDatabaseUrls,
+) -> None:
+    artifact, _, _ = await _factor_scenario(engine, symbol="FACTOR")
+
+    # Content and its availability receipt cannot be collapsed into one commit.
+    async with snapshot_builder_engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            returned_id = (
+                await conn.execute(
+                    _PUBLISH_ADJUSTMENT_FACTOR_SET,
+                    {"payload": artifact.canonical_payload},
+                )
+            ).scalar_one()
+            assert returned_id == artifact.factor_set_id
+            with pytest.raises(DBAPIError, match="requires a later transaction"):
+                await conn.execute(
+                    _PUBLISH_ADJUSTMENT_FACTOR_RECEIPT,
+                    {"factor_set_id": artifact.factor_set_id},
+                )
+        finally:
+            await transaction.rollback()
+
+    factor_store = SqlAdjustmentFactorSetStore(snapshot_builder_engine)
+    published = await factor_store.publish(artifact)
+    assert await factor_store.publish(artifact) == published
+    assert published.factor_set_id == artifact.factor_set_id
+    assert published.input_count == len(artifact.raw_inputs)
+
+    # The production resolver must reproduce the exact artifact from DB
+    # receipts, release its read session, and replay the authoritative
+    # publisher rather than relying on test-assembled inputs.
+    builder = AdjustmentFactorBuilder(
+        async_sessionmaker(snapshot_builder_engine, expire_on_commit=False),
+        factor_store,
+    )
+    rebuilt = await builder.build(
+        AdjustmentFactorBuildSpec(
+            symbol=artifact.symbol,
+            coverage_start=artifact.raw_inputs[0].observation_date,
+            coverage_end=artifact.raw_inputs[-1].observation_date,
+            cutoff=artifact.cutoff,
+        )
+    )
+    assert rebuilt.artifact == artifact
+    assert rebuilt.publication == published
+
+    # Exercise the production runtime loader and adjusted read against the
+    # real immutable tables. Pagination occurs only after the loader validates
+    # all three exact raw versions and the complete factor window.
+    async with async_sessionmaker(engine, expire_on_commit=False)() as runtime_session:
+        first_page = await read_adjusted_prices(
+            runtime_session,
+            artifact.symbol,
+            AdjustedPriceFilters(factor_set_id=artifact.factor_set_id, limit=2),
+        )
+        second_page = await read_adjusted_prices(
+            runtime_session,
+            artifact.symbol,
+            AdjustedPriceFilters(
+                factor_set_id=artifact.factor_set_id,
+                end=first_page.page.next_end,
+                limit=2,
+            ),
+        )
+    assert first_page.count == 2
+    assert first_page.page.has_more is True
+    assert first_page.page.next_end == artifact.raw_inputs[1].observed_at
+    assert [bar.timestamp for bar in first_page.bars] == [
+        artifact.raw_inputs[1].observed_at,
+        artifact.raw_inputs[2].observed_at,
+    ]
+    assert second_page.count == 1
+    assert second_page.page.has_more is False
+    assert second_page.bars[0].timestamp == artifact.raw_inputs[0].observed_at
+    assert second_page.bars[0].close < float(artifact.raw_inputs[0].close)
+    assert first_page.lineage.factor_set_id == artifact.factor_set_id
+
+    document = json.loads(artifact.canonical_payload)
+    async with async_sessionmaker(
+        snapshot_builder_engine,
+        expire_on_commit=False,
+    )() as session:
+        header = (
+            await session.execute(
+                select(AdjustmentFactorSetRecord).where(
+                    AdjustmentFactorSetRecord.factor_set_id == artifact.factor_set_id
+                )
+            )
+        ).scalar_one()
+        entries = tuple(
+            (
+                await session.execute(
+                    select(AdjustmentFactorEntry)
+                    .where(AdjustmentFactorEntry.factor_set_id == artifact.factor_set_id)
+                    .order_by(AdjustmentFactorEntry.ordinal)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        receipt = (
+            await session.execute(
+                select(AdjustmentFactorSetAvailability).where(
+                    AdjustmentFactorSetAvailability.factor_set_id == artifact.factor_set_id
+                )
+            )
+        ).scalar_one()
+
+    assert header.canonical_payload == artifact.canonical_payload
+    assert (
+        header.format,
+        header.policy_version,
+        header.policy_hash,
+        header.symbol,
+        header.cutoff,
+        header.anchor_date,
+        header.coverage_start,
+        header.coverage_end,
+        header.input_count,
+        header.split_collection_id,
+        header.dividend_collection_id,
+    ) == (
+        document["format"],
+        artifact.policy_version,
+        artifact.policy_hash,
+        artifact.symbol,
+        artifact.cutoff,
+        artifact.anchor_date,
+        artifact.raw_inputs[0].observation_date,
+        artifact.raw_inputs[-1].observation_date,
+        len(artifact.raw_inputs),
+        artifact.split_collection_id,
+        artifact.dividend_collection_id,
+    )
+    assert len(entries) == len(document["raw_inputs"]) == len(document["factors"])
+    for ordinal, (entry, raw, factor) in enumerate(
+        zip(entries, document["raw_inputs"], document["factors"], strict=True)
+    ):
+        assert (
+            entry.ordinal,
+            entry.symbol,
+            entry.observation_date.isoformat(),
+            entry.observed_at,
+            entry.timespan,
+            entry.multiplier,
+            entry.source,
+            entry.adjustment_basis,
+            entry.version_recorded_at,
+            entry.raw_available_at,
+            entry.raw_close_decimal,
+            entry.raw_close_f64_be,
+            entry.price_factor_decimal,
+            entry.price_factor_f64_be,
+            entry.volume_factor_decimal,
+            entry.volume_factor_f64_be,
+        ) == (
+            ordinal,
+            artifact.symbol,
+            raw["observation_date"],
+            datetime.fromisoformat(raw["observed_at"].replace("Z", "+00:00")),
+            raw["timespan"],
+            raw["multiplier"],
+            raw["source"],
+            raw["adjustment_basis"],
+            datetime.fromisoformat(raw["version_recorded_at"].replace("Z", "+00:00")),
+            datetime.fromisoformat(raw["available_at"].replace("Z", "+00:00")),
+            raw["close_decimal"],
+            bytes.fromhex(raw["close_f64_be"]),
+            factor["price_factor_decimal"],
+            bytes.fromhex(factor["price_factor_f64_be"]),
+            factor["volume_factor_decimal"],
+            bytes.fromhex(factor["volume_factor_f64_be"]),
+        )
+    assert receipt.factor_set_recorded_at == header.recorded_at
+    assert receipt.available_at >= receipt.factor_set_recorded_at
+    assert header.max_input_available_at == max(
+        *(value.available_at for value in artifact.raw_inputs),
+        header.split_collection_available_at,
+        header.dividend_collection_available_at,
+    )
+
+    async with owner_engine.connect() as conn:
+        exact_fks = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_constraint WHERE conname = ANY(CAST(:names AS text[]))"
+                ),
+                {
+                    "names": [
+                        "fk_adjustment_factor_sets_exact_split_collection_receipt",
+                        "fk_adjustment_factor_sets_exact_dividend_collection_receipt",
+                        "fk_adjustment_factor_entries_exact_bar_receipt",
+                    ]
+                },
+            )
+        ).scalar_one()
+        receipt_xid = (
+            await conn.execute(
+                text(
+                    "SELECT (xmin::text)::bigint FROM adjustment_factor_set_availability "
+                    "WHERE factor_set_id = :factor_set_id"
+                ),
+                {"factor_set_id": artifact.factor_set_id},
+            )
+        ).scalar_one()
+    assert exact_fks == 3
+    assert receipt_xid != header.creator_xid
+
+    # The real publisher must wait behind the same raw-series fence as ingestion.
+    async with owner_engine.connect() as holder, snapshot_builder_engine.connect() as waiter:
+        holder_transaction = await holder.begin()
+        waiter_transaction = await waiter.begin()
+        wait_task: asyncio.Task[Any] | None = None
+        try:
+            lock_id = (
+                await holder.execute(
+                    text(
+                        "SELECT public.forecast_bar_series_fence_id("
+                        ":symbol, 'polygon_open_close', 'day')"
+                    ),
+                    {"symbol": artifact.symbol},
+                )
+            ).scalar_one()
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lock_id},
+            )
+            waiter_pid = (await waiter.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            wait_task = asyncio.create_task(
+                waiter.execute(
+                    _PUBLISH_ADJUSTMENT_FACTOR_SET,
+                    {"payload": artifact.canonical_payload},
+                )
+            )
+            waiting = False
+            for _ in range(40):
+                async with owner_engine.connect() as probe:
+                    waiting = bool(
+                        (
+                            await probe.execute(
+                                text(
+                                    "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                                    "WHERE pid = :pid AND locktype = 'advisory' "
+                                    "AND NOT granted)"
+                                ),
+                                {"pid": waiter_pid},
+                            )
+                        ).scalar_one()
+                    )
+                if waiting:
+                    break
+                await asyncio.sleep(0.05)
+            assert waiting
+            assert not wait_task.done()
+            await holder_transaction.commit()
+            replayed_id = (await asyncio.wait_for(wait_task, timeout=5)).scalar_one()
+            await waiter_transaction.commit()
+        finally:
+            if holder_transaction.is_active:
+                await holder_transaction.rollback()
+            if wait_task is not None and not wait_task.done():
+                wait_task.cancel()
+            if waiter_transaction.is_active:
+                await waiter_transaction.rollback()
+    assert replayed_id == artifact.factor_set_id
+
+    downgrade = await asyncio.to_thread(
+        _invoke_alembic,
+        migrated_database_url.owner,
+        "downgrade",
+        "0012_corporate_actions",
+    )
+    assert downgrade.returncode != 0
+    assert "cannot downgrade nonempty adjustment-factor evidence" in (
+        f"{downgrade.stdout}\n{downgrade.stderr}"
+    )
+    async with owner_engine.connect() as conn:
+        version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+    assert version == "0013_adjustment_factors"
+
+
+async def test_adjustment_decimal_kernel_is_exact_decimal34(
+    owner_engine: AsyncEngine,
+) -> None:
+    decimal_cases = (
+        (
+            "1.2345678901234567890123456789012345",
+            "1.234567890123456789012345678901234",
+        ),
+        (
+            "1.2345678901234567890123456789012355",
+            "1.234567890123456789012345678901236",
+        ),
+        (
+            "1.2345678901234567890123456789012345001",
+            "1.234567890123456789012345678901235",
+        ),
+        ("9.9999999999999999999999999999999995", "10"),
+    )
+    division_cases = (
+        ("1", "3", "0.3333333333333333333333333333333333"),
+        ("2", "3", "0.6666666666666666666666666666666667"),
+        ("101", "101.5", "0.9950738916256157635467980295566502"),
+    )
+    async with owner_engine.connect() as conn:
+        for value, expected in decimal_cases:
+            actual = (
+                await conn.execute(
+                    text(
+                        "SELECT adjustment_decimal_text("
+                        "adjustment_decimal34(CAST(:value AS numeric)))"
+                    ),
+                    {"value": value},
+                )
+            ).scalar_one()
+            assert actual == expected
+        for numerator, denominator, expected in division_cases:
+            actual = (
+                await conn.execute(
+                    text(
+                        "SELECT adjustment_decimal_text(adjustment_divide34("
+                        "CAST(:numerator AS numeric), CAST(:denominator AS numeric)))"
+                    ),
+                    {"numerator": numerator, "denominator": denominator},
+                )
+            ).scalar_one()
+            assert actual == expected
+
+
+async def test_adjustment_factor_acl_immutability_and_bytes_fail_closed(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+) -> None:
+    artifact, _, _ = await _factor_scenario(engine, symbol="FACBOUND")
+    published = await SqlAdjustmentFactorSetStore(snapshot_builder_engine).publish(artifact)
+    await _assert_immutability_triggers(
+        owner_engine,
+        (
+            "adjustment_factor_sets",
+            "adjustment_factor_entries",
+            "adjustment_factor_set_availability",
+        ),
+    )
+
+    for table_name, key_column in {
+        "adjustment_factor_sets": "factor_set_id",
+        "adjustment_factor_entries": "factor_set_id",
+        "adjustment_factor_set_availability": "factor_set_id",
+    }.items():
+        for statement in (
+            f"INSERT INTO {table_name} SELECT * FROM {table_name} WHERE false",
+            f"UPDATE {table_name} SET {key_column} = {key_column} WHERE false",
+            f"DELETE FROM {table_name} WHERE false",
+            f"TRUNCATE {table_name}",
+        ):
+            async with engine.connect() as conn:
+                transaction = await conn.begin()
+                try:
+                    with pytest.raises(DBAPIError, match="permission denied"):
+                        await conn.execute(text(statement))
+                finally:
+                    await transaction.rollback()
+
+    for statement, parameters in (
+        (_PUBLISH_ADJUSTMENT_FACTOR_SET, {"payload": artifact.canonical_payload}),
+        (
+            _PUBLISH_ADJUSTMENT_FACTOR_RECEIPT,
+            {"factor_set_id": artifact.factor_set_id},
+        ),
+    ):
+        async with engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(DBAPIError, match="permission denied"):
+                    await conn.execute(statement, parameters)
+            finally:
+                await transaction.rollback()
+
+    tampered = json.loads(artifact.canonical_payload)
+    tampered["factors"][0]["price_factor_decimal"] = "0.25"
+    tampered["factors"][0]["price_factor_f64_be"] = "3fd0000000000000"
+    invalid_payloads = (
+        b"{}",
+        artifact.canonical_payload.replace(b"{", b"{ ", 1),
+        _canonical_bytes(tampered),
+    )
+    for payload in invalid_payloads:
+        async with snapshot_builder_engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(DBAPIError):
+                    await conn.execute(
+                        _PUBLISH_ADJUSTMENT_FACTOR_SET,
+                        {"payload": payload},
+                    )
+            finally:
+                await transaction.rollback()
+
+    for mutation in (
+        "UPDATE adjustment_factor_sets SET symbol = symbol WHERE factor_set_id = :factor_set_id",
+        "DELETE FROM adjustment_factor_entries WHERE factor_set_id = :factor_set_id",
+        "TRUNCATE adjustment_factor_set_availability",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(DBAPIError, match="adjustment-factor evidence is append-only"):
+                    await conn.execute(
+                        text(mutation),
+                        {"factor_set_id": published.factor_set_id},
+                    )
+            finally:
+                await transaction.rollback()
+
+
+async def test_adjustment_factor_rejects_stale_and_omitted_raw_receipts(
+    engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+) -> None:
+    artifact, split_collection, dividend_collection = await _factor_scenario(
+        engine,
+        symbol="FACRAW",
+        cash_amount=None,
+    )
+
+    omitted = json.loads(artifact.canonical_payload)
+    omitted["raw_inputs"] = [omitted["raw_inputs"][0], omitted["raw_inputs"][2]]
+    omitted["factors"] = [omitted["factors"][0], omitted["factors"][2]]
+    for ordinal, factor in enumerate(omitted["factors"]):
+        factor["raw_input_ordinal"] = ordinal
+    async with snapshot_builder_engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            with pytest.raises(DBAPIError, match="omit newest cutoff-visible"):
+                await conn.execute(
+                    _PUBLISH_ADJUSTMENT_FACTOR_SET,
+                    {"payload": _canonical_bytes(omitted)},
+                )
+        finally:
+            await transaction.rollback()
+
+    old_raw = artifact.raw_inputs
+    await _restate_factor_bar(
+        engine,
+        symbol=artifact.symbol,
+        session_date=date(2026, 7, 9),
+        close=111.0,
+    )
+    stale_artifact = build_adjustment_factor_set(
+        symbol=artifact.symbol,
+        cutoff=await _factor_database_now(engine),
+        raw_closes=old_raw,
+        split_collection_id=split_collection.collection_id,
+        splits=(),
+        dividend_collection_id=dividend_collection.collection_id,
+        dividends=(),
+    )
+    async with snapshot_builder_engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            with pytest.raises(DBAPIError, match="not the unique newest cutoff version"):
+                await conn.execute(
+                    _PUBLISH_ADJUSTMENT_FACTOR_SET,
+                    {"payload": stale_artifact.canonical_payload},
+                )
+        finally:
+            await transaction.rollback()
+
+
+async def test_adjustment_factor_action_order_delayed_receipt_and_correction(
+    engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+) -> None:
+    symbol = "FACACT"
+    sessions = (date(2026, 7, 8), date(2026, 7, 9), date(2026, 7, 10))
+    raw = await _seed_factor_raw_series(
+        engine,
+        symbol=symbol,
+        sessions=sessions,
+        closes=(200.0, 201.0, 202.0),
+    )
+    split_collection = _factor_split_collection(
+        symbol=symbol,
+        request_id="facact-splits",
+        start=sessions[0],
+        end=sessions[-1],
+        fetched_at=datetime(2026, 7, 10, 21, tzinfo=UTC),
+    )
+    old = _factor_dividend_collection(
+        symbol=symbol,
+        request_id="facact-old",
+        start=sessions[0],
+        end=sessions[-1],
+        ex_dividend_date=sessions[1],
+        cash_amount="0.40",
+        fetched_at=datetime(2026, 7, 10, 21, 1, tzinfo=UTC),
+    )
+    newer = _factor_dividend_collection(
+        symbol=symbol,
+        request_id="facact-newer",
+        start=sessions[0],
+        end=sessions[-1],
+        ex_dividend_date=sessions[1],
+        cash_amount="0.41",
+        fetched_at=datetime(2026, 7, 10, 21, 2, tzinfo=UTC),
+    )
+    action_store = SqlCorporateActionCollectionStore(engine)
+    await action_store.publish(split_collection)
+    assert await _publish_corporate_action_content(engine, old) == old.collection_id
+    await asyncio.sleep(0.01)
+    await action_store.publish(newer)
+    async with engine.begin() as conn:
+        delayed_old_receipt = (
+            await conn.execute(
+                _PUBLISH_CORPORATE_ACTION_RECEIPT,
+                {"collection_id": old.collection_id},
+            )
+        ).one()
+
+    cutoff = await _factor_database_now(engine)
+    newer_artifact = build_adjustment_factor_set(
+        symbol=symbol,
+        cutoff=cutoff,
+        raw_closes=raw,
+        split_collection_id=split_collection.collection_id,
+        splits=(),
+        dividend_collection_id=newer.collection_id,
+        dividends=_factor_dividend_versions(newer),
+    )
+    first_published = await SqlAdjustmentFactorSetStore(snapshot_builder_engine).publish(
+        newer_artifact
+    )
+    assert delayed_old_receipt.available_at <= newer_artifact.cutoff
+
+    stale_action_artifact = build_adjustment_factor_set(
+        symbol=symbol,
+        cutoff=cutoff,
+        raw_closes=raw,
+        split_collection_id=split_collection.collection_id,
+        splits=(),
+        dividend_collection_id=old.collection_id,
+        dividends=_factor_dividend_versions(old),
+    )
+    async with snapshot_builder_engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            with pytest.raises(DBAPIError, match="not newest for the exact cutoff scope"):
+                await conn.execute(
+                    _PUBLISH_ADJUSTMENT_FACTOR_SET,
+                    {"payload": stale_action_artifact.canonical_payload},
+                )
+        finally:
+            await transaction.rollback()
+
+    correction = _factor_dividend_collection(
+        symbol=symbol,
+        request_id="facact-correction",
+        start=sessions[0],
+        end=sessions[-1],
+        ex_dividend_date=sessions[1],
+        cash_amount="0.42",
+        fetched_at=datetime(2026, 7, 10, 21, 3, tzinfo=UTC),
+    )
+    await asyncio.sleep(0.01)
+    await action_store.publish(correction)
+    corrected_artifact = build_adjustment_factor_set(
+        symbol=symbol,
+        cutoff=await _factor_database_now(engine),
+        raw_closes=raw,
+        split_collection_id=split_collection.collection_id,
+        splits=(),
+        dividend_collection_id=correction.collection_id,
+        dividends=_factor_dividend_versions(correction),
+    )
+    corrected = await SqlAdjustmentFactorSetStore(snapshot_builder_engine).publish(
+        corrected_artifact
+    )
+    assert corrected.factor_set_id != first_published.factor_set_id
 
 
 async def test_forecast_evidence_schema_and_role_boundaries(
@@ -3356,3 +4863,218 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
                 .where(ForecastRun.idempotency_token_digest == race_digest)
             )
         ).scalar_one() == 1
+
+
+async def test_persisted_factor_to_adjusted_forecast_snapshot_live_chain(
+    engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+) -> None:
+    """Prove the exact action/factor/receipt evidence can seal and replay a snapshot."""
+
+    symbol = "MSFT"
+    runtime_maker = build_sessionmaker(engine)
+    builder_maker = build_sessionmaker(snapshot_builder_engine)
+    initial_cutoff = await database_snapshot_cutoff(builder_maker)
+    calendar = exchange_calendars.get_calendar(
+        "XNYS",
+        start="1990-01-01",
+        end="2100-12-31",
+    )
+    latest_session = latest_completed_xnys_session(initial_cutoff)
+    labels = calendar.sessions_window(pd.Timestamp(latest_session), -258)
+    sessions = tuple(label.date() for label in labels)
+    closes = tuple(100.0 + index * 0.05 + (index % 7) * 0.2 for index in range(len(sessions)))
+    assert len(sessions) == 258
+    await _seed_factor_raw_series(
+        engine,
+        symbol=symbol,
+        sessions=sessions,
+        closes=closes,
+        fetched_at=initial_cutoff,
+        allow_receipt_reconciliation=True,
+    )
+
+    split_collection = _factor_split_collection(
+        symbol=symbol,
+        request_id="msft-adjusted-snapshot-splits",
+        start=sessions[0],
+        end=sessions[-1],
+        fetched_at=initial_cutoff,
+    )
+    dividend_collection = _factor_dividend_collection(
+        symbol=symbol,
+        request_id="msft-adjusted-snapshot-dividends",
+        start=sessions[0],
+        end=sessions[-1],
+        ex_dividend_date=sessions[-2],
+        cash_amount=None,
+        fetched_at=initial_cutoff,
+    )
+    action_store = SqlCorporateActionCollectionStore(engine)
+    split_publication = await action_store.publish(split_collection)
+    dividend_publication = await action_store.publish(dividend_collection)
+    assert split_publication.event_count == dividend_publication.event_count == 0
+
+    factor_cutoff = await _factor_database_now(engine)
+    factor_result = await AdjustmentFactorBuilder(
+        runtime_maker,
+        SqlAdjustmentFactorSetStore(snapshot_builder_engine),
+    ).build(
+        AdjustmentFactorBuildSpec(
+            symbol=symbol,
+            coverage_start=sessions[0],
+            coverage_end=sessions[-1],
+            cutoff=factor_cutoff,
+        )
+    )
+    assert factor_result.artifact.split_collection_id == split_collection.collection_id
+    assert factor_result.artifact.dividend_collection_id == dividend_collection.collection_id
+    assert factor_result.publication.input_count == 258
+
+    snapshot_as_of = await database_snapshot_cutoff(builder_maker)
+    assert latest_completed_xnys_session(snapshot_as_of) == sessions[-1]
+    spec = AdjustedSnapshotBuildSpec(
+        symbol=symbol,
+        target="adjusted_close",
+        horizon_unit="trading_day",
+        as_of=snapshot_as_of,
+    )
+    snapshot_builder = AdjustedForecastSnapshotBuilder(builder_maker)
+    created = await snapshot_builder.build(spec)
+    replayed = await snapshot_builder.build(spec)
+    assert created.created is True
+    assert replayed.created is False
+    assert replayed.snapshot_id == created.snapshot_id
+    assert replayed.availability_checked_at == created.availability_checked_at
+    assert created.observation_count == 258
+    assert created.target_time_count == 252
+
+    async with runtime_maker() as session:
+        stored = (
+            await session.execute(
+                select(ForecastInputSnapshot).where(
+                    ForecastInputSnapshot.snapshot_id == created.snapshot_id
+                )
+            )
+        ).scalar_one()
+    payload = parse_snapshot_payload(bytes(stored.canonical_payload))
+    assert stored.target == payload.target == "adjusted_close"
+    assert stored.series_basis == payload.series_basis == "split_dividend_adjusted"
+    assert stored.resolution_policy_hash == ADJUSTED_RESOLUTION_POLICY_HASH
+    assert stored.availability_status == "passed"
+    assert stored.availability_rule_set_hash == ADJUSTED_AVAILABILITY_RULE_SET_HASH
+    assert stored.max_available_at == factor_result.publication.available_at
+    assert payload.availability.checked_at == created.availability_checked_at
+    assert len(payload.observations) == 258
+    assert (
+        payload.observations[-1].observed_at == calendar.session_close(labels[-1]).to_pydatetime()
+    )
+    assert payload.observations[-1].value == closes[-1]
+    assert all(
+        observation.available_at == factor_result.publication.available_at
+        for observation in payload.observations
+    )
+
+    sources = {source.name: source for source in payload.data_sources}
+    assert set(sources) == {
+        "polygon_dividends",
+        "polygon_open_close",
+        "polygon_splits",
+        "stockapi_adjustment_factors",
+    }
+    assert sources["polygon_splits"].snapshot_id == split_collection.collection_id
+    assert sources["polygon_splits"].max_available_at == split_publication.available_at
+    assert sources["polygon_dividends"].snapshot_id == dividend_collection.collection_id
+    assert sources["polygon_dividends"].max_available_at == dividend_publication.available_at
+    assert sources["stockapi_adjustment_factors"].snapshot_id == (
+        factor_result.artifact.factor_set_id
+    )
+    assert sources["stockapi_adjustment_factors"].max_available_at == (
+        factor_result.publication.available_at
+    )
+    assert sources["polygon_open_close"].snapshot_id.startswith("sha256:")
+
+    # Synthetic product-path proof only: serve the sealed adjusted snapshot
+    # through the production baseline service and archive exactly one run. This
+    # deliberately does not publish outcomes or calibration-cohort evidence.
+    async with runtime_maker() as session:
+        adjusted_runs_before = (
+            await session.execute(
+                select(func.count())
+                .select_from(ForecastRun)
+                .where(ForecastRun.snapshot_id == created.snapshot_id)
+            )
+        ).scalar_one()
+    assert adjusted_runs_before == 0
+
+    run_store = SqlForecastRunStore(
+        sessionmaker=runtime_maker,
+        identity_secret="live-gate-synthetic-adjusted-archive-secret",
+        resolution_policy_hash=ADJUSTED_RESOLUTION_POLICY_HASH,
+        availability_rule_set_hash=ADJUSTED_AVAILABILITY_RULE_SET_HASH,
+    )
+    forecast_service = SnapshotForecastService(
+        repository=SqlForecastInputSnapshotRepository(
+            runtime_maker,
+            trusted_availability_rule_set_hash=ADJUSTED_AVAILABILITY_RULE_SET_HASH,
+        ),
+        policy=ForecastServingPolicy(
+            resolution_policy_hash=ADJUSTED_RESOLUTION_POLICY_HASH,
+            trusted_availability_rule_set_hash=ADJUSTED_AVAILABILITY_RULE_SET_HASH,
+            target="adjusted_close",
+            series_basis="split_dividend_adjusted",
+        ),
+        code_version="live-gate-synthetic-adjusted-1",
+        run_store=run_store,
+    )
+    synthetic_request = ForecastRequest(
+        symbol=symbol,
+        horizon=2,
+        horizon_unit="trading_day",
+        target="adjusted_close",
+        snapshot_id=created.snapshot_id,
+        model="baseline_naive",
+        interval_coverages=[0.8],
+    )
+    synthetic_response = await forecast_service.forecast(synthetic_request)
+    assert synthetic_response.symbol == symbol
+    assert synthetic_response.target == "adjusted_close"
+    assert synthetic_response.provenance.snapshot_id == created.snapshot_id
+    assert synthetic_response.provenance.series_basis == "split_dividend_adjusted"
+    assert synthetic_response.provenance.lookahead_check.status == "passed"
+    assert len(synthetic_response.forecasts) == 2
+    assert {source.name for source in synthetic_response.provenance.data_sources} == set(sources)
+
+    async with runtime_maker() as session:
+        archived_runs = (
+            (
+                await session.execute(
+                    select(ForecastRun).where(ForecastRun.snapshot_id == created.snapshot_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(archived_runs) == 1
+    archived = archived_runs[0]
+    assert archived.forecast_id == synthetic_response.provenance.forecast_id
+    assert archived.target == "adjusted_close"
+    assert archived.series_basis == "split_dividend_adjusted"
+    assert archived.resolution_policy_hash == ADJUSTED_RESOLUTION_POLICY_HASH
+    assert archived.availability_rule_set_hash == ADJUSTED_AVAILABILITY_RULE_SET_HASH
+    assert archived.snapshot_id == created.snapshot_id
+
+    # The serving role can read the sealed result but cannot mutate it.
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            with pytest.raises(DBAPIError, match="permission denied"):
+                await conn.execute(
+                    text(
+                        "UPDATE forecast_input_snapshots SET symbol = symbol "
+                        "WHERE snapshot_id = :snapshot_id"
+                    ),
+                    {"snapshot_id": created.snapshot_id},
+                )
+        finally:
+            await transaction.rollback()

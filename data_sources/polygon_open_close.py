@@ -37,6 +37,12 @@ def _as_utc(value: datetime, label: str) -> datetime:
     return value.astimezone(UTC)
 
 
+def open_close_endpoint_identity(symbol: str, session_date: date) -> str:
+    """Return the guard identity for one exact unadjusted session request."""
+
+    return f"/v1/open-close/{symbol}/{session_date.isoformat()}?adjusted=false"
+
+
 class PolygonOpenCloseProvider(PolygonProvider):
     """Fetch raw regular-session daily OHLCV from ``/v1/open-close``."""
 
@@ -75,9 +81,11 @@ class PolygonOpenCloseProvider(PolygonProvider):
         bars: list[OHLCVBar] = []
         for session in sessions:
             session_date = session.date()
+            path = f"/v1/open-close/{sym}/{session_date.isoformat()}"
             payload = await self._get(
-                f"/v1/open-close/{sym}/{session_date.isoformat()}",
+                path,
                 {"adjusted": "false"},
+                endpoint=open_close_endpoint_identity(sym, session_date),
             )
             # The clock is deliberately sampled only after the complete response
             # has been received and decoded by ``_get``.

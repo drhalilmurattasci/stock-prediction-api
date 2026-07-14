@@ -57,13 +57,6 @@ _HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _BUILD_REVISION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _BUILD_REVISION_PATH = Path("/app/.stockapi-build-revision")
 
-#: Policy v1 deliberately serves raw closes only. Adjusted targets require the
-#: separate corporate-action ledger promised by the project doctrine; vendor-
-#: rewritten adjusted history is not relabelled as locally reproducible data.
-_SERIES_BASIS_BY_TARGET = {
-    "close": "raw",
-}
-
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
@@ -95,23 +88,37 @@ def read_build_revision(path: Path = _BUILD_REVISION_PATH) -> str | None:
 
 @dataclass(frozen=True)
 class ForecastServingPolicy:
-    """Operator-pinned resolution and trust identity for served forecasts."""
+    """One operator-pinned, single-target forecast policy epoch."""
 
     resolution_policy_hash: str
     trusted_availability_rule_set_hash: str
+    target: str = "close"
+    series_basis: str = "raw"
     input_timespan: str = "day"
     input_multiplier: int = 1
     seasonal_period: int = 5
 
+    def __post_init__(self) -> None:
+        expected_basis = {
+            "close": "raw",
+            "adjusted_close": "split_dividend_adjusted",
+        }.get(self.target)
+        if expected_basis is None or self.series_basis != expected_basis:
+            raise ValueError("forecast target and series basis are not one supported epoch")
+        if (
+            _HASH_PATTERN.fullmatch(self.resolution_policy_hash) is None
+            or _HASH_PATTERN.fullmatch(self.trusted_availability_rule_set_hash) is None
+        ):
+            raise ValueError("forecast policy identities must be SHA-256 content addresses")
+
     def series_basis_for(self, target: str) -> str:
-        basis = _SERIES_BASIS_BY_TARGET.get(target)
-        if basis is None:
+        if target != self.target:
             raise AppError(
                 f"target {target!r} has no servable series basis",
                 code="target_not_servable",
                 status_code=status.HTTP_409_CONFLICT,
             )
-        return basis
+        return self.series_basis
 
 
 def build_latest_snapshot_statement(
@@ -400,32 +407,75 @@ class SnapshotForecastService:
         return self._forecaster_factory(model)().model_version
 
 
-def build_forecast_service(
-    settings: Settings,
-    sessionmaker: async_sessionmaker[AsyncSession],
-) -> SnapshotForecastService | None:
-    """Build the snapshot-backed service, or ``None`` when serving is not enabled.
+@dataclass(frozen=True)
+class TargetRoutedForecastService:
+    """Route each target to its independently pinned policy/archive child."""
 
-    Unset hashes mean serving was never enabled (the route stays 501). A
-    malformed configured hash is an operator error and raises loudly instead of
-    silently downgrading to 501.
-    """
-    policy_hash = settings.forecast_resolution_policy_hash
-    trusted_hash = settings.forecast_trusted_availability_rule_set_hash
-    if policy_hash is None and trusted_hash is None:
+    services: tuple[SnapshotForecastService, ...]
+
+    def __post_init__(self) -> None:
+        targets = tuple(service.policy.target for service in self.services)
+        if not targets or len(set(targets)) != len(targets):
+            raise ValueError("target-routed forecast services must be nonempty and unique")
+
+    async def forecast(
+        self,
+        request: ForecastRequest,
+        *,
+        idempotency_key: str | None = None,
+        principal: str | None = None,
+    ) -> ForecastResponse:
+        service = next(
+            (candidate for candidate in self.services if candidate.policy.target == request.target),
+            None,
+        )
+        if service is None:
+            raise NotImplementedYet(
+                f"verified snapshot serving is not configured for target {request.target!r}",
+                details={"target": request.target},
+            )
+        return await service.forecast(
+            request,
+            idempotency_key=idempotency_key,
+            principal=principal,
+        )
+
+
+def _configured_policy_pair(
+    resolution_hash: str | None,
+    availability_hash: str | None,
+    *,
+    target: str,
+) -> tuple[str, str] | None:
+    if resolution_hash is None and availability_hash is None:
         return None
     if (
-        policy_hash is None
-        or trusted_hash is None
-        or _HASH_PATTERN.fullmatch(policy_hash) is None
-        or _HASH_PATTERN.fullmatch(trusted_hash) is None
+        resolution_hash is None
+        or availability_hash is None
+        or _HASH_PATTERN.fullmatch(resolution_hash) is None
+        or _HASH_PATTERN.fullmatch(availability_hash) is None
     ):
         raise AppError(
-            "forecast serving is misconfigured: both the resolution-policy hash "
-            "and the trusted availability rule-set hash must be sha256:<hex64>",
+            f"forecast serving for {target} is misconfigured: both the "
+            "resolution-policy hash and trusted availability rule-set hash "
+            "must be sha256:<hex64>",
             code="forecast_serving_misconfigured",
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            details={"target": target},
         )
+    return resolution_hash, availability_hash
+
+
+def _build_target_service(
+    *,
+    sessionmaker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    target: str,
+    series_basis: str,
+    hashes: tuple[str, str],
+    code_version: str | None,
+) -> SnapshotForecastService:
+    policy_hash, trusted_hash = hashes
     return SnapshotForecastService(
         repository=SqlForecastInputSnapshotRepository(
             sessionmaker,
@@ -434,9 +484,11 @@ def build_forecast_service(
         policy=ForecastServingPolicy(
             resolution_policy_hash=policy_hash,
             trusted_availability_rule_set_hash=trusted_hash,
+            target=target,
+            series_basis=series_basis,
             seasonal_period=settings.forecast_seasonal_period,
         ),
-        code_version=read_build_revision(),
+        code_version=code_version,
         run_store=SqlForecastRunStore(
             sessionmaker=sessionmaker,
             identity_secret=settings.jwt_secret,
@@ -444,3 +496,54 @@ def build_forecast_service(
             availability_rule_set_hash=trusted_hash,
         ),
     )
+
+
+def build_forecast_service(
+    settings: Settings,
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> SnapshotForecastService | TargetRoutedForecastService | None:
+    """Build the snapshot-backed service, or ``None`` when serving is not enabled.
+
+    Unset hashes mean serving was never enabled (the route stays 501). A
+    malformed configured hash is an operator error and raises loudly instead of
+    silently downgrading to 501.
+    """
+    raw_hashes = _configured_policy_pair(
+        settings.forecast_resolution_policy_hash,
+        settings.forecast_trusted_availability_rule_set_hash,
+        target="close",
+    )
+    adjusted_hashes = _configured_policy_pair(
+        settings.forecast_adjusted_close_resolution_policy_hash,
+        settings.forecast_adjusted_close_trusted_availability_rule_set_hash,
+        target="adjusted_close",
+    )
+    if raw_hashes is None and adjusted_hashes is None:
+        return None
+    code_version = read_build_revision()
+    children: list[SnapshotForecastService] = []
+    if raw_hashes is not None:
+        children.append(
+            _build_target_service(
+                sessionmaker=sessionmaker,
+                settings=settings,
+                target="close",
+                series_basis="raw",
+                hashes=raw_hashes,
+                code_version=code_version,
+            )
+        )
+    if adjusted_hashes is not None:
+        children.append(
+            _build_target_service(
+                sessionmaker=sessionmaker,
+                settings=settings,
+                target="adjusted_close",
+                series_basis="split_dividend_adjusted",
+                hashes=adjusted_hashes,
+                code_version=code_version,
+            )
+        )
+    if len(children) == 1:
+        return children[0]
+    return TargetRoutedForecastService(tuple(children))

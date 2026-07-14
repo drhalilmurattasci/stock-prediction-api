@@ -10,8 +10,8 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 
 ## Status
 
-🚧 **The fail-closed forecast/evidence substrate is code-complete through
-migration `0011`, but the product has not yet served a forecast over real
+🚧 **The fail-closed data/forecast evidence substrate is code-complete through
+migration `0013`, but the product has not yet served a forecast over real
 vendor data.**
 The repository now has API-key auth, bounded `/v1/prices` and `/v1/indicators`
 reads, versioned Polygon daily-bar ingestion, append-only restatement history, an
@@ -27,14 +27,36 @@ immutable policy registry and database-enforced receipt fence close the cutoff
 race; runtime outcome writes are possible only through a bounded canonical
 publisher that records the exact authorizing cohort member.
 
+Migrations `0012`-`0013` add the missing corporate-action and adjustment
+boundary: append-only content-addressed split/dividend collections and exact
+post-commit receipts, followed by immutable Decimal34 adjustment-factor sets,
+one factor per exact receipted raw bar version, and a later factor-set receipt.
+`GET /v1/prices/{symbol}/adjusted` requires an explicit immutable
+`factor_set_id`; it reconstructs every bound current-or-revision raw version,
+validates the complete factor window before applying a range or page, and
+returns split/dividend-adjusted OHLCV with factor, policy, action-collection,
+and raw-version lineage. It never resolves a mutable “latest” set or falls back
+to raw values.
+
 The initial builder policy is intentionally narrow: Massive/Polygon raw
 regular-session closes from `/v1/open-close` (source `polygon_open_close`) for
 `AAPL`, `MSFT`, `NVDA`, `QQQ`, and `SPY`; XNYS `trading_day` horizons; USD; 512
 observation capacity with a 258-observation minimum; and 252 real
-exchange-session target closes. Adjusted
-prices remain refused until the separate corporate-action ledger exists. The
-route also stays `501` until an operator explicitly pins the code-derived policy
-and availability hashes.
+exchange-session target closes. A separate adjusted-close snapshot policy can
+derive a sealed snapshot only from a receipted factor set and has independently
+pin-gated forecast serving. Raw and adjusted targets cannot cross policy epochs.
+The raw route stays `501` until its two code-derived identities are pinned; the
+`adjusted_close` target stays fail-closed until its own two identities are
+pinned and a compatible adjusted snapshot exists. The current outcome resolver,
+scheduled-evaluation cohorts, and calibration evidence remain deliberately
+raw-close-only.
+
+**Acceptance status — 2026-07-14.** The local empirical state was empty: the
+throwaway database was reset to zero market-data, corporate-action, factor,
+snapshot, forecast, outcome, and cohort evidence rows; `POLYGON_API_KEY` was
+absent; and no vendor request had ever run. There were therefore no real
+adjusted rows, real forecasts, matured outcomes, or calibration claims despite
+the code-complete paths above.
 
 `/v1/indicators/{symbol}` is the second implemented Phase 2 read surface. Version
 one is intentionally fixed to the raw daily `polygon_open_close` lane and the
@@ -45,17 +67,20 @@ and separates formula-policy, window-policy, and exact-input hashes. The endpoin
 is a current-snapshot calculation, not an availability-as-of reconstruction;
 later restatements can change a historical request, raw values can include
 unresolved corporate-action discontinuities, and it does not assert that the
-newest stored row is the latest completed session. The database is still empty,
-so this API work does not change the real-data/product status above.
+newest stored row is the latest completed session. At the dated acceptance
+checkpoint above the database was empty; this API surface alone is not evidence
+of a real-data forecast.
 
 Unit/static gates cover the evidence substrate. The destructive TimescaleDB
-integration gate now passes through migration `0011` on real PostgreSQL 17.
+integration gate now passes through migration `0013` on real PostgreSQL 17.
 `run-live-gate.ps1` is hard-bound to the designated `stockapi_test` throwaway
 database and checks the complete migration chain, exact
 runtime/builder role boundaries, restatement history, historical point-in-time
 snapshot reconstruction, archived serving, schema-validated keyed replay, and
 the outcome/cohort hash, exact-receipt, immutability, role-boundary, and
-pre-outcome sealing constraints. It also drives the owned outcome resolver
+pre-outcome sealing constraints. It also proves immutable corporate-action
+collections, exact action receipts, Decimal34 factor publication, exact raw-bar
+receipt binding, and factor-table immutability. It drives the owned outcome resolver
 through a direct receipt-writer race across the cutoff, proves fresh
 READ-COMMITTED visibility, and tests frozen-cutoff restatement behavior. A
 clearly labelled synthetic throwaway target exercises the successful DB
@@ -64,16 +89,46 @@ not evidence of a real market outcome.
 Ordinary test runs still skip that gate when
 its explicit live-database environment is absent. The first real
 Massive/Polygon call remains a separate credentialed smoke gate.
-That gate now has a one-attempt, fail-closed operator command documented in
+That gate has a one-attempt, fail-closed operator command documented in
 `INSTALL.md`; no vendor request runs as part of ordinary verification. The next
-history step is also scaffolded but has not run: a clean-commit-bound MSFT plan
-derives the exact final 258 XNYS sessions, then a separately authorized,
-no-auto-retry backfill checkpoints one bar and exact availability receipt per
-request at a hard 5/60 pace. Its append-only local ledger makes late failures
-resumable and ambiguous crashes fail closed. All controlled Polygon ingestion,
-smoke, and backfill paths share one vendor-wide PostgreSQL operation lock.
-The final no-vendor step is also scaffolded: a read-only plan binds the completed
-backfill, clean commit, database clock, policy hashes, and API auth configuration;
+history step is now a typed combined acquisition lane, not an unscoped
+backfill. Its read-only plan covers the exact final 258 XNYS sessions plus one
+complete split page and one complete dividend page over the same window. From
+the empty state after a successful one-bar smoke, the expected authorization is
+exactly **259 outbound attempts: 1 split + 1 dividend + 257 open-close**. The
+executor sends actions first, disables HTTP retries, checkpoints every exact
+receipt, enforces one global 5/60 budget, and records typed reservations and
+outcomes in an ignored append-only ledger. A code revision, session rollover,
+database receipt, or unresolved prior attempt invalidates or blocks the plan.
+All controlled Polygon vendor-ingestion operator paths share one vendor-wide
+PostgreSQL operation lock.
+
+The acquisition plan itself is safe to inspect before any vendor credential or
+grant:
+
+```powershell
+.\run-vendor-acquisition.ps1 -Mode plan -End YYYY-MM-DD
+```
+
+It accepts no authorization fields, cannot call the vendor, and binds the clean
+local commit without requiring or performing a push. With no smoke anchor it
+reports `blocked`; it never substitutes another session date.
+
+After acquisition is complete, adjusted evidence has a separate low-level
+builder primitive: `ingestion.tasks.seal_adjusted_forecast_snapshot`. Inside an
+exact revision-attested `stockapi_snapshot_builder` image, it can publish or
+exact-replay one MSFT factor set at an operator-plan-bound cutoff and seal or
+replay one adjusted-close snapshot at the later factor-receipt time. It performs
+no vendor I/O and does not enable Celery. It also is not yet a complete host
+operator: no read-only adjusted-seal planner or PowerShell attestation wrapper
+currently binds the cutoff, detached image, actor exclusions, and HTTP proof.
+Do not invoke the primitive ad hoc. The raw-close demo remains the only complete
+end-to-end host proof, and adjusted outcomes, cohorts, and calibration remain
+excluded.
+
+The final raw-close, no-vendor step is also scaffolded: a read-only plan binds the
+completed price acquisition, clean commit, database clock, raw policy hashes,
+and API auth configuration;
 its separately authorized execution uses one short-lived least-privilege builder
 container, then proves the real loopback route returns `401` without a key and
 `200` with the configured key. It never starts the ordinary worker or Beat.
@@ -88,8 +143,9 @@ uv run alembic upgrade head   # apply migrations
 make api                      # uvicorn app.main:app --reload  ->  http://localhost:8000/docs
 ```
 
-Before enabling snapshot creation/forecast serving, print and pin the exact
-policy identities:
+Before enabling snapshot creation/forecast serving, print the exact raw and
+adjusted policy identities and pin only the target epochs intentionally being
+enabled:
 
 ```bash
 uv run python -m ingestion.tasks.build_forecast_snapshots --print-policy-hashes
@@ -101,7 +157,8 @@ privileged snapshot builder, or Beat. Persistent actors live behind the separate
 Polygon lanes) a positive finite process budget. See [INSTALL.md](INSTALL.md)
 for role bootstrap and the live database gate. For the bounded milestone proof,
 use `run-forecast-demo.ps1`; its one-shot builder does not enable Celery
-automation. Compose publishes the API on loopback only. That proof builds from
+automation and remains deliberately raw-close-only. Compose publishes the API
+on loopback only. That proof builds from
 the exact reviewed Git commit and pins both API and one-shot builder execution
 to revision-labelled immutable image IDs.
 
@@ -147,6 +204,8 @@ budget, then use `make up-automation` only under an approved runbook.
 |---|---|
 | [STOCK_API_MASTER_PLAN.md](STOCK_API_MASTER_PLAN.md) | Master plan — overview, doctrine, not-to-do list, tech stack, full feature catalog of 14 APIs/frameworks, phased roadmap |
 | [INSTALL.md](INSTALL.md) | Start-to-finish installation guide (Windows) — WSL2, Docker, uv, Python 3.12, infra stack, smoke tests |
+| [docs/architecture.md](docs/architecture.md) | Implemented trust boundaries for raw bars, corporate actions, factors, snapshots, serving, and evidence |
+| [scripts/README.md](scripts/README.md) | Exact operator planning, authorization, budget, and recovery contracts |
 
 ## Tech stack (committed)
 

@@ -250,10 +250,12 @@ DATABASE_MAX_OVERFLOW=5
 DATABASE_POOL_TIMEOUT=30
 API_STATEMENT_TIMEOUT_MS=5000
 
-# Blank keeps snapshot creation and /v1/forecast fail-closed. Print the exact
-# current values with the command documented below before enabling.
+# Each target epoch requires its own complete pair. Blank keeps that target's
+# snapshot creation/forecast serving fail-closed. Print exact values below.
 FORECAST_RESOLUTION_POLICY_HASH=
 FORECAST_TRUSTED_AVAILABILITY_RULE_SET_HASH=
+FORECAST_ADJUSTED_CLOSE_RESOLUTION_POLICY_HASH=
+FORECAST_ADJUSTED_CLOSE_TRUSTED_AVAILABILITY_RULE_SET_HASH=
 FORECAST_SEASONAL_PERIOD=5
 
 # ---- Redis (cache + rate-limit counters) ----
@@ -473,7 +475,8 @@ First run pulls images (TimescaleDB, Redis) and the MLflow container pip-install
 Fresh databases create the fixed, non-owner `stockapi_app` and
 `stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
 Existing initialized database directories do not rerun Docker init scripts;
-bootstrap both roles once before applying migrations `0007` through `0010`:
+bootstrap both roles once before applying migrations `0007` through the current
+head, `0013_adjustment_factors`:
 
 ```powershell
 docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh
@@ -490,8 +493,9 @@ The native `.env` workflow is a convenience boundary, not hard secret
 isolation: every local Python process can read that file. Use Compose or inject
 per-process environments when validating credential separation.
 
-Print the content-derived policy identities, copy both values into `.env`, then
-start the serving-only API tier when you are ready to enable raw-close forecasts:
+Print the content-derived policy identities. The command emits separate raw and
+adjusted pairs; copy only a complete pair into `.env` when intentionally enabling
+that target epoch, then start the serving-only API tier:
 
 ```powershell
 uv run python -m ingestion.tasks.build_forecast_snapshots --print-policy-hashes
@@ -557,16 +561,19 @@ afterward. Both wrapper and test module independently enforce the exact local
 owner target; the wrapper also refuses to reset while API/Celery/uvicorn
 processes could race it. All mutating operator wrappers share one machine-wide
 mutex, and the fixture holds the same PostgreSQL vendor-operation advisory lock
-used by direct smoke/backfill/demo lanes across reset and teardown. The module
+used by direct smoke/acquisition/backfill/demo lanes across reset and teardown. The module
 fixture then drops its seeded test data and reapplies
-migrations, leaving an empty schema at migration head so the later vendor smoke
+migrations, leaving an empty schema at migration head `0013` so the later vendor smoke
 still proves absence. It never makes a vendor call.
 
 ✅ When all rows pass, the database migration, privilege, revision, immutable
 snapshot, runtime-role serving, API-key short circuit, authenticated HTTP
 forecast, realized-outcome hash/exact-receipt, resolver cutoff, exact race
 replay, post-cutoff restatement, and cohort post-commit sealing boundaries are
-proven. Polygon credentials and Celery/Beat remain outside this destructive
+proven. The gate also proves immutable corporate-action collections and
+receipts, Decimal34 adjustment-factor publication, exact raw-version binding,
+and factor-table role/immutability boundaries. Polygon credentials and
+Celery/Beat remain outside this destructive
 gate. A labelled synthetic throwaway target exercises the successful
 publisher/store/source-link path and forged-snapshot refusal, but is not a real
 market outcome. The gate does not pretend that a newly sealed real XNYS cohort
@@ -601,9 +608,110 @@ holds a non-blocking PostgreSQL advisory lock from the absence precheck through
 the post-commit receipt proof, so direct module invocations also fail closed on
 contention. Success requires both the exact bar and its DB-stamped post-commit
 availability receipt. It does not build a snapshot or serve a forecast; those
-remain behind the separately budgeted backfill gate below.
+remain behind the separately budgeted typed acquisition and local build gates
+below.
 
-### Separately authorized, resumable MSFT backfill
+### Separately authorized typed corporate-action + price acquisition
+
+The one-request smoke authorizes only that one bar. The adjusted-data history
+lane has a separate read-only planner and a typed global budget covering both
+corporate actions and missing open-close sessions. Planning needs no vendor key
+and cannot make a vendor request:
+
+```powershell
+.\run-vendor-acquisition.ps1 -Mode plan -End YYYY-MM-DD
+```
+
+`-End` must be the latest completed XNYS session and must be named again in any
+later authorization. The plan binds the clean local Git commit, exact 258-session
+MSFT price window, both exact corporate-action query scopes and query-policy
+hash, current price/action receipts, both attempt ledgers, ordered typed calls,
+and the hard 5-calls-per-60-seconds pace into `plan_id` and `calls_sha256`. It
+does not require the commit to be pushed and never performs a push.
+
+Interpret the result before asking for authorization:
+
+- `blocked`: the latest-session smoke receipt is absent, an action scope has
+  ambiguous repair candidates, or a prior unresolved reservation overlaps the
+  required call set. Do not execute.
+- `ready`: the plan identifies an exact nonempty call set or receipt-only
+  repairs.
+- `complete`: all 258 price receipts and both complete action-collection
+  receipts exist. Do not execute.
+
+Immediately after the destructive live gate, the cleaned throwaway database has
+no smoke anchor, so an acquisition plan is correctly `blocked`. Once the
+separately authorized one-bar smoke succeeds, and assuming no other data exists,
+the expected acquisition allocation is exactly **259 outbound attempts**:
+
+| call kind | exact ceiling | purpose |
+|---|---:|---|
+| `split_page` | 1 | one complete, bounded MSFT split collection |
+| `dividend_page` | 1 | one complete, bounded MSFT dividend collection |
+| `open_close` | 257 | the remaining sessions in the 258-session window |
+| **global** | **259** | one non-renewing authorization budget |
+
+At 5 calls per 60 seconds this is roughly 52 minutes plus network/database time.
+The owner grant must name MSFT, `window_start`, `window_end`, `tool_revision`,
+`plan_id`, `calls_sha256`, the exact three-part allocation, the global 259-call
+ceiling, the 5/60 pace, and a fresh lowercase `authorization_id`. The fixed
+sentinel below is only a mechanical check; it cannot substitute for that grant.
+
+With those exact freshly reviewed values, execution is:
+
+```powershell
+.\run-vendor-acquisition.ps1 `
+  -Mode execute `
+  -End YYYY-MM-DD `
+  -PlanId sha256:<64-hex-plan-id> `
+  -MaxCalls 259 `
+  -SplitCalls 1 `
+  -DividendCalls 1 `
+  -OpenCloseCalls 257 `
+  -Authorization stockapi-msft-acquisition-only `
+  -AuthorizationId msft-acquisition-YYYYMMDD-a
+```
+
+The wrapper reads the key only from ignored `.env`, pins the local Docker
+Desktop daemon/project, and refuses worker/Beat or another mutating operator.
+The Python lane holds the vendor-wide PostgreSQL lock, independently re-plans,
+requires the exact typed ceilings to equal the current call set, and reserves
+each call in `data/vendor_acquisition_attempts.jsonl` before HTTP. Split and
+dividend pages run first; each page must be complete and pagination-exhausted.
+Missing open-close sessions follow in ascending order. HTTP retries are disabled,
+session currency is rechecked after pacing, and exact content plus its later
+database receipt is verified before the next call.
+
+Preserve both ignored ledgers: the combined lane also imports unresolved state
+from the older `data/vendor_backfill_attempts.jsonl`. Recovery is fail-closed:
+
+- If only receipts are absent for already committed content, re-plan and run:
+
+  ```powershell
+  .\run-vendor-acquisition.ps1 `
+    -Mode repair `
+    -End YYYY-MM-DD `
+    -PlanId sha256:<current-plan-id>
+  ```
+
+  This performs database receipt writes but makes zero vendor calls.
+- A caught failed attempt has a terminal outcome. Re-plan and obtain a new grant
+  and authorization ID for only the remaining typed call set.
+- An unresolved reservation overlapping a required call is an unknown
+  request/checkpoint outcome. Stop for independent vendor/database forensics;
+  there is no automatic or destructive clear switch.
+
+Success requires zero remaining calls and repairs, exactly 258 price receipts,
+and one complete receipted collection for each action type. Acquisition does not
+itself publish an adjustment-factor set, seal a forecast snapshot, or authorize
+an outcome/cohort write.
+
+### Lower-level price-only backfill (not the adjusted-data runbook)
+
+The older price-only lane remains useful for focused recovery and its coverage
+planner is reused by the typed acquisition implementation. Do **not** use it as
+the initial adjusted-data milestone: it cannot acquire or authorize corporate
+actions. The combined lane above is the owner runbook.
 
 The history pull is not covered by the one-request smoke authorization. Run it
 only from a reviewed, clean commit with the ordinary worker and Beat stopped.
@@ -680,8 +788,75 @@ authorization ID. Recovery is fail-closed:
 
 Success reports 258 required sessions, zero remaining sessions, and equal
 `attempts_reserved`/`attempts_spent`. Re-run `plan` to independently obtain
-`status: complete`; only then proceed to snapshot sealing and authenticated
-forecast serving.
+`status: complete`; only then proceed to an explicitly reviewed factor or raw
+snapshot build.
+
+### Factor publication and adjusted-serving boundary
+
+A complete typed acquisition supplies inputs; it does not silently manufacture
+derived evidence. The implemented factor path is:
+
+1. `AdjustmentFactorBuilder` resolves one exact cutoff, 258-session raw series,
+   and exact complete split/dividend collections with their receipts.
+2. The pure pinned policy computes canonical Decimal34 price/volume factors and
+   publishes the exact IEEE-754 bits consumers must use.
+3. `SqlAdjustmentFactorSetStore` publishes immutable content and entries, then a
+   distinct later `adjustment_factor_set_availability` receipt.
+4. `GET /v1/prices/{symbol}/adjusted` accepts only the resulting explicit
+   `factor_set_id`; it validates every exact raw version before filtering or
+   paginating and fails closed instead of selecting “latest” or returning raw.
+
+The implemented low-level primitive is
+`ingestion.tasks.seal_adjusted_forecast_snapshot`. Its exact interface contract
+is shown here for review, **not as a direct host runbook**:
+
+```text
+python -m ingestion.tasks.seal_adjusted_forecast_snapshot \
+  --end YYYY-MM-DD \
+  --factor-cutoff <aware-ISO-8601-plan-cutoff> \
+  --tool-revision <40-hex-reviewed-commit> \
+  --authorization stockapi-msft-adjusted-seal-only
+```
+
+The primitive makes no vendor call and is not a Celery task. It refuses any
+database except `stockapi_snapshot_builder@timescaledb:5432/stockapi_test`, any
+non-local environment, or an image whose baked `/app/.stockapi-build-revision`
+does not exactly equal `--tool-revision`. It requires both adjusted hashes to
+match the running code, an exact 258-session MSFT/current-XNYS window, and the
+operator-plan-bound factor cutoff. Fresh database-clock checks before and after
+factor publication reject future cutoffs, session rollover, and insufficient
+rollover margin. The factor's later receipt becomes the deterministic adjusted
+snapshot `as_of`; exact factor and snapshot replays are allowed, and persisted
+snapshot lineage is reread and verified before success. Its sanitized JSON
+names the factor/snapshot IDs, cutoff and receipt times, counts, and policy
+hashes.
+
+There is **not yet** a complete adjusted-seal host controller: no read-only plan
+currently derives and binds `--factor-cutoff`, and no PowerShell wrapper builds
+the exact detached revision, pins the immutable image, excludes competing
+actors, revalidates the plan, and surfaces the resulting adjusted forecast over
+HTTP. Do not improvise a direct invocation. The fixed sentinel is only a
+low-level refusal check; neither it nor the vendor acquisition grant supplies
+authority for the local factor/snapshot writes. `run-forecast-demo.ps1` remains
+the only complete end-to-end local host proof, and it is raw-close-only.
+
+Once a reviewed controller has published an exact factor ID, the adjusted-price
+read shape is:
+
+```text
+GET /v1/prices/MSFT/adjusted?factor_set_id=sha256:<64-hex-id>&limit=100
+```
+
+The response includes the factor/policy identities, exact split and dividend
+collection receipts, action version IDs, full raw coverage, raw-version receipt
+identity per returned row, receipt-derived availability, and a keyset `next_end`.
+The existing raw `/v1/prices/{symbol}` response remains unchanged.
+
+Adjusted-close target-routed forecast serving uses the snapshot above and its
+own pair of hashes printed by `--print-policy-hashes`. The outcome resolver,
+scheduled-evaluation cohorts, and calibration evidence remain raw-close-only,
+so an adjusted forecast must not be represented as a matured/scored cohort or
+calibration result.
 
 ### Separately authorized local seal-and-serve proof
 
@@ -689,7 +864,8 @@ This step makes **no vendor request**. It does make one idempotent insert into
 `forecast_input_snapshots` (or proves an exact replay) and starts the local API,
 so review a fresh read-only plan before authorizing it. Prerequisites are:
 
-- the backfill plan reports all 258 exact MSFT receipts complete;
+- the typed acquisition reports complete and the shared price planner confirms
+  all 258 exact MSFT receipts;
 - `.env` pins both hashes printed by the policy command;
 - `.env` contains exactly one non-empty `API_KEYS` value; and
 - `.env` contains a non-default ASCII `JWT_SECRET` of at least 32 characters
@@ -702,7 +878,7 @@ Plan without starting the API or writing a snapshot:
 .\run-forecast-demo.ps1 -Mode plan -End YYYY-MM-DD
 ```
 
-`status: ready` binds the exact backfill/version state, stable maximum receipt
+`status: ready` binds the exact acquired price/version state, stable maximum receipt
 cutoff, database-clock session, clean `tool_revision`, policy identities, local
 runtime/broker targets, secret-safe API-key identity, bounded session-rollover
 margin, and fixed five-step `baseline_naive` request into `plan_id`. A newer
@@ -750,8 +926,8 @@ provenance additionally requires digest-pinned bases and signed artifacts.
 
 Success is the demo milestone: one immutable point-in-time snapshot and one
 real authenticated forecast response. The local API remains available on
-loopback for inspection; vendor backfill authorization is neither implied nor
-consumed by this step. Planning/execution refuse inside a ten-minute guard band
+loopback for inspection; vendor acquisition/backfill authorization is neither
+implied nor consumed by this step. Planning/execution refuse inside a ten-minute guard band
 before the next XNYS close. If the session nevertheless advances after the
 snapshot commits, the command exits `3` with an explicit nonsecret
 `sealed_session_advanced` receipt (including the snapshot ID) instead of hiding
@@ -798,7 +974,7 @@ docker compose up -d                 # infra
 .\.venv\Scripts\Activate.ps1         # python env
 uvicorn app.main:app --reload        # api
 # Persistent workers and Beat remain stopped during ordinary development.
-# Separately authorized smoke/backfill/demo wrappers use bounded one-shot paths.
+# Separately authorized smoke/acquisition/backfill/demo wrappers use bounded one-shot paths.
 
 # Stop
 docker compose stop                  # stop containers, keep data

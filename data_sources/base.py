@@ -10,6 +10,7 @@ carries its ``source`` and the ``fetched_at`` time it was retrieved.
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -17,6 +18,14 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 # --- literals ---------------------------------------------------------------
 Timespan = Literal["minute", "hour", "day", "week", "month"]
 AdjustmentBasis = Literal["raw", "split_adjusted", "split_dividend_adjusted"]
+SplitAdjustmentType = Literal["forward_split", "reverse_split", "stock_dividend"]
+DividendDistributionType = Literal[
+    "recurring",
+    "special",
+    "supplemental",
+    "irregular",
+    "unknown",
+]
 
 
 # --- errors -----------------------------------------------------------------
@@ -111,28 +120,91 @@ class SecurityRef(_DTO):
 class Split(_DTO):
     """A stock split (ratio = split_to / split_from)."""
 
+    provider_event_id: str = Field(min_length=1)
     symbol: str
     execution_date: date
-    split_from: float = Field(gt=0)
-    split_to: float = Field(gt=0)
-    source: str
+    split_from: Decimal = Field(gt=Decimal("0"), strict=True)
+    split_to: Decimal = Field(gt=Decimal("0"), strict=True)
+    adjustment_type: SplitAdjustmentType
+    historical_adjustment_factor: Decimal = Field(gt=Decimal("0"), strict=True)
+    source: str = Field(min_length=1)
     fetched_at: AwareDatetime
 
 
 class Dividend(_DTO):
     """A cash dividend / distribution."""
 
+    provider_event_id: str = Field(min_length=1)
     symbol: str
     ex_dividend_date: date
-    cash_amount: float = Field(ge=0)
+    cash_amount: Decimal = Field(gt=Decimal("0"), strict=True)
+    split_adjusted_cash_amount: Decimal = Field(gt=Decimal("0"), strict=True)
+    historical_adjustment_factor: Decimal = Field(gt=Decimal("0"), strict=True)
     currency: str | None = None
     pay_date: date | None = None
     record_date: date | None = None
     declaration_date: date | None = None
-    frequency: int | None = None
-    dividend_type: str | None = None
-    source: str
+    frequency: int | None = Field(default=None, ge=0)
+    distribution_type: DividendDistributionType
+    source: str = Field(min_length=1)
     fetched_at: AwareDatetime
+
+
+class CorporateActionPage(_DTO):
+    """One complete, bounded provider page plus empty-page provenance."""
+
+    provider_request_id: str = Field(min_length=1)
+    provider_origin: str = Field(min_length=1)
+    endpoint: str = Field(min_length=1)
+    symbol: str = Field(min_length=1)
+    start: date
+    end: date
+    source: str = Field(min_length=1)
+    fetched_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> CorporateActionPage:
+        if self.start > self.end:
+            raise ValueError("start must be on or before end")
+        return self
+
+
+class SplitPage(CorporateActionPage):
+    """A complete one-page split response for an inclusive date window."""
+
+    action_kind: Literal["splits"] = "splits"
+    results: tuple[Split, ...]
+
+    @model_validator(mode="after")
+    def _validate_results(self) -> SplitPage:
+        for result in self.results:
+            if (
+                result.symbol != self.symbol
+                or result.source != self.source
+                or result.fetched_at != self.fetched_at
+                or not self.start <= result.execution_date <= self.end
+            ):
+                raise ValueError("split result does not match its page provenance")
+        return self
+
+
+class DividendPage(CorporateActionPage):
+    """A complete one-page dividend response for an inclusive date window."""
+
+    action_kind: Literal["dividends"] = "dividends"
+    results: tuple[Dividend, ...]
+
+    @model_validator(mode="after")
+    def _validate_results(self) -> DividendPage:
+        for result in self.results:
+            if (
+                result.symbol != self.symbol
+                or result.source != self.source
+                or result.fetched_at != self.fetched_at
+                or not self.start <= result.ex_dividend_date <= self.end
+            ):
+                raise ValueError("dividend result does not match its page provenance")
+        return self
 
 
 # --- protocols --------------------------------------------------------------
@@ -176,6 +248,18 @@ class MarketDataProvider(Protocol):
 
     async def search_securities(self, query: str, *, limit: int = 20) -> list[SecurityRef]: ...
 
-    async def get_splits(self, symbol: str) -> list[Split]: ...
+    async def get_splits(
+        self,
+        symbol: str,
+        *,
+        start: date,
+        end: date,
+    ) -> SplitPage: ...
 
-    async def get_dividends(self, symbol: str) -> list[Dividend]: ...
+    async def get_dividends(
+        self,
+        symbol: str,
+        *,
+        start: date,
+        end: date,
+    ) -> DividendPage: ...

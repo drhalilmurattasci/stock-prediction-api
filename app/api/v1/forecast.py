@@ -85,8 +85,9 @@ async def get_forecast(
         ForecastTarget,
         Query(
             description=(
-                "Forecast target. Policy v1 serves only raw close; other contract values "
-                "currently return 409."
+                "Forecast target. Raw close and locally reproducible split/dividend-adjusted "
+                "close use separate operator-pinned policy epochs; unconfigured targets fail "
+                "closed."
             )
         ),
     ] = "close",

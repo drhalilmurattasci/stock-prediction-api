@@ -80,11 +80,18 @@ class Settings(BaseSettings):
     # the server will honor. There are no defaults on purpose.
     forecast_resolution_policy_hash: str | None = None
     forecast_trusted_availability_rule_set_hash: str | None = None
+    # Adjusted-close serving is a separate policy epoch.  Keeping distinct
+    # pins prevents an adjusted snapshot or archived run from being validated
+    # under the raw-close policy merely because both share one API route.
+    forecast_adjusted_close_resolution_policy_hash: str | None = None
+    forecast_adjusted_close_trusted_availability_rule_set_hash: str | None = None
     forecast_seasonal_period: int = Field(default=5, ge=2)
 
     @field_validator(
         "forecast_resolution_policy_hash",
         "forecast_trusted_availability_rule_set_hash",
+        "forecast_adjusted_close_resolution_policy_hash",
+        "forecast_adjusted_close_trusted_availability_rule_set_hash",
         mode="before",
     )
     @classmethod

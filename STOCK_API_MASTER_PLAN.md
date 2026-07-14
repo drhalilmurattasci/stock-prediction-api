@@ -137,11 +137,33 @@ The service is a Python 3.12 application built on **FastAPI** with full async I/
 
 - **TimescaleDB** (a Postgres extension) is the system of record for all OHLCV and time-series data. Bars live in hypertables partitioned by time (and space-partitioned by symbol where volume warrants), with continuous aggregates materializing 1m -> 5m -> 1h -> 1d rollups, native compression on older chunks, and retention policies. Using a Timescale-flavored Postgres rather than a separate TSDB means time-series and relational data share one engine, one backup story, and one SQL dialect.
 - **Postgres** (the same cluster) holds relational metadata: instruments, symbol mappings, corporate actions, users, API keys, model/run registry pointers, and prediction audit records.
+- **Implemented immutable market evidence (migration head `0013`)** keeps raw daily bars plus append-only restatement history and exact later publication receipts; content-addressed complete split/dividend collections plus later receipts; and Decimal34 adjustment-factor sets binding both action receipts and every exact raw-bar version/receipt. Adjusted prices are derived from published factor bits on read, never written back over raw history.
 - **Redis is split by durability semantics:** `redis-cache` handles response/feature caching and rate-limit counters with LRU eviction and no persistence; `redis-celery` is dedicated to the Celery broker/result backend with AOF persistence and `noeviction`. Pub/sub remains available for fan-out of fresh-bar events, but cache eviction can never delete queued work.
 
 #### Ingestion / Orchestration
 
 We standardize on **Celery + Celery Beat**. Rationale: Celery already has to exist in this stack because synchronous model inference, batch backtests, and heavy feature computation must run off the request thread, and Redis is already deployed as the broker. Adding **Prefect** would mean a second scheduler, a second worker pool, and a second operational surface for the same job: "pull data on a schedule, retry on failure." Beat handles cron-style scheduled pulls (e.g., EOD fundamentals, intraday bar polling, news sweeps); Celery handles retries, rate-limit-aware backoff, idempotent upserts, and concurrency control. If DAG-style data lineage and a richer observability UI become a real requirement later (complex multi-stage backfills, cross-dataset dependencies), Prefect is the migration target — but we do not pay for it on day one.
+
+Unattended automation is separately fenced and default-off. The first MSFT data
+milestone uses reviewed one-shot operators instead: one exact smoke request, then
+a read-only content-addressed acquisition plan whose expected otherwise-empty,
+post-smoke allocation is 1 complete split page + 1 complete dividend page + 257
+missing open-close requests. Execution requires that exact 259-call typed allocation,
+uses one non-renewing global 5/60 budget, disables HTTP retries, persists an
+append-only reservation before each request, and checkpoints exact content and
+its later receipt before continuing. This operator lane is not authority to
+start Celery/Beat or any other vendor workload.
+
+Derived adjusted evidence remains a separate local-write gate. The implemented
+low-level `ingestion.tasks.seal_adjusted_forecast_snapshot` primitive performs
+no vendor I/O and is not a Celery task; inside an exact revision-attested
+least-privilege builder image it publishes/replays one MSFT factor set at an
+operator-plan-bound cutoff and seals/replays one snapshot at the later factor
+receipt. Its end session, aware factor cutoff, reviewed revision, and two
+adjusted policy identities are enforced independently of the 259-call
+acquisition budget. A read-only adjusted-seal planner and complete PowerShell
+host attestation/HTTP controller have not landed, so this primitive is not yet a
+direct operator runbook. Neither lane requires or performs a push.
 
 #### ML / Modeling
 
@@ -166,6 +188,16 @@ Backtesting / evaluation is trust-core IP we own: a small, explicit walk-forward
 #### Serving
 
 Models are served behind the same **FastAPI** app via a dedicated prediction router that loads versioned artifacts resolved from the MLflow registry (cached in-process, refreshed on promotion). Heavy/batch inference is dispatched to Celery; low-latency single-symbol predictions run inline with Redis-cached results. **BentoML** is the escape hatch if we need independent scaling, adaptive batching, or GPU-backed model servers separate from the API tier. Critically, the API serves **only derived predictions** — forecasts, intervals, signals, scores, and our own computed analytics. We never redistribute raw vendor market data; this is both a licensing requirement and the core product boundary.
+
+The implemented first serving boundary is snapshot-backed rather than
+MLflow-selected. Raw and split/dividend-adjusted close use independent
+operator-pinned resolution/availability hashes and target routing. Public
+adjusted OHLCV is a separate
+`GET /v1/prices/{symbol}/adjusted?factor_set_id=...` surface requiring one exact
+immutable factor identity; it validates the complete bound raw window before
+range filtering or keyset pagination and never resolves “latest” or falls back
+to raw. Adjusted-close forecast snapshots and serving do not widen the raw-only
+outcome/cohort/calibration policy.
 
 #### Data Sources (committed)
 
@@ -822,6 +854,17 @@ Sources:
 
 ## 6. Phased Roadmap & Delivery Plan
 
+**Implementation checkpoint — 2026-07-14.** P0 is complete. P1 now has a
+live-Postgres-proven daily-price, corporate-action collection, and immutable
+adjustment-factor substrate plus typed bounded acquisition tooling, but no real
+vendor request/evidence is recorded and fundamentals, news, broad-universe
+coverage, refresh automation, and data-quality operations remain. P2 implements
+bounded raw prices, explicit factor-pinned adjusted prices, and the owned
+indicator bundle; fundamentals/news/search and a public corporate-action read
+surface remain. P3 has raw and factor-backed adjusted snapshot/serving machinery,
+baselines, archives, and raw-close outcome/cohort evidence, but no real forecast,
+matured outcome, fitted calibration artifact, or empirical coverage claim.
+
 P0 — Foundations
 - **Goal:** Stand up the skeleton, contracts, and guardrails so every later phase ships against a stable spine.
 - **Deliverables / features:**
@@ -905,12 +948,18 @@ API endpoints we'll expose (sequenced by phase):
 
 - `GET /healthz`, `GET /readyz` — liveness/readiness probes *(P0)*
 - `GET /v1/symbols` — symbol search & security metadata *(P1/P2)*
-- `GET /v1/prices` — raw & adjusted OHLCV (range/interval params) *(P2)*
+- `GET /v1/prices/{symbol}` — bounded current raw OHLCV *(P2, implemented)*
+- `GET /v1/prices/{symbol}/adjusted?factor_set_id=...` — full-window-validated,
+  immutable factor-pinned split/dividend-adjusted OHLCV *(P2, implemented;
+  requires published evidence)*
 - `GET /v1/fundamentals` — financial statements & ratios, as-of aware *(P2)*
 - `GET /v1/indicators` — technical indicators (SMA/EMA, RSI, MACD, Bollinger, ATR, volatility) *(P2)*
 - `GET /v1/news` — news items & metadata per symbol *(P2)*
-- `GET /v1/corporate-actions` — splits & dividends *(P2)*
-- `POST /v1/forecast` (and `GET /v1/forecast`) — price/return forecast with prediction intervals, horizon & model version *(P3, ML in P4)*
+- `GET /v1/corporate-actions` — splits & dividends *(P2; immutable storage is
+  implemented, public route remains)*
+- `POST /v1/forecast` (and `GET /v1/forecast`) — raw or separately pin-gated
+  adjusted-close forecast with prediction intervals, horizon & model version
+  *(P3 machinery implemented; real evidence/calibration remains, ML in P4)*
 - `POST /v1/backtest` — strategy/model backtest -> equity curve + risk metrics *(P4)*
 - `GET /v1/signals` — buy/hold/sell or ranked scores with confidence *(P4)*
 - `GET /v1/models` — model registry: versions, metrics, champion/challenger *(P4/P5)*
