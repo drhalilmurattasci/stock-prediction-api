@@ -22,15 +22,17 @@ actually reject NaN/Infinity under Postgres NaN ordering, and the API
 statement-timeout cancels a pathological statement.
 The same command also proves forecast-input snapshot SHA-256 enforcement,
 idempotent insertion, semantic collision rejection, pure resolution, and
-database-level UPDATE/DELETE/TRUNCATE refusal. Migration ``0010`` wires the same
-gate to check content-addressed realized outcomes bound to an exact
-bar-availability receipt and cohort manifests whose availability can be sealed
-only after the manifest commits and before its first target.
+database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0011`` wire
+the same gate to check content-addressed realized outcomes, immutable policy
+registration, the direct receipt-writer cutoff fence, source-bound publication,
+and cohort manifests whose availability can be sealed only after the manifest
+commits and before its first target.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import subprocess
 import sys
@@ -63,6 +65,7 @@ from app.db.models.forecast_evidence import (
     ForecastOutcomeCohortManifest,
     ForecastOutcomeCohortMember,
     ForecastRealizedOutcome,
+    ForecastRealizedOutcomePublication,
 )
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.db.models.predictions import ForecastRun
@@ -80,13 +83,22 @@ from app.schemas.forecast import (
     LookaheadCheck,
 )
 from app.schemas.prices import PriceFilters
-from app.services.forecast_cohort_store import SqlForecastCohortStore
+from app.services.forecast_cohort_store import ForecastCohortProof, SqlForecastCohortStore
 from app.services.forecast_cohorts import (
     ForecastCohortManifest,
     ForecastCohortMember,
     canonical_cohort_manifest,
     cohort_id_for_manifest,
     member_from_scheduled_run,
+)
+from app.services.forecast_outcome_policy_store import SqlForecastOutcomePolicyStore
+from app.services.forecast_outcome_resolution import (
+    ForecastOutcomeResolutionPolicy,
+    SqlOutcomeBarVersionResolver,
+)
+from app.services.forecast_outcome_store import (
+    ForecastOutcomePublicationSource,
+    SqlForecastOutcomeStore,
 )
 from app.services.forecast_outcomes import (
     BarVersionEvidence,
@@ -126,6 +138,7 @@ from app.services.forecast_snapshots import (
     parse_snapshot_payload,
     validate_and_resolve_snapshot,
 )
+from app.services.market_calendar import latest_completed_xnys_session
 from app.services.prices import read_prices
 from app.services.scheduled_evaluation import (
     ScheduledEvaluationService,
@@ -134,6 +147,7 @@ from app.services.scheduled_evaluation import (
 from data_sources.base import OHLCVBar
 from ingestion.locks import (
     VendorOperationBusy,
+    bar_series_lock_id,
     exclusive_vendor_operation,
     vendor_operation_lock_id,
 )
@@ -164,18 +178,30 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 class _MissingReadBarrier:
     """Release two real sessions only after both observed one row missing."""
 
-    def __init__(self, model: type[Any]) -> None:
+    def __init__(
+        self,
+        model: type[Any],
+        *,
+        rounds: int = 1,
+        barrier_on_execute: bool = False,
+    ) -> None:
         self.model = model
+        self.barrier_on_execute = barrier_on_execute
         self.arrivals = 0
+        self._rounds = rounds
         self._lock = asyncio.Lock()
-        self._release = asyncio.Event()
+        self._releases = [asyncio.Event() for _ in range(rounds)]
 
     async def arrive(self) -> None:
         async with self._lock:
             self.arrivals += 1
-            if self.arrivals == 2:
-                self._release.set()
-        await asyncio.wait_for(self._release.wait(), timeout=5)
+            round_index = (self.arrivals - 1) // 2
+            if round_index >= self._rounds:
+                return
+            release = self._releases[round_index]
+            if self.arrivals % 2 == 0:
+                release.set()
+        await asyncio.wait_for(release.wait(), timeout=5)
 
 
 class _BarrierSession:
@@ -201,6 +227,12 @@ class _BarrierSession:
             await self._barrier.arrive()
         return row
 
+    async def execute(self, *args: object, **kwargs: object) -> Any:
+        result = await self._session.execute(*args, **kwargs)
+        if self._barrier.barrier_on_execute:
+            await self._barrier.arrive()
+        return result
+
     def add(self, row: object) -> None:
         self._session.add(row)
 
@@ -224,7 +256,7 @@ class _BarrierSessionMaker:
         return _BarrierSession(self._maker(), self._barrier)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class LiveDatabaseUrls:
     owner: str
     runtime: str
@@ -301,7 +333,9 @@ def _drop_project_schema(url: str) -> None:
                 text(
                     "DROP TABLE IF EXISTS forecast_outcome_cohort_availability, "
                     "forecast_outcome_cohort_members, forecast_outcome_cohort_manifests, "
-                    "forecast_realized_outcomes, forecast_runs, forecast_input_snapshots, "
+                    "forecast_realized_outcome_publications, forecast_realized_outcomes, "
+                    "forecast_outcome_resolution_policies, forecast_runs, "
+                    "forecast_input_snapshots, "
                     "bar_version_availability, bars_revisions, bars, alembic_version CASCADE"
                 )
             )
@@ -320,17 +354,32 @@ def _drop_project_schema(url: str) -> None:
                 "stamp_forecast_outcome_cohort_availability",
                 "validate_forecast_outcome_cohort_member",
                 "materialize_forecast_outcome_cohort_members",
+                "fence_bar_version_availability",
+                "stamp_forecast_outcome_resolution_policy",
+                "validate_forecast_realized_outcome_policy",
             ):
                 conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
+            conn.execute(
+                text("DROP FUNCTION IF EXISTS forecast_bar_series_fence_id(text, text, text)")
+            )
+            conn.execute(
+                text("DROP FUNCTION IF EXISTS register_forecast_outcome_resolution_policy(bytea)")
+            )
+            conn.execute(
+                text(
+                    "DROP FUNCTION IF EXISTS publish_forecast_realized_outcome("
+                    "varchar, uuid, smallint, varchar, bytea)"
+                )
+            )
     finally:
         sync_engine.dispose()
 
 
-def _run_alembic(url: str, *arguments: str) -> None:
+def _invoke_alembic(url: str, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.pop("ALEMBIC_CONFIG", None)
     environment.update({"DATABASE_URL": url, "MIGRATION_DATABASE_URL": url})
-    result = subprocess.run(  # fresh process: env.py resolves DATABASE_URL uncached
+    return subprocess.run(  # fresh process: env.py resolves DATABASE_URL uncached
         [
             sys.executable,
             "-m",
@@ -345,6 +394,10 @@ def _run_alembic(url: str, *arguments: str) -> None:
         text=True,
         timeout=300,
     )
+
+
+def _run_alembic(url: str, *arguments: str) -> None:
+    result = _invoke_alembic(url, *arguments)
     assert result.returncode == 0, (
         f"alembic {' '.join(arguments)} failed:\n{result.stdout}\n{result.stderr}"
     )
@@ -452,7 +505,7 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0010_forecast_evidence"
+        assert version == "0011_outcome_policy_fence"
         hypertables = (
             await conn.execute(
                 text(
@@ -739,14 +792,63 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
                         {"role": role, "function_name": function_name},
                     )
                 ).scalar_one()
-                assert can_execute_run_trigger is False
+            assert can_execute_run_trigger is False
+
+
+async def test_nonempty_policy_registry_refuses_downgrade(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+    migrated_database_url: LiveDatabaseUrls,
+) -> None:
+    policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=24 * 60 * 60)
+    registered = await SqlForecastOutcomePolicyStore(build_sessionmaker(engine)).register(policy)
+
+    noncanonical = policy.canonical_policy.replace(b"{", b"{ ", 1)
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(DBAPIError, match="exact supported canonical form"):
+            await conn.execute(
+                text("SELECT register_forecast_outcome_resolution_policy(:policy)"),
+                {"policy": noncanonical},
+            )
+        await transaction.rollback()
+
+    for mutation in (
+        "UPDATE forecast_outcome_resolution_policies SET schema_version = schema_version "
+        "WHERE policy_hash = :policy_hash",
+        "DELETE FROM forecast_outcome_resolution_policies WHERE policy_hash = :policy_hash",
+        "TRUNCATE forecast_outcome_resolution_policies CASCADE",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match="forecast evidence is insert-only"):
+                await conn.execute(
+                    text(mutation),
+                    {"policy_hash": registered.record.policy_hash},
+                )
+            await transaction.rollback()
+
+    result = await asyncio.to_thread(
+        _invoke_alembic,
+        migrated_database_url.owner,
+        "downgrade",
+        "0010_forecast_evidence",
+    )
+    combined = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0
+    assert "cannot downgrade nonempty outcome-policy evidence" in combined
+    async with owner_engine.connect() as conn:
+        version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+    assert version == "0011_outcome_policy_fence"
 
 
 async def test_forecast_evidence_schema_and_role_boundaries(
     owner_engine: AsyncEngine,
 ) -> None:
     tables = (
+        "forecast_outcome_resolution_policies",
         "forecast_realized_outcomes",
+        "forecast_realized_outcome_publications",
         "forecast_outcome_cohort_manifests",
         "forecast_outcome_cohort_members",
         "forecast_outcome_cohort_availability",
@@ -755,7 +857,14 @@ async def test_forecast_evidence_schema_and_role_boundaries(
         "uq_bar_version_availability_exact_receipt",
         "ck_forecast_realized_outcomes_outcome_id_matches_payload",
         "uq_forecast_realized_outcomes_semantic_key",
+        "ck_forecast_realized_outcomes_currency_usd",
+        "fk_forecast_realized_outcomes_registered_policy",
+        "pk_forecast_outcome_resolution_policies",
+        "ck_forecast_outcome_resolution_policies_resolution_lag_bounded",
+        "uq_forecast_outcome_resolution_policies_policy_rules",
+        "pk_forecast_realized_outcome_publications",
         "ck_forecast_outcome_cohort_manifests_cohort_id_matches_payload",
+        "fk_forecast_outcome_cohort_manifests_registered_policy",
         "pk_forecast_outcome_cohort_members",
         "uq_forecast_outcome_cohort_members_opportunity_step",
     }
@@ -763,6 +872,27 @@ async def test_forecast_evidence_schema_and_role_boundaries(
         ("forecast_realized_outcomes", "forecast_realized_outcomes_stamp"),
         ("forecast_realized_outcomes", "forecast_realized_outcomes_no_row_mutation"),
         ("forecast_realized_outcomes", "forecast_realized_outcomes_no_truncate"),
+        ("forecast_realized_outcomes", "forecast_realized_outcomes_validate_policy"),
+        (
+            "forecast_outcome_resolution_policies",
+            "forecast_outcome_resolution_policies_stamp",
+        ),
+        (
+            "forecast_outcome_resolution_policies",
+            "forecast_outcome_resolution_policies_no_row_mutation",
+        ),
+        (
+            "forecast_outcome_resolution_policies",
+            "forecast_outcome_resolution_policies_no_truncate",
+        ),
+        (
+            "forecast_realized_outcome_publications",
+            "forecast_realized_outcome_publications_no_row_mutation",
+        ),
+        (
+            "forecast_realized_outcome_publications",
+            "forecast_realized_outcome_publications_no_truncate",
+        ),
         ("forecast_outcome_cohort_manifests", "forecast_outcome_cohorts_stamp"),
         (
             "forecast_outcome_cohort_manifests",
@@ -844,6 +974,10 @@ async def test_forecast_evidence_schema_and_role_boundaries(
             name.startswith("fk_forecast_outcome_cohort_members_forecast_id")
             for name in constraints
         )
+        assert any(
+            name.startswith("ck_forecast_outcome_resolution_policies_canonical_polic")
+            for name in constraints
+        )
 
         indexes = set(
             (
@@ -879,7 +1013,10 @@ async def test_forecast_evidence_schema_and_role_boundaries(
         assert triggers == required_triggers
 
         for table_name in tables:
-            app_may_insert = table_name != "forecast_outcome_cohort_members"
+            app_may_insert = table_name in {
+                "forecast_outcome_cohort_manifests",
+                "forecast_outcome_cohort_availability",
+            }
             runtime = (
                 await conn.execute(
                     text(
@@ -890,7 +1027,10 @@ async def test_forecast_evidence_schema_and_role_boundaries(
                         "has_table_privilege('stockapi_app', :table_name, 'TRUNCATE'), "
                         "has_table_privilege('stockapi_app', :table_name, 'REFERENCES'), "
                         "has_table_privilege('stockapi_app', :table_name, 'TRIGGER'), "
-                        "has_table_privilege('stockapi_app', :table_name, 'MAINTAIN')"
+                        "has_table_privilege('stockapi_app', :table_name, 'MAINTAIN'), "
+                        "has_any_column_privilege('stockapi_app', :table_name, 'INSERT'), "
+                        "has_any_column_privilege('stockapi_app', :table_name, 'UPDATE'), "
+                        "has_any_column_privilege('stockapi_app', :table_name, 'REFERENCES')"
                     ),
                     {"table_name": table_name},
                 )
@@ -902,6 +1042,9 @@ async def test_forecast_evidence_schema_and_role_boundaries(
                 False,
                 False,
                 False,
+                False,
+                False,
+                app_may_insert,
                 False,
                 False,
             )
@@ -918,12 +1061,18 @@ async def test_forecast_evidence_schema_and_role_boundaries(
                         "has_table_privilege("
                         "'stockapi_snapshot_builder', :table_name, 'DELETE'), "
                         "has_table_privilege("
-                        "'stockapi_snapshot_builder', :table_name, 'TRUNCATE')"
+                        "'stockapi_snapshot_builder', :table_name, 'TRUNCATE'), "
+                        "has_any_column_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'INSERT'), "
+                        "has_any_column_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'UPDATE'), "
+                        "has_any_column_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'REFERENCES')"
                     ),
                     {"table_name": table_name},
                 )
             ).one()
-            assert tuple(builder) == (False, False, False, False, False)
+            assert tuple(builder) == (False, False, False, False, False, False, False, False)
 
         for function_name in (
             "stamp_forecast_realized_outcome()",
@@ -932,6 +1081,10 @@ async def test_forecast_evidence_schema_and_role_boundaries(
             "materialize_forecast_outcome_cohort_members()",
             "stamp_forecast_outcome_cohort_availability()",
             "reject_forecast_evidence_mutation()",
+            "fence_bar_version_availability()",
+            "stamp_forecast_outcome_resolution_policy()",
+            "validate_forecast_realized_outcome_policy()",
+            "forecast_bar_series_fence_id(text,text,text)",
         ):
             executable = (
                 await conn.execute(
@@ -944,6 +1097,23 @@ async def test_forecast_evidence_schema_and_role_boundaries(
                 )
             ).one()
             assert tuple(executable) == (False, False)
+
+        for function_name in (
+            "register_forecast_outcome_resolution_policy(bytea)",
+            "publish_forecast_realized_outcome(varchar,uuid,smallint,varchar,bytea)",
+        ):
+            runtime, builder = (
+                await conn.execute(
+                    text(
+                        "SELECT has_function_privilege('stockapi_app', :function_name, "
+                        "'EXECUTE'), has_function_privilege('stockapi_snapshot_builder', "
+                        ":function_name, 'EXECUTE')"
+                    ),
+                    {"function_name": function_name},
+                )
+            ).one()
+            assert runtime is True
+            assert builder is False
 
 
 async def test_realized_outcome_binds_exact_receipt_and_is_immutable(
@@ -988,24 +1158,36 @@ async def test_realized_outcome_binds_exact_receipt_and_is_immutable(
             )
         ).scalar_one()
 
-    source = BarVersionEvidence(
-        symbol=bar.symbol,
-        timespan=bar.timespan,
-        multiplier=bar.multiplier,
-        observed_at=bar.ts,
-        source=bar.source,
-        adjustment_basis=bar.adjustment_basis,
-        fetched_at=bar.fetched_at,
-        source_as_of=bar.as_of,
-        version_recorded_at=bar.recorded_at,
-        available_at=receipt.available_at,
-        field="close",
-        value=bar.close,
+    async def policy_after(
+        available_at: datetime,
+    ) -> tuple[ForecastOutcomeResolutionPolicy, datetime]:
+        # Pick an explicit integer lag whose deterministic cutoff is just after
+        # this real DB receipt, then wait only for the DB clock to cross it.
+        lag_seconds = int((available_at - observed_at).total_seconds()) + 2
+        policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=lag_seconds)
+        cutoff = policy.cutoff_for(observed_at)
+        while True:
+            async with maker() as session:
+                database_now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+            remaining = (cutoff - database_now).total_seconds()
+            if remaining <= 0:
+                return policy, cutoff
+            await asyncio.sleep(min(remaining + 0.02, 0.25))
+
+    policy, cutoff = await policy_after(receipt.available_at)
+    resolver = SqlOutcomeBarVersionResolver(maker, policy)
+    source = await resolver.resolve(
+        symbol=symbol,
+        target_time=observed_at,
+        resolution_cutoff=cutoff,
     )
+    assert source.value == bar.close
+    assert source.version_recorded_at == bar.recorded_at
+    assert source.available_at == receipt.available_at
     payload = RealizedOutcomePayload(
-        outcome_resolution_policy_hash="sha256:" + "a" * 64,
-        availability_rule_set_hash="sha256:" + "b" * 64,
-        resolution_cutoff=receipt.available_at,
+        outcome_resolution_policy_hash=policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=policy.availability_rule_set_hash,
+        resolution_cutoff=cutoff,
         symbol=bar.symbol,
         target="close",
         series_basis="raw",
@@ -1015,102 +1197,492 @@ async def test_realized_outcome_binds_exact_receipt_and_is_immutable(
         source_version=source,
     )
     canonical = canonical_outcome_payload(payload)
-    caller_sealed_at = datetime(2000, 1, 1, tzinfo=UTC)
     outcome_id = outcome_id_for_payload(canonical)
-    async with engine.begin() as conn:
-        before = (await conn.execute(select(func.clock_timestamp()))).scalar_one()
-        stored = (
-            await conn.execute(
-                pg_insert(ForecastRealizedOutcome)
-                .values(
-                    outcome_id=outcome_id,
-                    sealed_at=caller_sealed_at,
-                    canonical_evidence=canonical,
-                )
-                .returning(*ForecastRealizedOutcome.__table__.c)
-            )
-        ).one()
-        after = (await conn.execute(select(func.clock_timestamp()))).scalar_one()
-    assert before <= stored.sealed_at <= after
-    assert stored.sealed_at != caller_sealed_at
-    assert stored.outcome_id == outcome_id
-    assert stored.bar_value == stored.realized_value == bar.close
-    assert stored.bar_fetched_at == bar.fetched_at
-    assert stored.bar_source_as_of == bar.as_of
-    assert stored.bar_available_at == receipt.available_at
+    registered = await SqlForecastOutcomePolicyStore(maker).register(policy)
+    assert registered.record.policy_hash == policy.outcome_resolution_policy_hash
 
-    mismatched_payload = replace(
-        payload,
-        outcome_resolution_policy_hash="sha256:" + "c" * 64,
-    )
-    mismatched_canonical = canonical_outcome_payload(mismatched_payload)
+    # Runtime cannot bypass the provenance boundary with a raw INSERT. The
+    # function itself also fails closed after policy/max-version validation
+    # when no prospectively sealed cohort member authorizes this old target.
     async with engine.connect() as conn:
         transaction = await conn.begin()
-        with pytest.raises(
-            IntegrityError,
-            match="ck_forecast_realized_outcomes_outcome_id_matches_payload",
-        ):
+        with pytest.raises(DBAPIError, match="permission denied"):
             await conn.execute(
                 pg_insert(ForecastRealizedOutcome).values(
-                    outcome_id="sha256:" + "0" * 64,
-                    canonical_evidence=mismatched_canonical,
+                    outcome_id=outcome_id,
+                    canonical_evidence=canonical,
                 )
             )
         await transaction.rollback()
+
+    # The callable boundary must reject oversized or semantically equivalent
+    # but noncanonical JSON before it can occupy the immutable semantic key.
+    for rejected_bytes, message in (
+        (b"{" + b" " * 262_144, "invalid or exceeds its bound"),
+        (
+            canonical.replace(b'{"format"', b'{ "format"', 1),
+            "not the exact canonical form",
+        ),
+    ):
+        rejected_id = "sha256:" + hashlib.sha256(rejected_bytes).hexdigest()
+        async with engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match=message):
+                await conn.execute(
+                    text(
+                        "SELECT public.publish_forecast_realized_outcome("
+                        ":cohort_id, :forecast_id, :step, :outcome_id, :canonical)"
+                    ),
+                    {
+                        "cohort_id": "sha256:" + "f" * 64,
+                        "forecast_id": UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                        "step": 1,
+                        "outcome_id": rejected_id,
+                        "canonical": rejected_bytes,
+                    },
+                )
+            await transaction.rollback()
+
+    non_usd = canonical.replace(b'"currency":"USD"', b'"currency":"EUR"', 1)
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(DBAPIError, match="registered cutoff policy"):
+            await conn.execute(
+                text(
+                    "SELECT public.publish_forecast_realized_outcome("
+                    ":cohort_id, :forecast_id, :step, :outcome_id, :canonical)"
+                ),
+                {
+                    "cohort_id": "sha256:" + "f" * 64,
+                    "forecast_id": UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                    "step": 1,
+                    "outcome_id": "sha256:" + hashlib.sha256(non_usd).hexdigest(),
+                    "canonical": non_usd,
+                },
+            )
+        await transaction.rollback()
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(
+            DBAPIError,
+            match="outcome publication is not backed by an exact sealed cohort member",
+        ):
+            await conn.execute(
+                text(
+                    "SELECT public.publish_forecast_realized_outcome("
+                    ":cohort_id, :forecast_id, :step, :outcome_id, :canonical)"
+                ),
+                {
+                    "cohort_id": "sha256:" + "f" * 64,
+                    "forecast_id": UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                    "step": 1,
+                    "outcome_id": outcome_id,
+                    "canonical": canonical,
+                },
+            )
+        await transaction.rollback()
+    async with maker() as session:
+        persisted_count = (
+            await session.execute(
+                select(func.count())
+                .select_from(ForecastRealizedOutcome)
+                .where(ForecastRealizedOutcome.outcome_id == outcome_id)
+            )
+        ).scalar_one()
+    assert persisted_count == 0
+
+    # A restatement finalized after the frozen cutoff must not rewrite truth
+    # under this policy. A separately hashed later-lag policy may select it.
+    restated_close = bar.close + 3.0
+    restatement = OHLCVBar(
+        symbol=symbol,
+        timestamp=observed_at,
+        timespan="day",
+        multiplier=1,
+        open=restated_close - 1.0,
+        high=restated_close + 1.0,
+        low=restated_close - 2.0,
+        close=restated_close,
+        volume=1_100.0,
+        source="polygon_open_close",
+        adjustment_basis="raw",
+        fetched_at=source_bar.fetched_at + timedelta(minutes=1),
+    )
+    async with maker() as session, session.begin():
+        restated_plan = await upsert_bars(session, [restatement])
+    async with maker() as session, session.begin():
+        assert await finalize_bar_version_availability(session, restated_plan.rows) == 1
+    async with maker() as session:
+        restated_receipt = (
+            (
+                await session.execute(
+                    select(BarVersionAvailability)
+                    .where(
+                        BarVersionAvailability.symbol == symbol,
+                        BarVersionAvailability.version_recorded_at != source.version_recorded_at,
+                    )
+                    .order_by(BarVersionAvailability.version_recorded_at.desc())
+                )
+            )
+            .scalars()
+            .first()
+        )
+    assert restated_receipt is not None
+    assert restated_receipt.available_at > cutoff
+    still_original = await resolver.resolve(
+        symbol=symbol,
+        target_time=observed_at,
+        resolution_cutoff=cutoff,
+    )
+    assert still_original == source
+    later_policy, later_cutoff = await policy_after(restated_receipt.available_at)
+    later_source = await SqlOutcomeBarVersionResolver(maker, later_policy).resolve(
+        symbol=symbol,
+        target_time=observed_at,
+        resolution_cutoff=later_cutoff,
+    )
+    assert later_policy.outcome_resolution_policy_hash != policy.outcome_resolution_policy_hash
+    assert later_source.value == restated_close
+    assert later_source.version_recorded_at == restated_receipt.version_recorded_at
+    await SqlForecastOutcomePolicyStore(maker).register(later_policy)
+
+    lane_lock = bar_series_lock_id(symbol, "polygon_open_close", "day")
+
+    async def owner_insert_rejected(
+        candidate_id: str,
+        candidate_canonical: bytes,
+        message: str,
+    ) -> None:
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            await conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lane_lock},
+            )
+            with pytest.raises(DBAPIError, match=message):
+                await conn.execute(
+                    pg_insert(ForecastRealizedOutcome).values(
+                        outcome_id=candidate_id,
+                        canonical_evidence=candidate_canonical,
+                    )
+                )
+            await transaction.rollback()
+
+    await owner_insert_rejected(
+        "sha256:" + "0" * 64,
+        canonical,
+        "ck_forecast_realized_outcomes_outcome_id_matches_payload",
+    )
 
     wrong_value = bar.close + 1.0
     wrong_value_source = replace(source, value=wrong_value)
     wrong_value_payload = replace(
         payload,
-        outcome_resolution_policy_hash="sha256:" + "d" * 64,
         realized_value=wrong_value,
         source_version=wrong_value_source,
     )
     wrong_value_canonical = canonical_outcome_payload(wrong_value_payload)
-    async with engine.connect() as conn:
-        transaction = await conn.begin()
-        with pytest.raises(DBAPIError, match="does not match its exact bar version"):
-            await conn.execute(
-                pg_insert(ForecastRealizedOutcome).values(
-                    outcome_id=outcome_id_for_payload(wrong_value_canonical),
-                    canonical_evidence=wrong_value_canonical,
-                )
-            )
-        await transaction.rollback()
+    await owner_insert_rejected(
+        outcome_id_for_payload(wrong_value_canonical),
+        wrong_value_canonical,
+        "does not match its exact bar version",
+    )
 
     fake_receipt_time = receipt.available_at + timedelta(microseconds=1)
     wrong_receipt_source = replace(source, available_at=fake_receipt_time)
     wrong_receipt_payload = replace(
         payload,
-        outcome_resolution_policy_hash="sha256:" + "e" * 64,
-        resolution_cutoff=fake_receipt_time,
         source_version=wrong_receipt_source,
     )
     wrong_receipt_canonical = canonical_outcome_payload(wrong_receipt_payload)
-    async with engine.connect() as conn:
-        transaction = await conn.begin()
-        with pytest.raises(DBAPIError, match="stored availability receipt"):
-            await conn.execute(
-                pg_insert(ForecastRealizedOutcome).values(
-                    outcome_id=outcome_id_for_payload(wrong_receipt_canonical),
-                    canonical_evidence=wrong_receipt_canonical,
-                )
-            )
-        await transaction.rollback()
+    await owner_insert_rejected(
+        outcome_id_for_payload(wrong_receipt_canonical),
+        wrong_receipt_canonical,
+        "stored availability receipt",
+    )
 
+    wrong_cutoff_payload = replace(
+        payload,
+        resolution_cutoff=cutoff + timedelta(seconds=1),
+    )
+    wrong_cutoff_canonical = canonical_outcome_payload(wrong_cutoff_payload)
+    await owner_insert_rejected(
+        outcome_id_for_payload(wrong_cutoff_canonical),
+        wrong_cutoff_canonical,
+        "registered cutoff policy",
+    )
+
+    stale_source_payload = replace(
+        payload,
+        outcome_resolution_policy_hash=later_policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=later_policy.availability_rule_set_hash,
+        resolution_cutoff=later_cutoff,
+    )
+    stale_source_canonical = canonical_outcome_payload(stale_source_payload)
+    await owner_insert_rejected(
+        outcome_id_for_payload(stale_source_canonical),
+        stale_source_canonical,
+        "unique newest cutoff-visible version",
+    )
+
+    # Admin-only direct insertion is still forced through the byte, policy,
+    # lock, and unique-maximum triggers. Use a rolled-back valid row to prove
+    # every mutation path remains blocked without manufacturing durable truth.
     for mutation in (
         "UPDATE forecast_realized_outcomes SET symbol = symbol WHERE outcome_id = :outcome_id",
         "DELETE FROM forecast_realized_outcomes WHERE outcome_id = :outcome_id",
-        "TRUNCATE forecast_realized_outcomes",
+        "TRUNCATE forecast_realized_outcomes CASCADE",
     ):
         async with owner_engine.connect() as conn:
             transaction = await conn.begin()
+            await conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": lane_lock},
+            )
+            await conn.execute(
+                pg_insert(ForecastRealizedOutcome).values(
+                    outcome_id=outcome_id,
+                    canonical_evidence=canonical,
+                )
+            )
             with pytest.raises(DBAPIError, match="forecast evidence is insert-only"):
                 await conn.execute(
                     text(mutation),
                     {"outcome_id": outcome_id} if ":outcome_id" in mutation else {},
                 )
             await transaction.rollback()
+
+
+async def test_receipt_fence_serializes_read_committed_outcome_resolution(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+    migrated_database_url: LiveDatabaseUrls,
+) -> None:
+    """Prove the DB receipt fence closes the resolver's pre-commit snapshot race."""
+
+    maker = build_sessionmaker(engine)
+    symbol = "FENCE"
+    async with owner_engine.connect() as conn:
+        database_now = (await conn.execute(select(func.clock_timestamp()))).scalar_one()
+    observed_at = _session_close(latest_completed_xnys_session(database_now))
+    source_bar = OHLCVBar(
+        symbol=symbol,
+        timestamp=observed_at,
+        timespan="day",
+        multiplier=1,
+        open=210.0,
+        high=212.0,
+        low=209.0,
+        close=211.5,
+        volume=2_000.0,
+        source="polygon_open_close",
+        adjustment_basis="raw",
+        fetched_at=observed_at,
+    )
+    async with maker() as session, session.begin():
+        plan = await upsert_bars(session, [source_bar])
+    async with maker() as session:
+        bar = (await session.execute(select(Bar).where(Bar.symbol == symbol))).scalar_one()
+
+    lane_lock = bar_series_lock_id(symbol, "polygon_open_close", "day")
+    async with owner_engine.connect() as conn:
+        database_lane_lock = (
+            await conn.execute(
+                text(
+                    "SELECT public.forecast_bar_series_fence_id("
+                    ":symbol, 'polygon_open_close', 'day')"
+                ),
+                {"symbol": symbol},
+            )
+        ).scalar_one()
+    assert database_lane_lock == lane_lock
+
+    release_writer = asyncio.Event()
+    receipt_ready: asyncio.Future[datetime] = asyncio.get_running_loop().create_future()
+
+    async def hold_uncommitted_receipt() -> datetime:
+        try:
+            async with maker() as session, session.begin():
+                assert await finalize_bar_version_availability(session, plan.rows) == 1
+                receipt = (
+                    await session.execute(
+                        select(BarVersionAvailability).where(
+                            BarVersionAvailability.symbol == bar.symbol,
+                            BarVersionAvailability.timespan == bar.timespan,
+                            BarVersionAvailability.multiplier == bar.multiplier,
+                            BarVersionAvailability.ts == bar.ts,
+                            BarVersionAvailability.source == bar.source,
+                            BarVersionAvailability.adjustment_basis == bar.adjustment_basis,
+                            BarVersionAvailability.version_recorded_at == bar.recorded_at,
+                        )
+                    )
+                ).scalar_one()
+                receipt_ready.set_result(receipt.available_at)
+                await release_writer.wait()
+                return receipt.available_at
+        except Exception as exc:
+            if not receipt_ready.done():
+                receipt_ready.set_exception(exc)
+            raise
+
+    repeatable_engine = create_async_engine(
+        migrated_database_url.runtime,
+        isolation_level="REPEATABLE READ",
+    )
+    writer_task = asyncio.create_task(hold_uncommitted_receipt())
+    resolver_task: asyncio.Task[Any] | None = None
+    tasks: list[asyncio.Task[Any]] = [writer_task]
+    try:
+        available_at = await asyncio.wait_for(asyncio.shield(receipt_ready), timeout=5)
+        lag_seconds = int((available_at - observed_at).total_seconds()) + 5
+        policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=lag_seconds)
+        cutoff = policy.cutoff_for(observed_at)
+        assert available_at < cutoff
+
+        resolver = SqlOutcomeBarVersionResolver(
+            build_sessionmaker(repeatable_engine),
+            policy,
+        )
+        resolver_task = asyncio.create_task(
+            resolver.resolve(
+                symbol=symbol,
+                target_time=observed_at,
+                resolution_cutoff=cutoff,
+            )
+        )
+        tasks.append(resolver_task)
+
+        lock_state_statement = text(
+            """
+            WITH target AS (
+                SELECT public.forecast_bar_series_fence_id(
+                    :symbol, 'polygon_open_close', 'day'
+                ) AS lock_id
+            )
+            SELECT count(*) FILTER (WHERE held.granted),
+                   count(*) FILTER (WHERE NOT held.granted)
+            FROM pg_catalog.pg_locks AS held
+            CROSS JOIN target
+            WHERE held.locktype = 'advisory'
+              AND held.database = (
+                  SELECT oid FROM pg_catalog.pg_database
+                  WHERE datname = current_database()
+              )
+              AND held.objsubid = 1
+              AND held.mode = 'ExclusiveLock'
+              AND held.classid = ((target.lock_id >> 32) & 4294967295)::oid
+              AND held.objid = (target.lock_id & 4294967295)::oid
+            """
+        )
+        loop = asyncio.get_running_loop()
+        lock_deadline = loop.time() + 5
+        async with owner_engine.connect() as monitor:
+            while True:
+                granted, waiting = (
+                    await monitor.execute(lock_state_statement, {"symbol": symbol})
+                ).one()
+                if (granted, waiting) == (1, 1):
+                    break
+                if resolver_task.done():
+                    await resolver_task
+                    pytest.fail("outcome resolver completed before the receipt fence released")
+                if loop.time() >= lock_deadline:
+                    pytest.fail(
+                        "receipt writer and outcome resolver did not contend on one lane fence"
+                    )
+                await asyncio.sleep(0.01)
+
+            assert not resolver_task.done()
+            while True:
+                database_now = (await monitor.execute(select(func.clock_timestamp()))).scalar_one()
+                remaining = (cutoff - database_now).total_seconds()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(max(remaining, 0.01), 0.1))
+
+        release_writer.set()
+        committed_available_at = await asyncio.wait_for(writer_task, timeout=5)
+        evidence = await asyncio.wait_for(resolver_task, timeout=5)
+        assert committed_available_at == available_at
+        assert evidence.symbol == symbol
+        assert evidence.value == source_bar.close
+        assert evidence.version_recorded_at == bar.recorded_at
+        assert evidence.available_at == available_at
+        assert evidence.available_at <= cutoff
+
+        payload = RealizedOutcomePayload(
+            outcome_resolution_policy_hash=policy.outcome_resolution_policy_hash,
+            availability_rule_set_hash=policy.availability_rule_set_hash,
+            resolution_cutoff=cutoff,
+            symbol=symbol,
+            target="close",
+            series_basis="raw",
+            target_time=observed_at,
+            currency="USD",
+            realized_value=evidence.value,
+            source_version=evidence,
+        )
+        canonical = canonical_outcome_payload(payload)
+        outcome_id = outcome_id_for_payload(canonical)
+        await SqlForecastOutcomePolicyStore(maker).register(policy)
+
+        # The owner cannot bypass the public publisher under a stale snapshot.
+        # This reaches the table trigger with otherwise-valid canonical bytes.
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            await conn.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            with pytest.raises(DBAPIError, match="requires READ COMMITTED") as excinfo:
+                await conn.execute(
+                    pg_insert(ForecastRealizedOutcome).values(
+                        outcome_id=outcome_id,
+                        canonical_evidence=canonical,
+                    )
+                )
+            assert getattr(excinfo.value.orig, "sqlstate", None) == "55000"
+            await transaction.rollback()
+
+        # The runtime's only publication capability independently enforces the
+        # same isolation contract before parsing or provenance lookup.
+        async with repeatable_engine.connect() as conn:
+            transaction = await conn.begin()
+            isolation = (await conn.execute(text("SHOW transaction_isolation"))).scalar_one()
+            assert isolation == "repeatable read"
+            with pytest.raises(DBAPIError, match="requires READ COMMITTED") as excinfo:
+                await conn.execute(
+                    text(
+                        "SELECT public.publish_forecast_realized_outcome("
+                        ":cohort_id, :forecast_id, :step, :outcome_id, :canonical)"
+                    ),
+                    {
+                        "cohort_id": "sha256:" + "f" * 64,
+                        "forecast_id": UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                        "step": 1,
+                        "outcome_id": outcome_id,
+                        "canonical": canonical,
+                    },
+                )
+            assert getattr(excinfo.value.orig, "sqlstate", None) == "55000"
+            await transaction.rollback()
+
+        async with maker() as session:
+            persisted_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ForecastRealizedOutcome)
+                    .where(ForecastRealizedOutcome.outcome_id == outcome_id)
+                )
+            ).scalar_one()
+        assert persisted_count == 0
+    finally:
+        release_writer.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await repeatable_engine.dispose()
 
 
 def _scheduled_response(
@@ -1248,6 +1820,8 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
         await conn.execute(pg_insert(ForecastRun).values(**run_values))
 
     runtime_maker = build_sessionmaker(engine)
+    outcome_policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=24 * 60 * 60)
+    await SqlForecastOutcomePolicyStore(runtime_maker).register(outcome_policy)
     async with runtime_maker() as session:
         scheduled_run = (
             await session.execute(select(ForecastRun).where(ForecastRun.forecast_id == forecast_id))
@@ -1286,8 +1860,8 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     manifest = ForecastCohortManifest(
         purpose="heldout_evaluation",
         selection_policy_hash="sha256:" + "9" * 64,
-        outcome_resolution_policy_hash="sha256:" + "a" * 64,
-        availability_rule_set_hash=availability_rule_set_hash,
+        outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
         members=(member,),
     )
     canonical = canonical_cohort_manifest(manifest)
@@ -1496,7 +2070,7 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
         "TRUNCATE forecast_outcome_cohort_manifests CASCADE",
         "UPDATE forecast_outcome_cohort_members SET step = step WHERE cohort_id = :cohort_id",
         "DELETE FROM forecast_outcome_cohort_members WHERE cohort_id = :cohort_id",
-        "TRUNCATE forecast_outcome_cohort_members",
+        "TRUNCATE forecast_outcome_cohort_members CASCADE",
         "UPDATE forecast_outcome_cohort_availability SET cohort_id = cohort_id "
         "WHERE cohort_id = :cohort_id",
         "DELETE FROM forecast_outcome_cohort_availability WHERE cohort_id = :cohort_id",
@@ -1510,6 +2084,231 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
                     {"cohort_id": cohort_id} if ":cohort_id" in mutation else {},
                 )
             await transaction.rollback()
+
+
+async def test_synthetic_publisher_path_binds_exact_snapshot_and_source(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+) -> None:
+    """Exercise publication plumbing without claiming a real market outcome.
+
+    The target is a short-lived synthetic timestamp in the owner-designated
+    throwaway database.  This proves the callable DB boundary, provenance
+    checks, and source-link replay; it deliberately does not substitute for a
+    prospective XNYS forecast resolving over real vendor data.
+    """
+
+    runtime_maker = build_sessionmaker(engine)
+    async with runtime_maker() as session:
+        database_now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+    target_time = database_now + timedelta(seconds=8)
+    outcome_policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=10)
+    await SqlForecastOutcomePolicyStore(runtime_maker).register(outcome_policy)
+
+    snapshot = _forecast_snapshot_record(
+        symbol="PUB",
+        as_of=database_now - timedelta(minutes=5),
+        target_times=(target_time,),
+    )
+    async with snapshot_builder_engine.begin() as conn:
+        await conn.execute(pg_insert(ForecastInputSnapshot).values(**_record_values(snapshot)))
+
+    forecast_policy_hash = "sha256:" + "1" * 64
+    forecast_rule_set_hash = "sha256:" + "2" * 64
+    cohort_store = SqlForecastCohortStore(runtime_maker)
+
+    async def archive_and_seal(
+        *,
+        forecast_id: UUID,
+        response_snapshot: ForecastInputSnapshotRecord,
+        selection_hash: str,
+    ) -> tuple[ForecastOutcomePublicationSource, ForecastCohortProof]:
+        response = _scheduled_response(
+            forecast_id=forecast_id,
+            snapshot=response_snapshot,
+            target_time=target_time,
+        )
+        request = ForecastRequest(
+            symbol=snapshot.symbol,
+            horizon=1,
+            horizon_unit=snapshot.horizon_unit,
+            target="close",
+            snapshot_id=snapshot.snapshot_id,
+            model="baseline_naive",
+            interval_coverages=[0.8],
+        )
+        request_bytes = canonical_request(request)
+        output_bytes = canonical_output(response)
+        values = {
+            "forecast_id": forecast_id,
+            "schema_version": 1,
+            "origin_kind": "scheduled_evaluation",
+            "idempotency_token_digest": None,
+            "request_hash": request_hash(request_bytes),
+            "opportunity_hash": opportunity_hash(
+                response,
+                resolution_policy_hash=forecast_policy_hash,
+                availability_rule_set_hash=forecast_rule_set_hash,
+                origin_kind="scheduled_evaluation",
+            ),
+            "output_hash": output_hash(output_bytes),
+            # Both rows reference the real immutable snapshot.  The forged
+            # case differs only in the canonical output's claimed snapshot.
+            "snapshot_id": snapshot.snapshot_id,
+            "resolution_policy_hash": forecast_policy_hash,
+            "availability_rule_set_hash": forecast_rule_set_hash,
+            "symbol": response.symbol,
+            "target": response.target,
+            "horizon": response.horizon,
+            "horizon_unit": response.horizon_unit,
+            "series_basis": response.provenance.series_basis,
+            "as_of": response.as_of,
+            "max_available_at": response.provenance.max_available_at,
+            "model_version": response.provenance.model_version,
+            "feature_set_hash": response.provenance.feature_set_hash,
+            "code_version": response.provenance.code_version,
+            "calibration_set_version": response.calibration.calibration_set_version,
+            "calibration_method": response.calibration.method,
+            "generated_at": response.provenance.generated_at,
+            "canonical_request": request_bytes,
+            "canonical_output": output_bytes,
+        }
+        async with engine.begin() as conn:
+            await conn.execute(pg_insert(ForecastRun).values(**values))
+        async with runtime_maker() as session:
+            run = await session.get(ForecastRun, forecast_id)
+            assert run is not None
+            member = member_from_scheduled_run(run, step=1)
+        manifest = ForecastCohortManifest(
+            purpose="heldout_evaluation",
+            selection_policy_hash=selection_hash,
+            outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+            availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
+            members=(member,),
+        )
+        proof = await cohort_store.publish(manifest)
+        return (
+            ForecastOutcomePublicationSource(
+                cohort_id=proof.record.cohort_id,
+                forecast_id=forecast_id,
+                step=1,
+            ),
+            proof,
+        )
+
+    valid_source, valid_cohort = await archive_and_seal(
+        forecast_id=UUID("61616161-6161-6161-6161-616161616161"),
+        response_snapshot=snapshot,
+        selection_hash="sha256:" + "3" * 64,
+    )
+    forged_snapshot = replace(snapshot, snapshot_id="sha256:" + "e" * 64)
+    forged_source, forged_cohort = await archive_and_seal(
+        forecast_id=UUID("62626262-6262-6262-6262-626262626262"),
+        response_snapshot=forged_snapshot,
+        selection_hash="sha256:" + "4" * 64,
+    )
+    assert valid_cohort.seal.sealed_at < target_time
+    assert forged_cohort.seal.sealed_at < target_time
+
+    async def wait_for_database(moment: datetime) -> None:
+        while True:
+            async with runtime_maker() as session:
+                now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+            remaining = (moment - now).total_seconds()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining + 0.02, 0.25))
+
+    await wait_for_database(target_time)
+    bar_input = OHLCVBar(
+        symbol="PUB",
+        timestamp=target_time,
+        timespan="day",
+        multiplier=1,
+        open=200.0,
+        high=202.0,
+        low=199.0,
+        close=201.0,
+        volume=1_000.0,
+        source="polygon_open_close",
+        adjustment_basis="raw",
+        fetched_at=target_time,
+    )
+    async with runtime_maker() as session, session.begin():
+        plan = await upsert_bars(session, [bar_input])
+    async with runtime_maker() as session, session.begin():
+        assert await finalize_bar_version_availability(session, plan.rows) == 1
+    async with runtime_maker() as session:
+        stored_bar = (await session.execute(select(Bar).where(Bar.symbol == "PUB"))).scalar_one()
+        receipt = (
+            await session.execute(
+                select(BarVersionAvailability).where(
+                    BarVersionAvailability.symbol == "PUB",
+                    BarVersionAvailability.version_recorded_at == stored_bar.recorded_at,
+                )
+            )
+        ).scalar_one()
+
+    resolution_cutoff = outcome_policy.cutoff_for(target_time)
+    assert receipt.available_at <= resolution_cutoff
+    await wait_for_database(resolution_cutoff)
+    version = BarVersionEvidence(
+        symbol="PUB",
+        timespan="day",
+        multiplier=1,
+        observed_at=target_time,
+        source="polygon_open_close",
+        adjustment_basis="raw",
+        fetched_at=stored_bar.fetched_at,
+        source_as_of=stored_bar.as_of,
+        version_recorded_at=stored_bar.recorded_at,
+        available_at=receipt.available_at,
+        field="close",
+        value=stored_bar.close,
+    )
+    payload = RealizedOutcomePayload(
+        outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
+        resolution_cutoff=resolution_cutoff,
+        symbol="PUB",
+        target="close",
+        series_basis="raw",
+        target_time=target_time,
+        currency="USD",
+        realized_value=stored_bar.close,
+        source_version=version,
+    )
+    store = SqlForecastOutcomeStore(
+        sessionmaker=runtime_maker,
+        outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
+    )
+
+    with pytest.raises(AppError) as forged_error:
+        await store.publish(payload, source=forged_source)
+    assert forged_error.value.code == "forecast_outcome_integrity_failed"
+
+    published = await store.publish(payload, source=valid_source)
+    replayed = await store.publish(payload, source=valid_source)
+    assert replayed == published
+    assert published.publication.cohort_id == valid_source.cohort_id
+    assert published.publication.forecast_id == valid_source.forecast_id
+    assert published.publication.step == valid_source.step
+    async with runtime_maker() as session:
+        publications = (
+            (
+                await session.execute(
+                    select(ForecastRealizedOutcomePublication).where(
+                        ForecastRealizedOutcomePublication.outcome_id == published.record.outcome_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(publications) == 1
+    assert publications[0].cohort_id == valid_source.cohort_id
 
 
 async def test_upsert_replay_is_noop_and_restatement_writes_revision(engine: AsyncEngine) -> None:
@@ -1807,43 +2606,53 @@ def _forecast_snapshot_record(
     *,
     final_value: float = 102.0,
     policy_hash: str = "sha256:" + "a" * 64,
+    symbol: str = "AAPL",
+    as_of: datetime | None = None,
+    target_times: tuple[datetime, ...] | None = None,
 ) -> ForecastInputSnapshotRecord:
-    as_of = datetime(2026, 7, 10, 21, tzinfo=UTC)
+    snapshot_as_of = as_of or datetime(2026, 7, 10, 21, tzinfo=UTC)
     return build_snapshot_record(
         ForecastInputSnapshotPayload(
             resolution_policy_hash=policy_hash,
-            symbol="AAPL",
+            symbol=symbol,
             target="close",
             horizon_unit="calendar_day",
             series_basis="raw",
             input_timespan="day",
             input_multiplier=1,
-            as_of=as_of,
+            as_of=snapshot_as_of,
             currency="USD",
             observations=(
                 SnapshotObservation(
-                    observed_at=as_of - timedelta(days=2, hours=1),
-                    available_at=as_of - timedelta(days=2),
+                    observed_at=snapshot_as_of - timedelta(days=2, hours=1),
+                    available_at=snapshot_as_of - timedelta(days=2),
                     value=100.0,
                 ),
                 SnapshotObservation(
-                    observed_at=as_of - timedelta(days=1, hours=1),
-                    available_at=as_of - timedelta(days=1),
+                    observed_at=snapshot_as_of - timedelta(days=1, hours=1),
+                    available_at=snapshot_as_of - timedelta(days=1),
                     value=final_value,
                 ),
             ),
-            target_times=(as_of + timedelta(days=1), as_of + timedelta(days=2)),
+            target_times=(
+                target_times
+                if target_times is not None
+                else (
+                    snapshot_as_of + timedelta(days=1),
+                    snapshot_as_of + timedelta(days=2),
+                )
+            ),
             data_sources=(
                 SnapshotSourceLineage(
                     name="live-gate",
                     snapshot_id="live-gate-source-v1",
-                    max_available_at=as_of - timedelta(hours=1),
+                    max_available_at=snapshot_as_of - timedelta(hours=1),
                     fields=("close",),
                 ),
             ),
             availability=SnapshotAvailabilityEvidence(status="not_run"),
         ),
-        sealed_at=as_of + timedelta(minutes=1),
+        sealed_at=snapshot_as_of + timedelta(minutes=1),
     )
 
 
@@ -2116,6 +2925,10 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
         model="baseline_naive",
         interval_coverages=[0.8],
     )
+    prospective_outcome_policy = ForecastOutcomeResolutionPolicy(
+        resolution_lag_seconds=24 * 60 * 60
+    )
+    await SqlForecastOutcomePolicyStore(runtime_maker).register(prospective_outcome_policy)
     scheduled_spec = ScheduledEvaluationSpec(
         request=scheduled_request,
         purpose="heldout_evaluation",
@@ -2125,8 +2938,8 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
         forecast_resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
         forecast_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
         selection_policy_hash="sha256:" + "d" * 64,
-        outcome_resolution_policy_hash="sha256:" + "e" * 64,
-        outcome_availability_rule_set_hash="sha256:" + "f" * 64,
+        outcome_resolution_policy_hash=(prospective_outcome_policy.outcome_resolution_policy_hash),
+        outcome_availability_rule_set_hash=(prospective_outcome_policy.availability_rule_set_hash),
     )
     scheduled_evaluation = ScheduledEvaluationService(
         forecast_service=scheduled_forecast_service,
@@ -2302,7 +3115,7 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
 
     for truncation in (
         "TRUNCATE forecast_runs CASCADE",
-        "TRUNCATE forecast_outcome_cohort_members",
+        "TRUNCATE forecast_outcome_cohort_members CASCADE",
     ):
         async with owner_engine.connect() as conn:
             transaction = await conn.begin()

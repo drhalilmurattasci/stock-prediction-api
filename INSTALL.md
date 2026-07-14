@@ -542,8 +542,8 @@ python -c "import os,sqlalchemy as sa; from dotenv import load_dotenv; load_dote
 The empirical database gate is intentionally destructive and must only target
 a specifically designated throwaway TimescaleDB. It drops/recreates the project
 tables before proving migrations, role ACLs, bar revisions, snapshot creation,
-read-only serving, exact-receipt realized-outcome evidence, and pre-outcome
-cohort sealing:
+read-only serving, exact-receipt realized-outcome resolution/persistence, and
+pre-outcome cohort sealing:
 
 ```powershell
 .\run-live-gate.ps1
@@ -564,10 +564,15 @@ still proves absence. It never makes a vendor call.
 
 ✅ When all rows pass, the database migration, privilege, revision, immutable
 snapshot, runtime-role serving, API-key short circuit, authenticated HTTP
-forecast, realized-outcome hash/exact-receipt, and cohort post-commit sealing
-boundaries are proven. Polygon credentials and Celery/Beat remain outside this
-destructive gate. The evidence checks prove storage invariants only; they do not
-enable an unattended outcome resolver, cohort publisher, or calibrator.
+forecast, realized-outcome hash/exact-receipt, resolver cutoff, exact race
+replay, post-cutoff restatement, and cohort post-commit sealing boundaries are
+proven. Polygon credentials and Celery/Beat remain outside this destructive
+gate. A labelled synthetic throwaway target exercises the successful
+publisher/store/source-link path and forged-snapshot refusal, but is not a real
+market outcome. The gate does not pretend that a newly sealed real XNYS cohort
+has already matured; that final composition requires a forecast made before the
+target and elapsed market time. These checks do not enable an unattended
+collector, cohort publisher, or calibrator.
 
 ### Separately authorized first vendor request
 

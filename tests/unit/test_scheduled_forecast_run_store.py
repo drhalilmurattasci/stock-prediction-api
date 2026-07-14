@@ -20,6 +20,7 @@ from tests.unit.test_forecast_runs import (
     _FakeSessionMaker,
     _integrity_error,
     _matching_request,
+    _operational_error,
     _response,
 )
 
@@ -209,6 +210,98 @@ async def test_scheduled_unknown_commit_without_visible_row_is_safe_to_retry() -
     assert excinfo.value.details == {"outcome_unknown": True, "retryable": True}
 
 
+async def test_sqlstate_40003_commit_reconciles_a_visible_scheduled_winner() -> None:
+    maker = _FakeSessionMaker(
+        AS_OF + timedelta(minutes=5),
+        commit_error=_operational_error("40003"),
+    )
+    store = _store(maker)
+    winner_response = _response()
+    request = _matching_request(winner_response)
+    maker.reconcile_row = _persisted_row(store, request, winner_response)
+    candidate = _different_run(winner_response)
+
+    async def _producer() -> ForecastResponse:
+        return candidate
+
+    reconciled = await store.execute(
+        request,
+        idempotency_key=None,
+        principal=None,
+        producer=_producer,
+    )
+
+    assert reconciled.provenance.forecast_id == winner_response.provenance.forecast_id
+    assert reconciled.provenance.forecast_id != candidate.provenance.forecast_id
+
+
+async def test_sqlstate_40003_without_visible_scheduled_winner_reports_unknown() -> None:
+    maker = _FakeSessionMaker(
+        AS_OF + timedelta(minutes=5),
+        commit_error=_operational_error("40003"),
+    )
+    store = _store(maker)
+    response = _response()
+
+    async def _producer() -> ForecastResponse:
+        return response
+
+    with pytest.raises(AppError) as excinfo:
+        await store.execute(
+            _matching_request(response),
+            idempotency_key=None,
+            principal=None,
+            producer=_producer,
+        )
+
+    assert excinfo.value.code == "forecast_archive_commit_unknown"
+    assert excinfo.value.details == {"outcome_unknown": True, "retryable": True}
+
+
+async def test_sqlstate_40003_during_execute_reconciles_visible_scheduled_winner() -> None:
+    maker = _FakeSessionMaker(AS_OF + timedelta(minutes=5))
+    maker.flush_error = _operational_error("40003")  # type: ignore[assignment]
+    store = _store(maker)
+    winner_response = _response()
+    request = _matching_request(winner_response)
+    maker.reconcile_row = _persisted_row(store, request, winner_response)
+    candidate = _different_run(winner_response)
+
+    async def _producer() -> ForecastResponse:
+        return candidate
+
+    reconciled = await store.execute(
+        request,
+        idempotency_key=None,
+        principal=None,
+        producer=_producer,
+    )
+
+    assert reconciled.provenance.forecast_id == winner_response.provenance.forecast_id
+    assert reconciled.provenance.forecast_id != candidate.provenance.forecast_id
+
+
+async def test_sqlstate_40003_during_execute_without_winner_reports_unknown() -> None:
+    maker = _FakeSessionMaker(AS_OF + timedelta(minutes=5))
+    maker.flush_error = _operational_error("40003")  # type: ignore[assignment]
+    store = _store(maker)
+    response = _response()
+
+    async def _producer() -> ForecastResponse:
+        return response
+
+    with pytest.raises(AppError) as excinfo:
+        await store.execute(
+            _matching_request(response),
+            idempotency_key=None,
+            principal=None,
+            producer=_producer,
+        )
+
+    assert excinfo.value.code == "forecast_archive_commit_unknown"
+    assert excinfo.value.details == {"outcome_unknown": True, "retryable": True}
+
+
 def _make_row_readable(maker: _FakeSessionMaker, row: ForecastRun) -> None:
     maker.commit_failed = True
     maker.reconcile_added_row = True
@@ -331,3 +424,87 @@ async def test_read_validated_missing_row_is_structured_retryable_unavailable() 
     assert excinfo.value.code == "forecast_archive_unavailable"
     assert excinfo.value.status_code == 503
     assert excinfo.value.details == {"retryable": True}
+
+
+async def test_read_self_validated_uses_the_rows_historical_policy_epoch() -> None:
+    maker = _FakeSessionMaker(AS_OF + timedelta(minutes=5))
+    writer = _store(maker)
+    response = _response()
+    request = _matching_request(response)
+    row = _persisted_row(writer, request, response)
+    _make_row_readable(maker, row)
+    reader = SqlForecastRunStore(
+        sessionmaker=maker,  # type: ignore[arg-type]
+        identity_secret="different-unused-reader-secret",
+        resolution_policy_hash="sha256:" + "d" * 64,
+        availability_rule_set_hash="sha256:" + "f" * 64,
+        origin_kind="api",
+    )
+
+    archived = await reader.read_self_validated(row.forecast_id)
+
+    assert isinstance(archived, ArchivedForecastRun)
+    assert archived.forecast_id == row.forecast_id
+    assert archived.origin_kind == "scheduled_evaluation"
+    assert archived.resolution_policy_hash == POLICY_HASH
+    assert archived.availability_rule_set_hash == RULE_SET_HASH
+    assert archived.canonical_request == canonical_request(request)
+    assert archived.canonical_output == canonical_output(response)
+
+
+async def test_read_self_validated_refuses_the_wrong_historical_origin() -> None:
+    maker = _FakeSessionMaker(AS_OF + timedelta(minutes=5))
+    store = _store(maker)
+    response = _response()
+    request = _matching_request(response)
+    row = _persisted_row(store, request, response)
+    _make_row_readable(maker, row)
+
+    with pytest.raises(AppError) as excinfo:
+        await store.read_self_validated(
+            row.forecast_id,
+            expected_origin_kind="api",
+        )
+
+    assert excinfo.value.code == "forecast_archive_read_conflict"
+    assert excinfo.value.details == {"retryable": False}
+
+
+@pytest.mark.parametrize("corruption", ["canonical_request", "opportunity_hash"])
+async def test_read_self_validated_refuses_corrupt_historical_evidence(
+    corruption: str,
+) -> None:
+    maker = _FakeSessionMaker(AS_OF + timedelta(minutes=5))
+    store = _store(maker)
+    response = _response()
+    request = _matching_request(response)
+    row = _persisted_row(store, request, response)
+    if corruption == "canonical_request":
+        row.canonical_request = bytes(row.canonical_request) + b" "
+    else:
+        row.opportunity_hash = "sha256:" + "0" * 64
+    _make_row_readable(maker, row)
+
+    with pytest.raises(AppError) as excinfo:
+        await store.read_self_validated(row.forecast_id)
+
+    assert excinfo.value.code == "forecast_archive_corrupt"
+    assert excinfo.value.details == {
+        "forecast_id": str(row.forecast_id),
+        "retryable": False,
+    }
+
+
+async def test_read_self_validated_distinguishes_a_missing_row_from_an_outage() -> None:
+    maker = _FakeSessionMaker(AS_OF + timedelta(minutes=5))
+    forecast_id = UUID("55555555-5555-5555-5555-555555555555")
+
+    with pytest.raises(AppError) as excinfo:
+        await _store(maker).read_self_validated(forecast_id)
+
+    assert excinfo.value.code == "forecast_archive_evidence_missing"
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.details == {
+        "forecast_id": str(forecast_id),
+        "retryable": False,
+    }

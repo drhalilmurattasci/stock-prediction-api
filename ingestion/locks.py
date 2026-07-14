@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -13,6 +14,7 @@ from app.config import Settings
 from app.db.session import build_engine
 
 POLYGON_VENDOR = "polygon"
+_BAR_SERIES_FENCE_DOMAIN = "stockapi.bar-series-fence.v1"
 
 
 class VendorOperationBusy(RuntimeError):
@@ -30,9 +32,25 @@ def stable_lock_id(namespace: str, *parts: str) -> int:
 
 
 def bar_series_lock_id(symbol: str, source: str, timespan: str) -> int:
-    """Identity used by both ingestion and point-in-time snapshot reads."""
+    """Return the DB-reproducible identity for one bar-series fence.
 
-    return stable_lock_id(source, timespan, symbol)
+    Unlike the process-owned generic lock identity, this SHA-256 construction
+    is intentionally simple to reproduce in PostgreSQL.  Receipt triggers,
+    ingestion writers, snapshot builders, and outcome resolvers therefore all
+    serialize on the same database-enforced lane even when a caller bypasses
+    the Python write path.
+    """
+
+    parts = (source, timespan, symbol)
+    if any(not isinstance(part, str) or not part for part in parts):
+        raise ValueError("bar-series fence identity parts must be canonical")
+    identity = bytearray(_BAR_SERIES_FENCE_DOMAIN.encode("utf-8"))
+    for part in parts:
+        encoded = part.encode("utf-8")
+        identity.extend(struct.pack("!I", len(encoded)))
+        identity.extend(encoded)
+    digest = hashlib.sha256(identity).digest()[:8]
+    return int.from_bytes(digest, byteorder="big", signed=True)
 
 
 def vendor_operation_lock_id(vendor: str = POLYGON_VENDOR) -> int:

@@ -86,6 +86,31 @@ cutoff, and database-stamped seal must form one ordered timeline. A restatement
 can therefore produce new evidence under an explicit policy; it cannot rewrite
 an older outcome row or attach an unreceipted scalar to it.
 
+The owned resolver makes the policy executable without making it implicit. Its
+constructor requires a positive bounded resolution lag; that lag, the exact
+XNYS calendar and dependency versions, raw-close source contract, USD resolver,
+and version-selection rule are covered by the policy hash. The outcome table's
+semantic key deliberately excludes the cutoff, so the resolver requires the
+one deterministic cutoff `target_time + resolution_lag_seconds` exactly. It
+takes the same transaction-scoped series lock as ingestion receipt publication,
+then samples the database clock and reconstructs current, previous, and incoming
+versions. Among exact receipts visible by the cutoff it accepts only one
+distinct candidate at the greatest `version_recorded_at`; receipt timestamp
+ordering never chooses the winner.
+
+Persistence performs a content-ID and semantic-key preflight, submits only the
+content ID and canonical evidence through a bounded `SECURITY DEFINER`
+publisher, and rereads both the committed outcome and exact publication link in
+a fresh session. PostgreSQL first checks exact canonical bytes, the immutable
+registered policy, READ COMMITTED isolation, deterministic cutoff, USD, and the
+unique newest cutoff-visible version. It then requires a pre-target-sealed
+cohort member whose canonical scheduled output names the same immutable input
+snapshot and target step. Exact replay may append another valid cohort-member
+link; it cannot reuse an unrelated source without re-entering those database
+checks. Ambiguous commit outcomes are reconciled only when both the outcome and
+requested publication link are visible, or reported honestly as unknown.
+Deterministic conflicts and corrupt evidence are never converted into retries.
+
 Calibration/evaluation membership is precommitted separately. A canonical
 cohort manifest identifies exact `(forecast_id, step)` members derived from
 `scheduled_evaluation` archive outputs and binds selection, outcome-resolution,
@@ -94,11 +119,14 @@ accepts its availability receipt only in a later transaction and strictly
 before the earliest target. This second-transaction receipt is the evidence
 that membership was durably visible before outcomes, rather than merely stamped
 inside an uncommitted transaction. PostgreSQL materializes each canonical member
-into a fourth relational table and validates it against the exact archived
+into a relational table and validates it against the exact archived
 `scheduled_evaluation` output; callers cannot insert projection rows directly.
-All four evidence tables reject update, delete, and truncate. `stockapi_app` has
-`SELECT`/`INSERT` on outcomes, manifests, and availability receipts but
-`SELECT` only on materialized members; the snapshot-builder role has no access.
+The policy registry, outcomes, publication links, manifests, materialized
+members, and cohort seals all reject update, delete, and truncate.
+`stockapi_app` can register exact supported policy bytes and call the validated
+publisher, but has no table- or column-level outcome INSERT. It retains the
+minimum manifest/seal writes and read access required by the internal seam; the
+snapshot-builder role has no outcome-evidence access.
 
 Migration `0010`, the pure canonical validators, and the default-off scheduled
 evaluation service establish this storage and publication boundary. A scheduled
@@ -108,11 +136,27 @@ the run, rereads and validates the committed row, derives membership only from
 those persisted bytes, and publishes the manifest and seal in distinct
 transactions. Exact replay, deadline refusal, and real manifest/seal races pass
 the one-command throwaway-database gate on PostgreSQL 17. No Celery task, Beat
-entry, default selection policy, unattended outcome resolver, scoreboard, or
-interval recalibrator is enabled yet.
+entry, default selection policy, unattended collector, scoreboard, or interval
+recalibrator is enabled yet. The default-off outcome collection seam accepts
+only a cohort ID, forecast ID, step, and deterministic cutoff. It freshly
+validates the manifest, relational member projection, distinct seal, and
+historical scheduled run under the run's stored policy epoch; rederives the
+member from canonical output; checks the precommitted outcome policy identities;
+then resolves and persists the exact raw-close evidence. Caller-supplied symbol,
+target, currency, forecast value, or bar value never crosses that boundary.
 
-The remaining Phase 3 trust gaps are the controlled outcome-resolution write
-path, scored calibration artifacts, stable idempotency identity across
+The live gate proves the resolver with a historical XNYS close, a direct
+receipt transaction held across the cutoff, fresh post-wait visibility, exact
+replay, and a post-cutoff restatement. A separately labelled synthetic target
+exercises successful publication and exact source-link replay in the throwaway
+database, including rejection of false canonical snapshot provenance. It is not
+a market observation. The database requires a real cohort seal before its XNYS
+target, while real resolution must occur after that target plus the hashed lag;
+that composed proof needs a forecast published in advance and elapsed market
+time.
+
+The remaining Phase 3 trust gaps are that first genuinely matured cohort,
+scored calibration artifacts, stable idempotency identity across
 credential/secret rotation, a reproducible model registry/leaderboard, and
 models that empirically beat the baselines. Daily
 forecast manifests/external anchoring remain beyond the per-run SHA-256 archive.

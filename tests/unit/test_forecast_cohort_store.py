@@ -13,6 +13,7 @@ from app.core.exceptions import AppError
 from app.db.models.forecast_evidence import (
     ForecastOutcomeCohortAvailability,
     ForecastOutcomeCohortManifest,
+    ForecastOutcomeCohortMember,
 )
 from app.services.forecast_cohort_store import SqlForecastCohortStore
 from app.services.forecast_cohorts import (
@@ -158,6 +159,9 @@ class _Session:
             return self.database.seals.get(identity)
         raise AssertionError("unexpected model")
 
+    async def execute(self, _statement: object) -> _ScalarResult:
+        return _ScalarResult(self.database.members)
+
     def add(self, row: object) -> None:
         if self.pending is not None:
             raise AssertionError("one evidence row per transaction")
@@ -170,6 +174,10 @@ class _Session:
         self.database.insert_attempts.append(kind)
         failure = self.database.flush_failures.pop(kind, None)
         if failure is not None:
+            if kind in self.database.flush_completion_visible:
+                self.database.flush_completion_visible.remove(kind)
+                winner = self.database.stamp(kind, row, self.database.next_xid())
+                self.database.commit(kind, winner)
             raise failure
         if kind in self.database.races:
             self.database.races.remove(kind)
@@ -191,11 +199,13 @@ class _Database:
     def __init__(self) -> None:
         self.records: dict[str, ForecastOutcomeCohortManifest] = {}
         self.seals: dict[str, ForecastOutcomeCohortAvailability] = {}
+        self.members: list[ForecastOutcomeCohortMember] = []
         self.insert_attempts: list[str] = []
         self.session_count = 0
         self._xid = 100
         self.races: set[str] = set()
         self.flush_failures: dict[str, Exception] = {}
+        self.flush_completion_visible: set[str] = set()
         self.commit_failures: dict[str, tuple[Exception, bool]] = {}
         self.get_failures: list[Exception | None] = []
 
@@ -233,9 +243,32 @@ class _Database:
         if kind == "manifest":
             assert isinstance(row, ForecastOutcomeCohortManifest)
             self.records[row.cohort_id] = row
+            manifest = parse_cohort_manifest(row.canonical_manifest)
+            self.members.extend(
+                ForecastOutcomeCohortMember(
+                    cohort_id=row.cohort_id,
+                    forecast_id=member.forecast_id,
+                    step=member.step,
+                    target_time=member.target_time,
+                    opportunity_hash=member.opportunity_hash,
+                    output_hash=member.output_hash,
+                )
+                for member in manifest.members
+            )
         else:
             assert isinstance(row, ForecastOutcomeCohortAvailability)
             self.seals[row.cohort_id] = row
+
+
+class _ScalarResult:
+    def __init__(self, rows: list[ForecastOutcomeCohortMember]) -> None:
+        self.rows = rows
+
+    def scalars(self) -> _ScalarResult:
+        return self
+
+    def all(self) -> list[ForecastOutcomeCohortMember]:
+        return list(self.rows)
 
 
 def _store(database: _Database) -> SqlForecastCohortStore:
@@ -309,6 +342,59 @@ async def test_unknown_invisible_commit_is_reported_honestly_and_is_safe_to_retr
         "stage": stage,
     }
     assert "db.internal" not in excinfo.value.message
+
+
+@pytest.mark.parametrize("stage", ["manifest", "seal"])
+async def test_sqlstate_40003_commit_reconciles_a_visible_exact_row(stage: str) -> None:
+    database = _Database()
+    database.commit_failures[stage] = (_operational("40003"), True)
+
+    proof = await _store(database).publish(_manifest())
+
+    assert validate_cohort_seal(proof.record, proof.seal) == proof.manifest
+
+
+@pytest.mark.parametrize("stage", ["manifest", "seal"])
+async def test_sqlstate_40003_without_visible_row_reports_commit_unknown(stage: str) -> None:
+    database = _Database()
+    database.commit_failures[stage] = (_operational("40003"), False)
+
+    with pytest.raises(AppError) as excinfo:
+        await _store(database).publish(_manifest())
+
+    assert excinfo.value.code == "forecast_cohort_commit_unknown"
+    assert excinfo.value.details == {
+        "outcome_unknown": True,
+        "retryable": True,
+        "stage": stage,
+    }
+
+
+@pytest.mark.parametrize("stage", ["manifest", "seal"])
+async def test_sqlstate_40003_during_execute_reconciles_visible_exact_row(stage: str) -> None:
+    database = _Database()
+    database.flush_failures[stage] = _operational("40003")
+    database.flush_completion_visible.add(stage)
+
+    proof = await _store(database).publish(_manifest())
+
+    assert validate_cohort_seal(proof.record, proof.seal) == proof.manifest
+
+
+@pytest.mark.parametrize("stage", ["manifest", "seal"])
+async def test_sqlstate_40003_during_execute_without_row_reports_unknown(stage: str) -> None:
+    database = _Database()
+    database.flush_failures[stage] = _operational("40003")
+
+    with pytest.raises(AppError) as excinfo:
+        await _store(database).publish(_manifest())
+
+    assert excinfo.value.code == "forecast_cohort_commit_unknown"
+    assert excinfo.value.details == {
+        "outcome_unknown": True,
+        "retryable": True,
+        "stage": stage,
+    }
 
 
 async def test_known_rollback_is_retryable_but_not_reported_as_unknown() -> None:
@@ -435,3 +521,69 @@ async def test_invalid_manifest_fails_before_opening_a_database_session() -> Non
 
     assert excinfo.value.code == "forecast_cohort_manifest_invalid"
     assert database.session_count == 0
+
+
+async def test_read_validated_returns_a_fresh_exact_sealed_proof() -> None:
+    database = _Database()
+    store = _store(database)
+    published = await store.publish(_manifest())
+
+    reread = await store.read_validated(published.record.cohort_id)
+
+    assert reread == published
+    assert validate_cohort_seal(reread.record, reread.seal) == reread.manifest
+    assert database.insert_attempts == ["manifest", "seal"]
+    assert database.session_count == 4
+
+
+async def test_read_validated_distinguishes_a_missing_manifest_from_an_outage() -> None:
+    database = _Database()
+    store = _store(database)
+    published = await store.publish(_manifest())
+    del database.records[published.record.cohort_id]
+
+    with pytest.raises(AppError) as excinfo:
+        await store.read_validated(published.record.cohort_id)
+
+    assert excinfo.value.code == "forecast_cohort_evidence_missing"
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.details == {
+        "cohort_id": published.record.cohort_id,
+        "retryable": False,
+    }
+
+
+async def test_read_validated_reports_a_missing_seal_as_incomplete_and_retryable() -> None:
+    database = _Database()
+    store = _store(database)
+    published = await store.publish(_manifest())
+    del database.seals[published.record.cohort_id]
+
+    with pytest.raises(AppError) as excinfo:
+        await store.read_validated(published.record.cohort_id)
+
+    assert excinfo.value.code == "forecast_cohort_evidence_incomplete"
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.details == {"retryable": True}
+
+
+@pytest.mark.parametrize("corruption", ["member_count", "member_projection", "seal_xid"])
+async def test_read_validated_refuses_corrupt_membership_or_seal_projection(
+    corruption: str,
+) -> None:
+    database = _Database()
+    store = _store(database)
+    published = await store.publish(_manifest())
+    if corruption == "member_count":
+        database.records[published.record.cohort_id].member_count += 1
+    elif corruption == "member_projection":
+        database.members[0].output_hash = "sha256:" + "0" * 64
+    else:
+        database.seals[published.record.cohort_id].sealer_xid = published.record.creator_xid
+
+    with pytest.raises(AppError) as excinfo:
+        await store.read_validated(published.record.cohort_id)
+
+    assert excinfo.value.code == "forecast_cohort_evidence_corrupt"
+    assert excinfo.value.status_code == 500
+    assert excinfo.value.details == {"retryable": False}

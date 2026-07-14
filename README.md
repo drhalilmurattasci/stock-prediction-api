@@ -10,17 +10,21 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 
 ## Status
 
-🚧 **First honest forecast vertical slice is code-complete; migration `0010`
-is proven on the live PostgreSQL 17 integration gate.**
+🚧 **The fail-closed forecast/evidence substrate is code-complete through
+migration `0011`, but the product has not yet served a forecast over real
+vendor data.**
 The repository now has API-key auth, bounded `/v1/prices` reads, versioned Polygon
 daily-bar ingestion, append-only restatement history, leakage-aware baselines, an
 immutable point-in-time snapshot builder, snapshot-backed `/v1/forecast`, and an
 insert-only content-hashed forecast-run archive with retry-safe POST idempotency.
-Migration `0010` also establishes the policy-explicit forecast-evidence
+Migrations `0010`-`0011` establish the policy-explicit forecast-evidence
 substrate: realized raw-close outcomes bind one exact post-commit bar receipt,
 while immutable cohort manifests materialize members validated against exact
 scheduled forecast outputs and receive a distinct post-commit seal before their
-first target so later evaluation cannot silently cherry-pick membership.
+first target so later evaluation cannot silently cherry-pick membership. An
+immutable policy registry and database-enforced receipt fence close the cutoff
+race; runtime outcome writes are possible only through a bounded canonical
+publisher that records the exact authorizing cohort member.
 
 The initial builder policy is intentionally narrow: Massive/Polygon raw
 regular-session closes from `/v1/open-close` (source `polygon_open_close`) for
@@ -32,13 +36,19 @@ route also stays `501` until an operator explicitly pins the code-derived policy
 and availability hashes.
 
 Unit/static gates cover the evidence substrate. The destructive TimescaleDB
-integration gate now passes through migration `0010` on real PostgreSQL 17.
+integration gate now passes through migration `0011` on real PostgreSQL 17.
 `run-live-gate.ps1` is hard-bound to the designated `stockapi_test` throwaway
 database and checks the complete migration chain, exact
 runtime/builder role boundaries, restatement history, historical point-in-time
 snapshot reconstruction, archived serving, schema-validated keyed replay, and
 the outcome/cohort hash, exact-receipt, immutability, role-boundary, and
-pre-outcome sealing constraints. Ordinary test runs still skip that gate when
+pre-outcome sealing constraints. It also drives the owned outcome resolver
+through a direct receipt-writer race across the cutoff, proves fresh
+READ-COMMITTED visibility, and tests frozen-cutoff restatement behavior. A
+clearly labelled synthetic throwaway target exercises the successful DB
+publisher/store/source-link path and rejects forged snapshot provenance; it is
+not evidence of a real market outcome.
+Ordinary test runs still skip that gate when
 its explicit live-database environment is absent. The first real
 Massive/Polygon call remains a separate credentialed smoke gate.
 That gate now has a one-attempt, fail-closed operator command documented in
@@ -85,11 +95,24 @@ to revision-labelled immutable image IDs.
 The evidence schema and strict canonical validators are a foundation, not a
 claim of calibration. A default-off internal scheduled-evaluation seam can now
 archive one explicitly versioned forecast and publish its selected cohort with
-a distinct post-commit seal; the throwaway PostgreSQL gate proves that complete
-path and exact replay. It is not wired to Celery, Beat, or a default selection
-policy. No unattended outcome resolver, scoreboard, or interval recalibrator
-is enabled; those actors still require explicit policy artifacts and the same
-automation and budget controls before use.
+a distinct post-commit seal. A second internal seam rereads that sealed cohort
+and the historical run, derives the requested member only from persisted bytes,
+resolves one XNYS raw close at a deterministic policy-hashed lag, and persists
+or exactly replays the immutable outcome. Resolution shares the ingestion
+series lock, so an eligible post-commit receipt cannot still be in flight when
+the cutoff is declared closed. Neither seam is wired to Celery, Beat, an API
+route, or a default scientific policy.
+
+The throwaway PostgreSQL gate proves the resolver against historical versions,
+including a real receipt-writer race and frozen-cutoff restatement behavior. It
+also proves the successful publication machinery with explicitly synthetic
+throwaway evidence. That does not manufacture the final real-market
+cohort-to-outcome lifecycle: a valid cohort must be sealed before a real XNYS
+target, and resolution occurs only after that target plus its committed lag.
+That empirical proof needs an actual precommitted forecast and elapsed market
+time. No unattended collector,
+scoreboard, or interval recalibrator is enabled; those actors still require
+explicit policy artifacts and the same automation controls before use.
 
 See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Persistent workers
 and Beat are intentionally not safe-by-default startup conveniences: inspect or

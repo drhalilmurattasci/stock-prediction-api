@@ -218,7 +218,6 @@ def test_every_semantic_change_changes_the_content_identity() -> None:
         _payload(outcome_resolution_policy_hash="sha256:" + "c" * 64),
         _payload(availability_rule_set_hash="sha256:" + "d" * 64),
         _payload(resolution_cutoff=RESOLUTION_CUTOFF + timedelta(minutes=1)),
-        _payload(currency="EUR"),
         _payload(source_version=_source(fetched_at=TARGET_TIME + timedelta(minutes=1, seconds=1))),
         _payload(
             source_version=_source(
@@ -245,6 +244,7 @@ def test_every_semantic_change_changes_the_content_identity() -> None:
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
+        (_payload(currency="EUR"), "currency must be USD"),
         (_payload(source_version=_source(symbol="AAPL")), "symbol does not match"),
         (
             _payload(source_version=_source(observed_at=TARGET_TIME - timedelta(seconds=1))),

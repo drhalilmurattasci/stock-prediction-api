@@ -26,6 +26,51 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 
+class ForecastOutcomeResolutionPolicyRegistration(Base):
+    """Immutable, content-addressed registration of one outcome policy."""
+
+    __tablename__ = "forecast_outcome_resolution_policies"
+    __table_args__ = (
+        CheckConstraint("schema_version = 1", name="schema_version_supported"),
+        CheckConstraint(
+            "policy_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="policy_hash_format",
+        ),
+        CheckConstraint(
+            "availability_rule_set_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="availability_rule_set_hash_format",
+        ),
+        CheckConstraint(
+            "resolution_lag_seconds BETWEEN 1 AND 31622400",
+            name="resolution_lag_bounded",
+        ),
+        CheckConstraint("creator_xid > 0", name="creator_xid_positive"),
+        CheckConstraint(
+            "octet_length(canonical_policy) BETWEEN 1 AND 262144",
+            name="canonical_policy_size_bounded",
+        ),
+        CheckConstraint(
+            "policy_hash = 'sha256:' || encode(digest(canonical_policy, 'sha256'), 'hex')",
+            name="policy_hash_matches_payload",
+        ),
+        UniqueConstraint(
+            "policy_hash",
+            "availability_rule_set_hash",
+            name="uq_forecast_outcome_resolution_policies_policy_rules",
+        ),
+    )
+
+    policy_hash: Mapped[str] = mapped_column(String(71), primary_key=True)
+    availability_rule_set_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    resolution_lag_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    canonical_policy: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+    creator_xid: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class ForecastRealizedOutcome(Base):
     """One content-addressed raw-close truth observation under a named policy."""
 
@@ -48,7 +93,7 @@ class ForecastRealizedOutcome(Base):
         CheckConstraint("symbol ~ '^[A-Z0-9.\\-_:]+$'", name="symbol_format"),
         CheckConstraint("target = 'close'", name="target_supported"),
         CheckConstraint("series_basis = 'raw'", name="series_basis_supported"),
-        CheckConstraint("currency ~ '^[A-Z]{3}$'", name="currency_format"),
+        CheckConstraint("currency = 'USD'", name="currency_usd"),
         CheckConstraint(
             "bar_timespan = 'day' AND bar_multiplier = 1 "
             "AND bar_source = 'polygon_open_close' "
@@ -114,6 +159,18 @@ class ForecastRealizedOutcome(Base):
                 "bar_version_availability.available_at",
             ),
             name=("fk_forecast_realized_outcomes_exact_bar_receipt_bar_version_availability"),
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            (
+                "outcome_resolution_policy_hash",
+                "availability_rule_set_hash",
+            ),
+            (
+                "forecast_outcome_resolution_policies.policy_hash",
+                "forecast_outcome_resolution_policies.availability_rule_set_hash",
+            ),
+            name="fk_forecast_realized_outcomes_registered_policy",
             ondelete="RESTRICT",
         ),
         Index(
@@ -190,6 +247,18 @@ class ForecastOutcomeCohortManifest(Base):
         CheckConstraint(
             "cohort_id = 'sha256:' || encode(digest(canonical_manifest, 'sha256'), 'hex')",
             name="cohort_id_matches_payload",
+        ),
+        ForeignKeyConstraint(
+            (
+                "outcome_resolution_policy_hash",
+                "availability_rule_set_hash",
+            ),
+            (
+                "forecast_outcome_resolution_policies.policy_hash",
+                "forecast_outcome_resolution_policies.availability_rule_set_hash",
+            ),
+            name="fk_forecast_outcome_cohort_manifests_registered_policy",
+            ondelete="RESTRICT",
         ),
         Index(
             "ix_forecast_outcome_cohorts_target_window",
@@ -284,9 +353,47 @@ class ForecastOutcomeCohortMember(Base):
     output_hash: Mapped[str] = mapped_column(String(71), nullable=False)
 
 
+class ForecastRealizedOutcomePublication(Base):
+    """One sealed scheduled-forecast member authorized to use an outcome row."""
+
+    __tablename__ = "forecast_realized_outcome_publications"
+    __table_args__ = (
+        CheckConstraint("step BETWEEN 1 AND 252", name="step_bounded"),
+        CheckConstraint("publisher_xid > 0", name="publisher_xid_positive"),
+        ForeignKeyConstraint(
+            ("cohort_id", "forecast_id", "step"),
+            (
+                "forecast_outcome_cohort_members.cohort_id",
+                "forecast_outcome_cohort_members.forecast_id",
+                "forecast_outcome_cohort_members.step",
+            ),
+            name=(
+                "fk_forecast_realized_outcome_publications_cohort_member_"
+                "forecast_outcome_cohort_members"
+            ),
+            ondelete="RESTRICT",
+        ),
+    )
+
+    outcome_id: Mapped[str] = mapped_column(
+        String(71),
+        ForeignKey("forecast_realized_outcomes.outcome_id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    cohort_id: Mapped[str] = mapped_column(String(71), primary_key=True)
+    forecast_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    step: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+    publisher_xid: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 __all__ = [
     "ForecastOutcomeCohortAvailability",
     "ForecastOutcomeCohortManifest",
     "ForecastOutcomeCohortMember",
+    "ForecastOutcomeResolutionPolicyRegistration",
     "ForecastRealizedOutcome",
+    "ForecastRealizedOutcomePublication",
 ]

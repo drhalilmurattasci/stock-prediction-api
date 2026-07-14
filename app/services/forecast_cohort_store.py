@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from fastapi import status
+from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -14,9 +15,11 @@ from app.core.exceptions import AppError
 from app.db.models.forecast_evidence import (
     ForecastOutcomeCohortAvailability,
     ForecastOutcomeCohortManifest,
+    ForecastOutcomeCohortMember,
 )
 from app.services.forecast_cohorts import (
     ForecastCohortManifest,
+    ForecastCohortMember,
     ForecastCohortRecord,
     ForecastCohortSeal,
     ForecastCohortValidationError,
@@ -47,6 +50,8 @@ class ForecastCohortStore(Protocol):
 
     async def publish(self, manifest: ForecastCohortManifest) -> ForecastCohortProof: ...
 
+    async def read_validated(self, cohort_id: str) -> ForecastCohortProof: ...
+
 
 @dataclass(frozen=True)
 class _PreparedManifest:
@@ -66,6 +71,36 @@ class SqlForecastCohortStore:
         record = await self._ensure_manifest(prepared)
         await self._ensure_seal(prepared, record)
         return await self._read_proof(prepared)
+
+    async def read_validated(self, cohort_id: str) -> ForecastCohortProof:
+        """Freshly read and independently validate one sealed cohort proof."""
+
+        try:
+            async with self.sessionmaker() as session:
+                manifest_row = await session.get(
+                    ForecastOutcomeCohortManifest,
+                    cohort_id,
+                )
+                seal_row = await session.get(
+                    ForecastOutcomeCohortAvailability,
+                    cohort_id,
+                )
+                member_rows = await _read_members(session, cohort_id)
+        except SQLAlchemyTimeoutError as exc:
+            raise _unavailable() from exc
+        except DBAPIError as exc:
+            raise _database_error(exc) from exc
+        if manifest_row is None:
+            raise _missing(cohort_id)
+        if seal_row is None:
+            raise _incomplete()
+        record, manifest = _validated_stored_record(
+            manifest_row,
+            expected_cohort_id=cohort_id,
+        )
+        _validate_member_projection(member_rows, manifest)
+        seal = _exact_seal(seal_row, record)
+        return ForecastCohortProof(manifest=manifest, record=record, seal=seal)
 
     async def _ensure_manifest(self, prepared: _PreparedManifest) -> ForecastCohortRecord:
         commit_pending = False
@@ -103,6 +138,8 @@ class SqlForecastCohortStore:
                 raise _integrity_error(exc, "manifest") from exc
             if _is_configuration_error(exc):
                 raise _configuration_invalid() from exc
+            if _is_statement_completion_unknown(exc):
+                return await self._reconcile_manifest_or_unknown(prepared, exc)
             if _is_known_rollback(exc):
                 raise _unavailable() from exc
             if commit_pending:
@@ -159,6 +196,8 @@ class SqlForecastCohortStore:
                 raise _integrity_error(exc, "seal") from exc
             if _is_configuration_error(exc):
                 raise _configuration_invalid() from exc
+            if _is_statement_completion_unknown(exc):
+                return await self._reconcile_seal_or_unknown(record, exc)
             if _is_known_rollback(exc):
                 raise _unavailable() from exc
             if commit_pending:
@@ -202,18 +241,15 @@ class SqlForecastCohortStore:
                     ForecastOutcomeCohortAvailability,
                     prepared.cohort_id,
                 )
+                member_rows = await _read_members(session, prepared.cohort_id)
         except SQLAlchemyTimeoutError as exc:
             raise _unavailable() from exc
         except DBAPIError as exc:
             raise _database_error(exc) from exc
         if manifest_row is None or seal_row is None:
-            raise AppError(
-                "Forecast cohort evidence is incomplete.",
-                code="forecast_cohort_evidence_incomplete",
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                details={"retryable": True},
-            )
+            raise _incomplete()
         record = _exact_record(manifest_row, prepared)
+        _validate_member_projection(member_rows, prepared.manifest)
         seal = _exact_seal(seal_row, record)
         return ForecastCohortProof(manifest=prepared.manifest, record=record, seal=seal)
 
@@ -270,6 +306,23 @@ def _exact_record(
     row: ForecastOutcomeCohortManifest,
     prepared: _PreparedManifest,
 ) -> ForecastCohortRecord:
+    record, stored = _validated_stored_record(
+        row,
+        expected_cohort_id=prepared.cohort_id,
+    )
+    try:
+        if record.canonical_manifest != prepared.canonical or stored != prepared.manifest:
+            raise ForecastCohortValidationError("stored cohort content differs")
+    except (ForecastCohortValidationError, TypeError, ValueError) as exc:
+        raise _corrupt() from exc
+    return record
+
+
+def _validated_stored_record(
+    row: ForecastOutcomeCohortManifest,
+    *,
+    expected_cohort_id: str,
+) -> tuple[ForecastCohortRecord, ForecastCohortManifest]:
     record = ForecastCohortRecord(
         cohort_id=row.cohort_id,
         schema_version=row.schema_version,
@@ -286,13 +339,11 @@ def _exact_record(
     )
     try:
         stored = validate_cohort_record(record)
-        if record.cohort_id != prepared.cohort_id:
+        if record.cohort_id != expected_cohort_id:
             raise ForecastCohortValidationError("stored cohort identity differs")
-        if record.canonical_manifest != prepared.canonical or stored != prepared.manifest:
-            raise ForecastCohortValidationError("stored cohort content differs")
     except (ForecastCohortValidationError, TypeError, ValueError) as exc:
         raise _corrupt() from exc
-    return record
+    return record, stored
 
 
 def _exact_seal(
@@ -310,6 +361,45 @@ def _exact_seal(
     except (ForecastCohortValidationError, TypeError, ValueError) as exc:
         raise _corrupt() from exc
     return seal
+
+
+async def _read_members(
+    session: AsyncSession,
+    cohort_id: str,
+) -> list[ForecastOutcomeCohortMember]:
+    result = await session.execute(
+        select(ForecastOutcomeCohortMember).where(
+            ForecastOutcomeCohortMember.cohort_id == cohort_id
+        )
+    )
+    return list(result.scalars().all())
+
+
+def _validate_member_projection(
+    rows: list[ForecastOutcomeCohortMember],
+    manifest: ForecastCohortManifest,
+) -> None:
+    projected = tuple(
+        sorted(
+            (
+                ForecastCohortMember(
+                    forecast_id=row.forecast_id,
+                    step=row.step,
+                    target_time=row.target_time,
+                    opportunity_hash=row.opportunity_hash,
+                    output_hash=row.output_hash,
+                )
+                for row in rows
+            ),
+            key=lambda member: (
+                member.target_time,
+                str(member.forecast_id),
+                member.step,
+            ),
+        )
+    )
+    if projected != manifest.members:
+        raise _corrupt()
 
 
 def _db_error_attribute(exc: DBAPIError, name: str) -> str | None:
@@ -349,7 +439,13 @@ def _is_integrity_state(exc: DBAPIError) -> bool:
 
 def _is_known_rollback(exc: DBAPIError) -> bool:
     sqlstate = _db_error_attribute(exc, "sqlstate")
-    return sqlstate is not None and (sqlstate.startswith("40") or sqlstate == "57014")
+    return sqlstate is not None and (
+        (sqlstate.startswith("40") and sqlstate != "40003") or sqlstate == "57014"
+    )
+
+
+def _is_statement_completion_unknown(exc: DBAPIError) -> bool:
+    return _db_error_attribute(exc, "sqlstate") == "40003"
 
 
 def _integrity_error(exc: DBAPIError, stage: str) -> AppError:
@@ -398,6 +494,24 @@ def _unavailable() -> AppError:
         code="forecast_cohort_store_unavailable",
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         details={"retryable": True},
+    )
+
+
+def _incomplete() -> AppError:
+    return AppError(
+        "Forecast cohort evidence is incomplete.",
+        code="forecast_cohort_evidence_incomplete",
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        details={"retryable": True},
+    )
+
+
+def _missing(cohort_id: str) -> AppError:
+    return AppError(
+        "The requested persisted forecast cohort does not exist.",
+        code="forecast_cohort_evidence_missing",
+        status_code=status.HTTP_404_NOT_FOUND,
+        details={"cohort_id": cohort_id, "retryable": False},
     )
 
 

@@ -375,8 +375,8 @@ def _normalized_payload(payload: RealizedOutcomePayload) -> RealizedOutcomePaylo
     if payload.series_basis != "raw":
         raise OutcomeValidationError("outcome v1 supports raw close only")
     currency = _text(payload.currency, "currency", max_length=3)
-    if _CURRENCY_PATTERN.fullmatch(currency) is None:
-        raise OutcomeValidationError("currency must be an uppercase ISO code")
+    if _CURRENCY_PATTERN.fullmatch(currency) is None or currency != "USD":
+        raise OutcomeValidationError("outcome v1 currency must be USD")
     target_time = _utc(payload.target_time, "target_time")
     cutoff = _utc(payload.resolution_cutoff, "resolution_cutoff")
     realized = _finite(payload.realized_value, "realized_value")

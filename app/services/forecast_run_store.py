@@ -202,6 +202,40 @@ class SqlForecastRunStore:
             )
         )
 
+    async def read_self_validated(
+        self,
+        forecast_id: UUID,
+        *,
+        expected_origin_kind: str = _SCHEDULED_ORIGIN_KIND,
+    ) -> ArchivedForecastRun:
+        """Read historical evidence using the policy epoch stored on the row.
+
+        Unlike :meth:`read_validated`, this seam deliberately has no caller-
+        supplied request or current-store policy expectation.  It is intended
+        for later evidence processing after a cohort has already committed the
+        exact forecast identifier and policy hashes.  The canonical request,
+        output, hashes, opportunity identity, headers, and persistence stamp
+        are therefore all revalidated from the detached row itself.
+        """
+
+        try:
+            async with self.sessionmaker() as session:
+                existing = await self._find_forecast(session, forecast_id)
+        except SQLAlchemyTimeoutError as exc:
+            raise _archive_unavailable(retryable=True) from exc
+        except DBAPIError as exc:
+            raise _database_error(exc) from exc
+        if existing is None:
+            raise _archive_evidence_missing(forecast_id)
+        return await anyio.to_thread.run_sync(
+            partial(
+                self._self_validated_read,
+                existing,
+                expected_forecast_id=forecast_id,
+                expected_origin_kind=expected_origin_kind,
+            )
+        )
+
     async def _preflight_retry(
         self,
         retry_identity: str | None,
@@ -276,6 +310,26 @@ class SqlForecastRunStore:
             sqlstate = _db_error_attribute(exc, "sqlstate")
             if _is_configuration_sqlstate(sqlstate):
                 raise _database_error(exc) from exc
+            if sqlstate == "40003":
+                reconciled = await self._reconcile_unknown_commit(
+                    row,
+                    retry_identity=retry_identity,
+                    expected_request=expected_request,
+                    expected_request_hash=expected_request_hash,
+                )
+                if reconciled is not None:
+                    return reconciled
+                raise AppError(
+                    "Forecast archive commit outcome is unknown.",
+                    code="forecast_archive_commit_unknown",
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    details={
+                        "outcome_unknown": True,
+                        "retryable": (
+                            retry_identity is not None or self.origin_kind == _SCHEDULED_ORIGIN_KIND
+                        ),
+                    },
+                ) from exc
             if _is_known_rollback_sqlstate(sqlstate):
                 raise _archive_unavailable(retryable=True) from exc
             if flushed:
@@ -609,6 +663,28 @@ class SqlForecastRunStore:
             )
         return row
 
+    def _self_validated_read(
+        self,
+        row: ArchivedForecastRun,
+        *,
+        expected_forecast_id: UUID,
+        expected_origin_kind: str,
+    ) -> ArchivedForecastRun:
+        self._require_persisted(row)
+        if row.forecast_id != expected_forecast_id or row.origin_kind != expected_origin_kind:
+            raise AppError(
+                "Forecast archive row does not match the expected identity or origin.",
+                code="forecast_archive_read_conflict",
+                status_code=status.HTTP_409_CONFLICT,
+                details={"retryable": False},
+            )
+        self._replay(
+            row,
+            expected_request=row.canonical_request,
+            expected_request_hash=row.request_hash,
+        )
+        return row
+
     @staticmethod
     def _require_persisted(row: ArchivedForecastRun) -> None:
         try:
@@ -901,6 +977,15 @@ def _archive_unavailable(*, retryable: bool) -> AppError:
     )
 
 
+def _archive_evidence_missing(forecast_id: UUID) -> AppError:
+    return AppError(
+        "The requested persisted forecast evidence does not exist.",
+        code="forecast_archive_evidence_missing",
+        status_code=status.HTTP_404_NOT_FOUND,
+        details={"forecast_id": str(forecast_id), "retryable": False},
+    )
+
+
 def _database_error(exc: DBAPIError) -> AppError:
     """Classify structured SQLSTATEs without exposing SQL or driver text."""
 
@@ -920,7 +1005,9 @@ def _is_configuration_sqlstate(sqlstate: str | None) -> bool:
 
 
 def _is_known_rollback_sqlstate(sqlstate: str | None) -> bool:
-    return sqlstate is not None and (sqlstate.startswith("40") or sqlstate == "57014")
+    return sqlstate is not None and (
+        (sqlstate.startswith("40") and sqlstate != "40003") or sqlstate == "57014"
+    )
 
 
 def _feature_hash(value: str) -> str:
