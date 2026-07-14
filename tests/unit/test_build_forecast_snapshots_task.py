@@ -135,6 +135,11 @@ def test_retry_canonicalizes_a_positional_symbol_call_to_kwargs(
         raise RetryRaised
 
     monkeypatch.setattr(task_module, "_run_owned_snapshot_batch", fail_batch)
+    monkeypatch.setattr(
+        task_module,
+        "get_settings",
+        lambda: _settings(automation_enabled=True),
+    )
     monkeypatch.setattr(task_module.build_forecast_snapshots, "retry", fake_retry)
 
     with pytest.raises(RetryRaised):

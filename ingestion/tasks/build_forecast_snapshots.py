@@ -23,6 +23,7 @@ from app.services.forecast_snapshot_builder import (
     database_snapshot_cutoff,
     scheduled_snapshot_cutoff,
 )
+from ingestion.automation import require_automation_enabled
 from ingestion.snapshot_celery_app import snapshot_celery_app
 
 log = structlog.get_logger(__name__)
@@ -54,11 +55,14 @@ def build_forecast_snapshots(
 ) -> dict[str, Any]:
     """Celery entrypoint; retries retain the first database-clock cutoff."""
 
+    settings = get_settings()
+    require_automation_enabled(settings)
     try:
         return asyncio.run(
             _run_owned_snapshot_batch(
                 symbols=symbols,
                 as_of=_parse_as_of(as_of) if as_of is not None else None,
+                settings=settings,
             )
         )
     except SnapshotBatchTransientError as exc:

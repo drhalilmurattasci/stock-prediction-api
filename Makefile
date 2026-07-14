@@ -1,4 +1,4 @@
-.PHONY: help install install-ml lock up up-app down logs api worker snapshot-builder beat lint fmt type test migrate revision
+.PHONY: help install install-ml lock up up-app up-automation down logs api worker snapshot-builder beat lint fmt type test migrate revision
 
 help:
 	@echo "Targets:"
@@ -6,7 +6,8 @@ help:
 	@echo "  install-ml  uv sync (core + dev + ml)"
 	@echo "  lock        uv lock (generate uv.lock)"
 	@echo "  up          docker compose up -d (infra: timescaledb, redis, mlflow)"
-	@echo "  up-app      docker compose --profile app up -d --build (full stack; needs uv.lock)"
+	@echo "  up-app      docker compose --profile app up -d --build (API only; needs uv.lock)"
+	@echo "  up-automation  add persistent workers + Beat (requires explicit env gates)"
 	@echo "  down        docker compose down"
 	@echo "  api         run the API with reload"
 	@echo "  worker      run the ordinary Celery worker (one process)"
@@ -30,6 +31,9 @@ up:
 
 up-app:
 	docker compose --profile app up -d --build
+
+up-automation:
+	docker compose --profile app --profile automation up -d --build
 
 down:
 	docker compose down

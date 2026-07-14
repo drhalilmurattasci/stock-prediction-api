@@ -2,8 +2,18 @@
 
 from __future__ import annotations
 
-from ingestion.celery_app import celery_app
+from app.config import Settings
+from ingestion.celery_app import build_beat_schedule, celery_app
 from ingestion.snapshot_celery_app import snapshot_celery_app
+
+
+def _automation_settings(*, polygon_budget: int = 0) -> Settings:
+    return Settings(
+        _env_file=None,
+        app_env="test",
+        automation_enabled=True,
+        polygon_total_call_budget=polygon_budget,
+    )
 
 
 def test_redis_visibility_timeout_is_explicit():
@@ -37,7 +47,7 @@ def test_snapshot_builder_is_routed_to_its_dedicated_queue() -> None:
         "forecasting.build_forecast_snapshots",
     )
     assert dedicated_route["queue"].name == "snapshot-builder"
-    schedule = celery_app.conf.beat_schedule["build-forecast-snapshots-eod"]
+    schedule = build_beat_schedule(_automation_settings())["build-forecast-snapshots-eod"]
     assert schedule["task"] == "forecasting.build_forecast_snapshots"
     assert schedule["schedule"].hour == {17}
     assert schedule["schedule"].minute == {0}
@@ -52,7 +62,29 @@ def test_privileged_worker_app_imports_only_the_builder_task_module() -> None:
 
 
 def test_regular_session_closes_run_before_the_snapshot_build() -> None:
-    schedule = celery_app.conf.beat_schedule["ingest-forecast-closes-eod"]
+    schedule = build_beat_schedule(_automation_settings(polygon_budget=25))[
+        "ingest-forecast-closes-eod"
+    ]
     assert schedule["task"] == "ingestion.ingest_forecast_closes"
     assert schedule["schedule"].hour == {16}
     assert schedule["schedule"].minute == {0}
+
+
+def test_beat_schedule_is_empty_by_default() -> None:
+    settings = Settings(_env_file=None, app_env="test")
+    assert settings.automation_enabled is False
+    assert build_beat_schedule(settings) == {}
+
+
+def test_vendor_schedules_require_a_positive_finite_budget() -> None:
+    snapshot_only = build_beat_schedule(_automation_settings())
+    assert set(snapshot_only) == {"build-forecast-snapshots-eod"}
+
+    budgeted = build_beat_schedule(_automation_settings(polygon_budget=25))
+    assert set(budgeted) == {
+        "build-forecast-snapshots-eod",
+        "ingest-forecast-closes-eod",
+        "ingest-prices-eod",
+    }
+    assert "ingest-fundamentals-daily" not in budgeted
+    assert "ingest-news-hourly" not in budgeted

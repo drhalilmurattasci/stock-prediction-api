@@ -63,17 +63,20 @@ policy identities:
 uv run python -m ingestion.tasks.build_forecast_snapshots --print-policy-hashes
 ```
 
-The full container tier (`--profile app`) includes a dedicated
-`stockapi_snapshot_builder` worker whose credential cannot write bars or mutate
-sealed snapshots. See [INSTALL.md](INSTALL.md) for role bootstrap and the live
-database gate. For the bounded milestone proof, use `run-forecast-demo.ps1`
-instead of starting the full app tier; Compose publishes the API on loopback
-only. That proof builds from the exact reviewed Git commit and pins both API
-and one-shot builder execution to revision-labelled immutable image IDs.
+The `app` Compose profile serves the API only; it never starts a worker, the
+privileged snapshot builder, or Beat. Persistent actors live behind the separate
+`automation` profile, the default-off `AUTOMATION_ENABLED` task gate, and (for
+Polygon lanes) a positive finite process budget. See [INSTALL.md](INSTALL.md)
+for role bootstrap and the live database gate. For the bounded milestone proof,
+use `run-forecast-demo.ps1`; its one-shot builder does not enable Celery
+automation. Compose publishes the API on loopback only. That proof builds from
+the exact reviewed Git commit and pins both API and one-shot builder execution
+to revision-labelled immutable image IDs.
 
-See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Run the ordinary
-worker, least-privilege snapshot worker, and scheduler with `make worker`,
-`make snapshot-builder`, and `make beat`.
+See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Persistent workers
+and Beat are intentionally not safe-by-default startup conveniences: inspect or
+purge the durable queue, set the explicit automation gates and finite vendor
+budget, then use `make up-automation` only under an approved runbook.
 
 ## Documentation
 

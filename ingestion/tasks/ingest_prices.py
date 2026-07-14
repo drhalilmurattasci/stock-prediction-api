@@ -25,6 +25,7 @@ from data_sources.base import (
     SymbolNotFoundError,
 )
 from data_sources.guards import InMemoryCostRateGuard
+from ingestion.automation import require_automation_enabled
 from ingestion.locks import (
     acquire_advisory_xact_lock,
     bar_series_lock_id,
@@ -65,6 +66,8 @@ def ingest_prices(
     use_watermark: bool = True,
 ) -> dict[str, Any]:
     """Celery sync entrypoint that bridges once into async ingestion code."""
+    settings = get_settings()
+    require_automation_enabled(settings, require_polygon_budget=True)
     result = asyncio.run(
         ingest_prices_async(
             symbols=symbols,
@@ -72,6 +75,7 @@ def ingest_prices(
             end=_parse_date(end) if end else None,
             adjusted=adjusted,
             use_watermark=use_watermark,
+            settings=settings,
         )
     )
     if result["status"] == "failed" and result["retryable_failures"]:

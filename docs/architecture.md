@@ -55,6 +55,15 @@ confidence intervals for an estimated parameter. Serving reports
 `calibration.method=none`, no held-out coverage evidence, and an
 `uncalibrated:<model-version>` calibration identity.
 
+The serving and acting tiers are mechanically separate. Compose profile `app`
+starts the API only. Persistent ingestion workers, the privileged snapshot
+builder, and Beat live under profile `automation`, and every Celery task checks
+the default-off `AUTOMATION_ENABLED` flag before any I/O. Beat registers no jobs
+while disabled; its Polygon jobs additionally require a positive finite
+per-lane, per-process call cap. Fundamentals and news remain unscheduled until
+they receive owned budgets. The separately authorized smoke, backfill, and demo
+commands call bounded async/operator paths directly and do not enable Celery.
+
 Archive persistence uses an optimistic two-phase flow: a short keyed lookup,
 snapshot loading and pure forecast computation with no archive connection held,
 then a short advisory-lock/recheck/insert transaction. Two simultaneous first

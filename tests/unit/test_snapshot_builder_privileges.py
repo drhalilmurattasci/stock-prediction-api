@@ -105,6 +105,7 @@ def test_compose_isolates_builder_credentials_and_queue_from_api_and_worker() ->
     builder = compose.split("\n  snapshot-builder:", maxsplit=1)[1].split("\n  beat:", maxsplit=1)[
         0
     ]
+    beat = compose.split("\n  beat:", maxsplit=1)[1]
 
     assert "POSTGRES_SNAPSHOT_BUILDER_PASSWORD" in compose
     assert "stockapi_snapshot_builder:${POSTGRES_SNAPSHOT_BUILDER_URL_PASSWORD}" in builder
@@ -113,9 +114,20 @@ def test_compose_isolates_builder_credentials_and_queue_from_api_and_worker() ->
     assert "POLYGON_API_KEY" not in builder
     assert "POSTGRES_SNAPSHOT_BUILDER" not in api
     assert "POSTGRES_SNAPSHOT_BUILDER" not in worker
+    assert 'profiles: ["app"]' in api
+    assert 'profiles: ["automation"]' in worker
+    assert 'profiles: ["automation"]' in builder
+    assert 'profiles: ["automation"]' in beat
+    assert "AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}" in worker
+    assert "AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}" in builder
+    assert "AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}" in beat
+    assert "POLYGON_TOTAL_CALL_BUDGET: ${POLYGON_TOTAL_CALL_BUDGET:-0}" in worker
+    assert "POLYGON_TOTAL_CALL_BUDGET: ${POLYGON_TOTAL_CALL_BUDGET:-0}" in beat
+    assert "POLYGON_API_KEY" not in beat
 
     env_example = ENV_EXAMPLE.read_text(encoding="utf-8")
     assert "POSTGRES_SNAPSHOT_BUILDER_PASSWORD=" in env_example
     assert "POSTGRES_SNAPSHOT_BUILDER_URL_PASSWORD=" in env_example
     assert "FORECAST_RESOLUTION_POLICY_HASH=" in env_example
     assert "FORECAST_TRUSTED_AVAILABILITY_RULE_SET_HASH=" in env_example
+    assert "AUTOMATION_ENABLED=false" in env_example

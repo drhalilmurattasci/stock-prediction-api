@@ -23,6 +23,7 @@ from app.services.market_calendar import latest_completed_xnys_session
 from data_sources.base import MarketDataProvider, OHLCVBar
 from data_sources.guards import AsyncPacingCostRateGuard
 from data_sources.polygon_open_close import PolygonOpenCloseProvider
+from ingestion.automation import require_automation_enabled
 from ingestion.locks import exclusive_vendor_operation
 from ingestion.tasks.ingest_prices import (
     _advisory_xact_lock,
@@ -122,12 +123,15 @@ def ingest_forecast_closes(
 ) -> dict[str, Any]:
     """Celery entrypoint for the separate forecast-input source lane."""
 
+    settings = get_settings()
+    require_automation_enabled(settings, require_polygon_budget=True)
     result = asyncio.run(
         ingest_forecast_closes_async(
             symbols=symbols,
             start=date.fromisoformat(start) if start else None,
             end=date.fromisoformat(end) if end else None,
             use_watermark=use_watermark,
+            settings=settings,
         )
     )
     if result["retryable_failures"]:

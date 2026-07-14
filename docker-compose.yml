@@ -1,9 +1,10 @@
 name: stock-api
 
 # Default `docker compose up` starts backing infra only (matches the native-dev
-# flow in INSTALL.md). The app tier (api/worker/snapshot-builder/beat) is under
-# the `app` profile;
-# start the full stack with `docker compose --profile app up -d --build`
+# flow in INSTALL.md). The API is under `app`; persistent workers and Beat are
+# under the separate `automation` profile and also require the default-off
+# AUTOMATION_ENABLED runtime gate. Enable both profiles only after budgeting
+# unattended work.
 # (requires a committed uv.lock — run `uv lock` first).
 
 services:
@@ -125,7 +126,7 @@ services:
         condition: service_healthy
 
   worker:
-    profiles: ["app"]
+    profiles: ["automation"]
     build: .
     container_name: stockapi-worker
     # The current Polygon guard is process-local. Keep one worker process until
@@ -142,6 +143,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}
       DATABASE_URL: postgresql+asyncpg://stockapi_app:${POSTGRES_APP_URL_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
       DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-5}
@@ -169,7 +171,7 @@ services:
         condition: service_healthy
 
   snapshot-builder:
-    profiles: ["app"]
+    profiles: ["automation"]
     image: ${STOCKAPI_SNAPSHOT_BUILDER_IMAGE:-stock-api-snapshot-builder}
     build: .
     container_name: stockapi-snapshot-builder
@@ -186,6 +188,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}
       DATABASE_URL: postgresql+asyncpg://stockapi_snapshot_builder:${POSTGRES_SNAPSHOT_BUILDER_URL_PASSWORD}@timescaledb:5432/${POSTGRES_DB}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
       DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-5}
@@ -201,15 +204,17 @@ services:
         condition: service_healthy
 
   beat:
-    profiles: ["app"]
+    profiles: ["automation"]
     build: .
     container_name: stockapi-beat
     command: ["celery", "-A", "ingestion.celery_app.celery_app", "beat", "--loglevel=INFO"]
     environment:
       APP_ENV: ${APP_ENV:-local}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AUTOMATION_ENABLED: ${AUTOMATION_ENABLED:-false}
       CELERY_BROKER_URL: redis://redis-celery:6379/0
       CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
+      POLYGON_TOTAL_CALL_BUDGET: ${POLYGON_TOTAL_CALL_BUDGET:-0}
     depends_on:
       redis-celery:
         condition: service_healthy

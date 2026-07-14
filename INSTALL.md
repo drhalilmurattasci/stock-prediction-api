@@ -404,11 +404,11 @@ services:
     volumes:
       - ./data/mlflow:/mlflow
 
-  # The app tier (api / worker / snapshot-builder / beat) lives under the
-  # `app` compose profile so
-  # `docker compose up` stays infra-only. Start the full stack with:
-  #   docker compose --profile app up -d --build   (requires a committed uv.lock)
-  # See docker-compose.yml in the repo for all app-tier service definitions.
+  # The API lives under profile `app`; persistent actors (ordinary worker,
+  # snapshot-builder, Beat) live under `automation`. Both default Compose and
+  # `--profile app` therefore start no unattended work. Automation additionally
+  # requires AUTOMATION_ENABLED=true and a positive finite Polygon budget.
+  # See docker-compose.yml for the exact service boundaries.
 ```
 
 ### 5.5 TimescaleDB init script
@@ -491,12 +491,21 @@ isolation: every local Python process can read that file. Use Compose or inject
 per-process environments when validating credential separation.
 
 Print the content-derived policy identities, copy both values into `.env`, then
-start the full app tier when you are ready to enable raw-close forecasts:
+start the serving-only API tier when you are ready to enable raw-close forecasts:
 
 ```powershell
 uv run python -m ingestion.tasks.build_forecast_snapshots --print-policy-hashes
 docker compose --profile app up -d --build
 ```
+
+That command starts no worker, snapshot builder, or Beat. Do not add the
+`automation` profile merely as a convenience. Before deliberately enabling it,
+inspect or purge the durable Celery queue, scope the symbol/window work, set
+`AUTOMATION_ENABLED=true`, and set a positive `POLYGON_TOTAL_CALL_BUDGET`.
+That cap is per Polygon lane and worker process, resets on restart, and is not a
+durable vendor-spend ledger. Stop `worker`, `snapshot-builder`, and `beat`
+immediately to disable a running tier; changing `.env` does not reconfigure an
+existing container, so recreate it to apply a new flag or budget.
 
 For an existing volume, retain the `POSTGRES_USER`, `POSTGRES_DB`, and owner
 password that originally initialized that database (older local volumes often
@@ -755,7 +764,9 @@ uvicorn app.main:app --reload --port 8000
 # Liveness:     http://localhost:8000/healthz
 # Readiness:    http://localhost:8000/readyz    (checks DB + Redis)
 
-# In separate terminals (needed for scheduled Polygon price ingestion):
+# In separate terminals only under an approved automation runbook. These task
+# entrypoints refuse while AUTOMATION_ENABLED is false; Polygon entrypoints also
+# refuse unless POLYGON_TOTAL_CALL_BUDGET is positive.
 celery -A ingestion.celery_app.celery_app worker --loglevel=INFO --concurrency=1
 celery -A ingestion.celery_app.celery_app beat   --loglevel=INFO
 
@@ -774,8 +785,8 @@ celery -A ingestion.snapshot_celery_app.snapshot_celery_app worker --loglevel=IN
 docker compose up -d                 # infra
 .\.venv\Scripts\Activate.ps1         # python env
 uvicorn app.main:app --reload        # api
-# (optional) celery -A ingestion.celery_app.celery_app worker --loglevel=INFO --concurrency=1
-# (optional, isolated builder env) celery -A ingestion.snapshot_celery_app.snapshot_celery_app worker --loglevel=INFO --concurrency=1 --queues=snapshot-builder
+# Persistent workers and Beat remain stopped during ordinary development.
+# Separately authorized smoke/backfill/demo wrappers use bounded one-shot paths.
 
 # Stop
 docker compose stop                  # stop containers, keep data
@@ -862,4 +873,6 @@ Image tags (`latest-pg17`) and `>=` ranges favor a smooth first install. **Befor
 - [ ] `docker compose up -d` → all services healthy
 - [ ] Smoke-test matrix all green (DB, Redis, MLflow)
 - [ ] `alembic upgrade head` → `uvicorn` serves `/docs`, `/healthz` returns 200
-- [ ] Ordinary worker, isolated snapshot-builder worker, and Beat are running
+- [ ] `--profile app` starts the API without worker, snapshot-builder, or Beat
+- [ ] If unattended automation is explicitly approved: queue inspected, finite
+      budget scoped, default-off gate enabled, and separate profile rehearsed

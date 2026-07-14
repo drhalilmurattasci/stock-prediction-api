@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6380/0"
     celery_result_backend: str = "redis://localhost:6380/1"
 
+    # --- unattended automation ---
+    # Workers may be started for inspection or one-shot operator commands, but
+    # no Celery task or Beat schedule is allowed to act unless this separate
+    # kill switch is deliberately enabled. Vendor-backed automation has an
+    # additional positive total-budget gate at its task boundary.
+    automation_enabled: bool = False
+
     # --- rate limiting ---
     rate_limit_storage_uri: str = "memory://"
     rate_limit_default: str = "120/minute"
