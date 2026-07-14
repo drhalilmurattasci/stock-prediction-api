@@ -22,7 +22,10 @@ actually reject NaN/Infinity under Postgres NaN ordering, and the API
 statement-timeout cancels a pathological statement.
 The same command also proves forecast-input snapshot SHA-256 enforcement,
 idempotent insertion, semantic collision rejection, pure resolution, and
-database-level UPDATE/DELETE/TRUNCATE refusal.
+database-level UPDATE/DELETE/TRUNCATE refusal. Migration ``0010`` wires the same
+gate to check content-addressed realized outcomes bound to an exact
+bar-availability receipt and cohort manifests whose availability can be sealed
+only after the manifest commits and before its first target.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ import threading
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import exchange_calendars
 import pytest
@@ -46,16 +50,47 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import Settings
 from app.core.exceptions import AppError
-from app.db.models.bars import Bar, BarRevision
+from app.db.models.bars import Bar, BarRevision, BarVersionAvailability
+from app.db.models.forecast_evidence import (
+    ForecastOutcomeCohortAvailability,
+    ForecastOutcomeCohortManifest,
+    ForecastOutcomeCohortMember,
+    ForecastRealizedOutcome,
+)
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.db.models.predictions import ForecastRun
 from app.db.session import build_engine, build_sessionmaker
 from app.main import create_app
-from app.schemas.forecast import ForecastRequest, ForecastResponse
+from app.schemas.forecast import (
+    DataSourceLineage,
+    ForecastCalibration,
+    ForecastInterval,
+    ForecastProvenance,
+    ForecastQuantile,
+    ForecastRequest,
+    ForecastResponse,
+    ForecastStep,
+    LookaheadCheck,
+)
 from app.schemas.prices import PriceFilters
+from app.services.forecast_cohorts import (
+    ForecastCohortManifest,
+    canonical_cohort_manifest,
+    cohort_id_for_manifest,
+    member_from_scheduled_run,
+)
+from app.services.forecast_outcomes import (
+    BarVersionEvidence,
+    RealizedOutcomePayload,
+    canonical_outcome_payload,
+    outcome_id_for_payload,
+)
 from app.services.forecast_run_store import SqlForecastRunStore
 from app.services.forecast_runs import (
+    canonical_output,
+    canonical_request,
     idempotency_digest,
+    opportunity_hash,
     output_hash,
     parse_output,
     request_hash,
@@ -188,7 +223,9 @@ def _drop_project_schema(url: str) -> None:
         with sync_engine.begin() as conn:
             conn.execute(
                 text(
-                    "DROP TABLE IF EXISTS forecast_runs, forecast_input_snapshots, "
+                    "DROP TABLE IF EXISTS forecast_outcome_cohort_availability, "
+                    "forecast_outcome_cohort_members, forecast_outcome_cohort_manifests, "
+                    "forecast_realized_outcomes, forecast_runs, forecast_input_snapshots, "
                     "bar_version_availability, bars_revisions, bars, alembic_version CASCADE"
                 )
             )
@@ -201,6 +238,12 @@ def _drop_project_schema(url: str) -> None:
                 "stamp_bar_version_availability",
                 "reject_forecast_run_mutation",
                 "stamp_forecast_run_recorded_at",
+                "reject_forecast_evidence_mutation",
+                "stamp_forecast_realized_outcome",
+                "stamp_forecast_outcome_cohort_manifest",
+                "stamp_forecast_outcome_cohort_availability",
+                "validate_forecast_outcome_cohort_member",
+                "materialize_forecast_outcome_cohort_members",
             ):
                 conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
     finally:
@@ -333,7 +376,7 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0009_forecast_runs"
+        assert version == "0010_forecast_evidence"
         hypertables = (
             await conn.execute(
                 text(
@@ -621,6 +664,658 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
                     )
                 ).scalar_one()
                 assert can_execute_run_trigger is False
+
+
+async def test_forecast_evidence_schema_and_role_boundaries(
+    owner_engine: AsyncEngine,
+) -> None:
+    tables = (
+        "forecast_realized_outcomes",
+        "forecast_outcome_cohort_manifests",
+        "forecast_outcome_cohort_members",
+        "forecast_outcome_cohort_availability",
+    )
+    required_constraints = {
+        "uq_bar_version_availability_exact_receipt",
+        "ck_forecast_realized_outcomes_outcome_id_matches_payload",
+        "uq_forecast_realized_outcomes_semantic_key",
+        "ck_forecast_outcome_cohort_manifests_cohort_id_matches_payload",
+        "pk_forecast_outcome_cohort_members",
+        "uq_forecast_outcome_cohort_members_opportunity_step",
+    }
+    required_triggers = {
+        ("forecast_realized_outcomes", "forecast_realized_outcomes_stamp"),
+        ("forecast_realized_outcomes", "forecast_realized_outcomes_no_row_mutation"),
+        ("forecast_realized_outcomes", "forecast_realized_outcomes_no_truncate"),
+        ("forecast_outcome_cohort_manifests", "forecast_outcome_cohorts_stamp"),
+        (
+            "forecast_outcome_cohort_manifests",
+            "forecast_outcome_cohort_manifests_no_row_mutation",
+        ),
+        (
+            "forecast_outcome_cohort_manifests",
+            "forecast_outcome_cohort_manifests_no_truncate",
+        ),
+        (
+            "forecast_outcome_cohort_manifests",
+            "forecast_outcome_cohorts_materialize_members",
+        ),
+        (
+            "forecast_outcome_cohort_members",
+            "forecast_outcome_cohort_members_validate",
+        ),
+        (
+            "forecast_outcome_cohort_members",
+            "forecast_outcome_cohort_members_no_row_mutation",
+        ),
+        (
+            "forecast_outcome_cohort_members",
+            "forecast_outcome_cohort_members_no_truncate",
+        ),
+        (
+            "forecast_outcome_cohort_availability",
+            "forecast_outcome_cohort_availability_stamp",
+        ),
+        (
+            "forecast_outcome_cohort_availability",
+            "forecast_outcome_cohort_availability_no_row_mutation",
+        ),
+        (
+            "forecast_outcome_cohort_availability",
+            "forecast_outcome_cohort_availability_no_truncate",
+        ),
+    }
+
+    async with owner_engine.connect() as conn:
+        present_tables = set(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT tablename FROM pg_tables "
+                        "WHERE schemaname = 'public' AND tablename = ANY(:tables)"
+                    ),
+                    {"tables": list(tables)},
+                )
+            ).scalars()
+        )
+        assert present_tables == set(tables)
+
+        constraints = set(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT constraint_name FROM information_schema.table_constraints "
+                        "WHERE table_schema = 'public' AND (table_name = ANY(:tables) "
+                        "OR table_name = 'bar_version_availability')"
+                    ),
+                    {"tables": list(tables)},
+                )
+            ).scalars()
+        )
+        assert required_constraints <= constraints
+        # PostgreSQL/SQLAlchemy may deterministically truncate long generated
+        # FK names to the 63-byte identifier limit; assert their stable semantic
+        # prefixes rather than coupling the gate to a compiler hash suffix.
+        assert any(
+            name.startswith("fk_forecast_realized_outcomes_exact_bar_receipt")
+            for name in constraints
+        )
+        assert any(
+            name.startswith("fk_forecast_outcome_cohort_availability_cohort_id")
+            for name in constraints
+        )
+        assert any(
+            name.startswith("fk_forecast_outcome_cohort_members_forecast_id")
+            for name in constraints
+        )
+
+        indexes = set(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' "
+                        "AND indexname IN ('ix_forecast_realized_outcomes_target', "
+                        "'ix_forecast_outcome_cohorts_target_window', "
+                        "'ix_forecast_outcome_cohort_members_target')"
+                    )
+                )
+            ).scalars()
+        )
+        assert indexes == {
+            "ix_forecast_realized_outcomes_target",
+            "ix_forecast_outcome_cohorts_target_window",
+            "ix_forecast_outcome_cohort_members_target",
+        }
+
+        triggers = {
+            tuple(row)
+            for row in (
+                await conn.execute(
+                    text(
+                        "SELECT relation.relname, trigger.tgname FROM pg_trigger AS trigger "
+                        "JOIN pg_class AS relation ON relation.oid = trigger.tgrelid "
+                        "WHERE NOT trigger.tgisinternal AND relation.relname = ANY(:tables)"
+                    ),
+                    {"tables": list(tables)},
+                )
+            ).all()
+        }
+        assert triggers == required_triggers
+
+        for table_name in tables:
+            app_may_insert = table_name != "forecast_outcome_cohort_members"
+            runtime = (
+                await conn.execute(
+                    text(
+                        "SELECT has_table_privilege('stockapi_app', :table_name, 'SELECT'), "
+                        "has_table_privilege('stockapi_app', :table_name, 'INSERT'), "
+                        "has_table_privilege('stockapi_app', :table_name, 'UPDATE'), "
+                        "has_table_privilege('stockapi_app', :table_name, 'DELETE'), "
+                        "has_table_privilege('stockapi_app', :table_name, 'TRUNCATE'), "
+                        "has_table_privilege('stockapi_app', :table_name, 'REFERENCES'), "
+                        "has_table_privilege('stockapi_app', :table_name, 'TRIGGER'), "
+                        "has_table_privilege('stockapi_app', :table_name, 'MAINTAIN')"
+                    ),
+                    {"table_name": table_name},
+                )
+            ).one()
+            assert tuple(runtime) == (
+                True,
+                app_may_insert,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            )
+
+            builder = (
+                await conn.execute(
+                    text(
+                        "SELECT has_table_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'SELECT'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'INSERT'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'UPDATE'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'DELETE'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table_name, 'TRUNCATE')"
+                    ),
+                    {"table_name": table_name},
+                )
+            ).one()
+            assert tuple(builder) == (False, False, False, False, False)
+
+        for function_name in (
+            "stamp_forecast_realized_outcome()",
+            "stamp_forecast_outcome_cohort_manifest()",
+            "validate_forecast_outcome_cohort_member()",
+            "materialize_forecast_outcome_cohort_members()",
+            "stamp_forecast_outcome_cohort_availability()",
+            "reject_forecast_evidence_mutation()",
+        ):
+            executable = (
+                await conn.execute(
+                    text(
+                        "SELECT has_function_privilege('stockapi_app', :function_name, "
+                        "'EXECUTE'), has_function_privilege('stockapi_snapshot_builder', "
+                        ":function_name, 'EXECUTE')"
+                    ),
+                    {"function_name": function_name},
+                )
+            ).one()
+            assert tuple(executable) == (False, False)
+
+
+async def test_realized_outcome_binds_exact_receipt_and_is_immutable(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+) -> None:
+    maker = build_sessionmaker(engine)
+    symbol = "EVID"
+    observed_at = datetime(2026, 7, 6, 20, tzinfo=UTC)
+    source_bar = OHLCVBar(
+        symbol=symbol,
+        timestamp=observed_at,
+        timespan="day",
+        multiplier=1,
+        open=122.5,
+        high=124.0,
+        low=122.0,
+        close=123.5,
+        volume=1_000.0,
+        source="polygon_open_close",
+        adjustment_basis="raw",
+        fetched_at=observed_at + timedelta(minutes=1),
+    )
+    async with maker() as session, session.begin():
+        plan = await upsert_bars(session, [source_bar])
+    async with maker() as session, session.begin():
+        assert await finalize_bar_version_availability(session, plan.rows) == 1
+
+    async with maker() as session:
+        bar = (await session.execute(select(Bar).where(Bar.symbol == symbol))).scalar_one()
+        receipt = (
+            await session.execute(
+                select(BarVersionAvailability).where(
+                    BarVersionAvailability.symbol == bar.symbol,
+                    BarVersionAvailability.timespan == bar.timespan,
+                    BarVersionAvailability.multiplier == bar.multiplier,
+                    BarVersionAvailability.ts == bar.ts,
+                    BarVersionAvailability.source == bar.source,
+                    BarVersionAvailability.adjustment_basis == bar.adjustment_basis,
+                    BarVersionAvailability.version_recorded_at == bar.recorded_at,
+                )
+            )
+        ).scalar_one()
+
+    source = BarVersionEvidence(
+        symbol=bar.symbol,
+        timespan=bar.timespan,
+        multiplier=bar.multiplier,
+        observed_at=bar.ts,
+        source=bar.source,
+        adjustment_basis=bar.adjustment_basis,
+        fetched_at=bar.fetched_at,
+        source_as_of=bar.as_of,
+        version_recorded_at=bar.recorded_at,
+        available_at=receipt.available_at,
+        field="close",
+        value=bar.close,
+    )
+    payload = RealizedOutcomePayload(
+        outcome_resolution_policy_hash="sha256:" + "a" * 64,
+        availability_rule_set_hash="sha256:" + "b" * 64,
+        resolution_cutoff=receipt.available_at,
+        symbol=bar.symbol,
+        target="close",
+        series_basis="raw",
+        target_time=bar.ts,
+        currency="USD",
+        realized_value=bar.close,
+        source_version=source,
+    )
+    canonical = canonical_outcome_payload(payload)
+    caller_sealed_at = datetime(2000, 1, 1, tzinfo=UTC)
+    outcome_id = outcome_id_for_payload(canonical)
+    async with engine.begin() as conn:
+        before = (await conn.execute(select(func.clock_timestamp()))).scalar_one()
+        stored = (
+            await conn.execute(
+                pg_insert(ForecastRealizedOutcome)
+                .values(
+                    outcome_id=outcome_id,
+                    sealed_at=caller_sealed_at,
+                    canonical_evidence=canonical,
+                )
+                .returning(*ForecastRealizedOutcome.__table__.c)
+            )
+        ).one()
+        after = (await conn.execute(select(func.clock_timestamp()))).scalar_one()
+    assert before <= stored.sealed_at <= after
+    assert stored.sealed_at != caller_sealed_at
+    assert stored.outcome_id == outcome_id
+    assert stored.bar_value == stored.realized_value == bar.close
+    assert stored.bar_fetched_at == bar.fetched_at
+    assert stored.bar_source_as_of == bar.as_of
+    assert stored.bar_available_at == receipt.available_at
+
+    mismatched_payload = replace(
+        payload,
+        outcome_resolution_policy_hash="sha256:" + "c" * 64,
+    )
+    mismatched_canonical = canonical_outcome_payload(mismatched_payload)
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(
+            IntegrityError,
+            match="ck_forecast_realized_outcomes_outcome_id_matches_payload",
+        ):
+            await conn.execute(
+                pg_insert(ForecastRealizedOutcome).values(
+                    outcome_id="sha256:" + "0" * 64,
+                    canonical_evidence=mismatched_canonical,
+                )
+            )
+        await transaction.rollback()
+
+    wrong_value = bar.close + 1.0
+    wrong_value_source = replace(source, value=wrong_value)
+    wrong_value_payload = replace(
+        payload,
+        outcome_resolution_policy_hash="sha256:" + "d" * 64,
+        realized_value=wrong_value,
+        source_version=wrong_value_source,
+    )
+    wrong_value_canonical = canonical_outcome_payload(wrong_value_payload)
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(DBAPIError, match="does not match its exact bar version"):
+            await conn.execute(
+                pg_insert(ForecastRealizedOutcome).values(
+                    outcome_id=outcome_id_for_payload(wrong_value_canonical),
+                    canonical_evidence=wrong_value_canonical,
+                )
+            )
+        await transaction.rollback()
+
+    fake_receipt_time = receipt.available_at + timedelta(microseconds=1)
+    wrong_receipt_source = replace(source, available_at=fake_receipt_time)
+    wrong_receipt_payload = replace(
+        payload,
+        outcome_resolution_policy_hash="sha256:" + "e" * 64,
+        resolution_cutoff=fake_receipt_time,
+        source_version=wrong_receipt_source,
+    )
+    wrong_receipt_canonical = canonical_outcome_payload(wrong_receipt_payload)
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(DBAPIError, match="stored availability receipt"):
+            await conn.execute(
+                pg_insert(ForecastRealizedOutcome).values(
+                    outcome_id=outcome_id_for_payload(wrong_receipt_canonical),
+                    canonical_evidence=wrong_receipt_canonical,
+                )
+            )
+        await transaction.rollback()
+
+    for mutation in (
+        "UPDATE forecast_realized_outcomes SET symbol = symbol WHERE outcome_id = :outcome_id",
+        "DELETE FROM forecast_realized_outcomes WHERE outcome_id = :outcome_id",
+        "TRUNCATE forecast_realized_outcomes",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match="forecast evidence is insert-only"):
+                await conn.execute(
+                    text(mutation),
+                    {"outcome_id": outcome_id} if ":outcome_id" in mutation else {},
+                )
+            await transaction.rollback()
+
+
+def _scheduled_response(
+    *,
+    forecast_id: UUID,
+    snapshot: ForecastInputSnapshotRecord,
+    target_time: datetime,
+) -> ForecastResponse:
+    quantiles = [
+        ForecastQuantile(level=0.1, value=98.0),
+        ForecastQuantile(level=0.5, value=100.0),
+        ForecastQuantile(level=0.9, value=102.0),
+    ]
+    generated_at = snapshot.as_of + timedelta(minutes=2)
+    return ForecastResponse(
+        symbol=snapshot.symbol,
+        target="close",
+        horizon=1,
+        horizon_unit=snapshot.horizon_unit,
+        as_of=snapshot.as_of,
+        currency=snapshot.currency,
+        forecasts=[
+            ForecastStep(
+                step=1,
+                target_time=target_time,
+                point=100.0,
+                quantiles=quantiles,
+                intervals=[
+                    ForecastInterval(
+                        coverage=0.8,
+                        lower_quantile=0.1,
+                        upper_quantile=0.9,
+                        lower=98.0,
+                        upper=102.0,
+                    )
+                ],
+            )
+        ],
+        provenance=ForecastProvenance(
+            forecast_id=forecast_id,
+            snapshot_id=snapshot.snapshot_id,
+            model_version="baseline-naive@1",
+            series_basis="raw",
+            feature_set_hash=snapshot.snapshot_id,
+            max_available_at=snapshot.max_available_at,
+            generated_at=generated_at,
+            code_version="live-gate",
+            data_sources=[
+                DataSourceLineage(
+                    name="live-gate",
+                    snapshot_id=snapshot.snapshot_id,
+                    max_available_at=snapshot.max_available_at,
+                    fields=["close"],
+                )
+            ],
+            lookahead_check=LookaheadCheck(
+                status="passed",
+                checked_at=generated_at,
+                max_feature_available_at=snapshot.max_available_at,
+            ),
+        ),
+        calibration=ForecastCalibration(
+            calibration_set_version="uncalibrated:baseline-naive@1",
+            method="none",
+            sample_count=0,
+        ),
+    )
+
+
+async def test_cohort_requires_post_commit_seal_and_is_immutable(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+) -> None:
+    async with engine.connect() as conn:
+        database_now = (await conn.execute(select(func.clock_timestamp()))).scalar_one()
+    earliest_target = database_now + timedelta(days=1)
+    resolution_policy_hash = "sha256:" + "7" * 64
+    availability_rule_set_hash = "sha256:" + "8" * 64
+    snapshot = _forecast_snapshot_record(policy_hash=resolution_policy_hash)
+    async with owner_engine.begin() as conn:
+        await conn.execute(pg_insert(ForecastInputSnapshot).values(**_record_values(snapshot)))
+
+    forecast_id = UUID("33333333-3333-3333-3333-333333333333")
+    response = _scheduled_response(
+        forecast_id=forecast_id,
+        snapshot=snapshot,
+        target_time=earliest_target,
+    )
+    request = ForecastRequest(
+        symbol=snapshot.symbol,
+        horizon=1,
+        horizon_unit=snapshot.horizon_unit,
+        target="close",
+        snapshot_id=snapshot.snapshot_id,
+        model="baseline_naive",
+        interval_coverages=[0.8],
+    )
+    canonical_request_bytes = canonical_request(request)
+    canonical_output_bytes = canonical_output(response)
+    run_opportunity_hash = opportunity_hash(
+        response,
+        resolution_policy_hash=resolution_policy_hash,
+        availability_rule_set_hash=availability_rule_set_hash,
+        origin_kind="scheduled_evaluation",
+    )
+    run_values: dict[str, object] = {
+        "forecast_id": forecast_id,
+        "schema_version": 1,
+        "origin_kind": "scheduled_evaluation",
+        "idempotency_token_digest": None,
+        "request_hash": request_hash(canonical_request_bytes),
+        "opportunity_hash": run_opportunity_hash,
+        "output_hash": output_hash(canonical_output_bytes),
+        "snapshot_id": snapshot.snapshot_id,
+        "resolution_policy_hash": resolution_policy_hash,
+        "availability_rule_set_hash": availability_rule_set_hash,
+        "symbol": response.symbol,
+        "target": response.target,
+        "horizon": response.horizon,
+        "horizon_unit": response.horizon_unit,
+        "series_basis": response.provenance.series_basis,
+        "as_of": response.as_of,
+        "max_available_at": response.provenance.max_available_at,
+        "model_version": response.provenance.model_version,
+        "feature_set_hash": snapshot.snapshot_id,
+        "code_version": response.provenance.code_version,
+        "calibration_set_version": response.calibration.calibration_set_version,
+        "calibration_method": response.calibration.method,
+        "generated_at": response.provenance.generated_at,
+        "recorded_at": datetime(2000, 1, 1, tzinfo=UTC),
+        "canonical_request": canonical_request_bytes,
+        "canonical_output": canonical_output_bytes,
+    }
+    async with engine.begin() as conn:
+        await conn.execute(pg_insert(ForecastRun).values(**run_values))
+
+    runtime_maker = build_sessionmaker(engine)
+    async with runtime_maker() as session:
+        scheduled_run = (
+            await session.execute(select(ForecastRun).where(ForecastRun.forecast_id == forecast_id))
+        ).scalar_one()
+        member = member_from_scheduled_run(scheduled_run, step=1)
+    manifest = ForecastCohortManifest(
+        purpose="heldout_evaluation",
+        selection_policy_hash="sha256:" + "9" * 64,
+        outcome_resolution_policy_hash="sha256:" + "a" * 64,
+        availability_rule_set_hash=availability_rule_set_hash,
+        members=(member,),
+    )
+    canonical = canonical_cohort_manifest(manifest)
+    cohort_id = cohort_id_for_manifest(canonical)
+    caller_timestamp = datetime(2000, 1, 1, tzinfo=UTC)
+
+    # A self-consistent canonical manifest is not sufficient: its materialized
+    # projection must match the exact scheduled archive bytes. This is the live
+    # regression for the forged-header/member gap that existed in the draft
+    # schema before the normalized member table and validation trigger.
+    forged_manifest = replace(
+        manifest,
+        members=(replace(member, target_time=earliest_target + timedelta(minutes=1)),),
+    )
+    forged_canonical = canonical_cohort_manifest(forged_manifest)
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(DBAPIError, match="step does not match scheduled output"):
+            await conn.execute(
+                pg_insert(ForecastOutcomeCohortManifest).values(
+                    cohort_id=cohort_id_for_manifest(forged_canonical),
+                    canonical_manifest=forged_canonical,
+                )
+            )
+        await transaction.rollback()
+
+    manifest_insert = (
+        pg_insert(ForecastOutcomeCohortManifest)
+        .values(
+            cohort_id=cohort_id,
+            recorded_at=caller_timestamp,
+            creator_xid=0,
+            canonical_manifest=canonical,
+        )
+        .returning(
+            ForecastOutcomeCohortManifest.recorded_at,
+            ForecastOutcomeCohortManifest.creator_xid,
+        )
+    )
+
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        same_transaction_manifest = (await conn.execute(manifest_insert)).one()
+        with pytest.raises(DBAPIError, match="requires a later transaction"):
+            await conn.execute(
+                pg_insert(ForecastOutcomeCohortAvailability).values(
+                    cohort_id=cohort_id,
+                    manifest_recorded_at=same_transaction_manifest.recorded_at,
+                    sealed_at=caller_timestamp,
+                    sealer_xid=0,
+                )
+            )
+        await transaction.rollback()
+
+    async with engine.begin() as conn:
+        stored_manifest = (await conn.execute(manifest_insert)).one()
+    assert stored_manifest.recorded_at != caller_timestamp
+    assert stored_manifest.creator_xid > 0
+    assert stored_manifest.recorded_at < earliest_target
+
+    async with runtime_maker() as session:
+        projected_member = (
+            await session.execute(
+                select(ForecastOutcomeCohortMember).where(
+                    ForecastOutcomeCohortMember.cohort_id == cohort_id
+                )
+            )
+        ).scalar_one()
+    assert projected_member.forecast_id == forecast_id
+    assert projected_member.step == 1
+    assert projected_member.target_time == earliest_target
+    assert projected_member.opportunity_hash == run_opportunity_hash
+    assert projected_member.output_hash == output_hash(canonical_output_bytes)
+
+    async with engine.begin() as conn:
+        sealer_xid = (await conn.execute(select(func.txid_current()))).scalar_one()
+        seal = (
+            await conn.execute(
+                pg_insert(ForecastOutcomeCohortAvailability)
+                .values(
+                    cohort_id=cohort_id,
+                    manifest_recorded_at=caller_timestamp,
+                    sealed_at=caller_timestamp,
+                    sealer_xid=0,
+                )
+                .returning(
+                    ForecastOutcomeCohortAvailability.manifest_recorded_at,
+                    ForecastOutcomeCohortAvailability.sealed_at,
+                    ForecastOutcomeCohortAvailability.sealer_xid,
+                )
+            )
+        ).one()
+    assert sealer_xid != stored_manifest.creator_xid
+    assert seal.sealer_xid == sealer_xid
+    assert seal.manifest_recorded_at == stored_manifest.recorded_at
+    assert stored_manifest.recorded_at <= seal.sealed_at < earliest_target
+    assert seal.sealed_at != caller_timestamp
+
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        with pytest.raises(DBAPIError, match="permission denied"):
+            await conn.execute(
+                pg_insert(ForecastOutcomeCohortMember).values(
+                    cohort_id=cohort_id,
+                    forecast_id=forecast_id,
+                    step=2,
+                    target_time=earliest_target,
+                    opportunity_hash=run_opportunity_hash,
+                    output_hash=output_hash(canonical_output_bytes),
+                )
+            )
+        await transaction.rollback()
+
+    for mutation in (
+        "UPDATE forecast_outcome_cohort_manifests SET purpose = purpose "
+        "WHERE cohort_id = :cohort_id",
+        "DELETE FROM forecast_outcome_cohort_manifests WHERE cohort_id = :cohort_id",
+        "TRUNCATE forecast_outcome_cohort_manifests CASCADE",
+        "UPDATE forecast_outcome_cohort_members SET step = step WHERE cohort_id = :cohort_id",
+        "DELETE FROM forecast_outcome_cohort_members WHERE cohort_id = :cohort_id",
+        "TRUNCATE forecast_outcome_cohort_members",
+        "UPDATE forecast_outcome_cohort_availability SET cohort_id = cohort_id "
+        "WHERE cohort_id = :cohort_id",
+        "DELETE FROM forecast_outcome_cohort_availability WHERE cohort_id = :cohort_id",
+        "TRUNCATE forecast_outcome_cohort_availability",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match="forecast evidence is insert-only"):
+                await conn.execute(
+                    text(mutation),
+                    {"cohort_id": cohort_id} if ":cohort_id" in mutation else {},
+                )
+            await transaction.rollback()
 
 
 async def test_upsert_replay_is_noop_and_restatement_writes_revision(engine: AsyncEngine) -> None:

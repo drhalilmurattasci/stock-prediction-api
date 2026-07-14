@@ -10,11 +10,17 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 
 ## Status
 
-🚧 **First honest forecast vertical slice is code-complete; the live DB gate passes.**
+🚧 **First honest forecast vertical slice is code-complete; migration `0010`
+awaits its next live-DB gate execution.**
 The repository now has API-key auth, bounded `/v1/prices` reads, versioned Polygon
 daily-bar ingestion, append-only restatement history, leakage-aware baselines, an
 immutable point-in-time snapshot builder, snapshot-backed `/v1/forecast`, and an
 insert-only content-hashed forecast-run archive with retry-safe POST idempotency.
+Migration `0010` also establishes the policy-explicit forecast-evidence
+substrate: realized raw-close outcomes bind one exact post-commit bar receipt,
+while immutable cohort manifests materialize members validated against exact
+scheduled forecast outputs and receive a distinct post-commit seal before their
+first target so later evaluation cannot silently cherry-pick membership.
 
 The initial builder policy is intentionally narrow: Massive/Polygon raw
 regular-session closes from `/v1/open-close` (source `polygon_open_close`) for
@@ -25,13 +31,17 @@ prices remain refused until the separate corporate-action ledger exists. The
 route also stays `501` until an operator explicitly pins the code-derived policy
 and availability hashes.
 
-Unit/static gates and the one-command destructive TimescaleDB integration gate
-pass locally. `run-live-gate.ps1` is hard-bound to the designated
-`stockapi_test` throwaway database and proves migrations through `0009`, exact
+Unit/static gates cover the evidence substrate. The destructive TimescaleDB
+integration gate previously passed through `0009`; migration `0010` is now
+wired into that same one-command proof and awaits its next runtime execution.
+`run-live-gate.ps1` is hard-bound to the designated `stockapi_test` throwaway
+database and checks the complete migration chain, exact
 runtime/builder role boundaries, restatement history, historical point-in-time
-snapshot reconstruction, archived serving, and schema-validated keyed replay. Ordinary test runs still
-skip that gate when its explicit live-database environment is absent. The first
-real Massive/Polygon call remains a separate credentialed smoke gate.
+snapshot reconstruction, archived serving, schema-validated keyed replay, and
+the outcome/cohort hash, exact-receipt, immutability, role-boundary, and
+pre-outcome sealing constraints. Ordinary test runs still skip that gate when
+its explicit live-database environment is absent. The first real
+Massive/Polygon call remains a separate credentialed smoke gate.
 That gate now has a one-attempt, fail-closed operator command documented in
 `INSTALL.md`; no vendor request runs as part of ordinary verification. The next
 history step is also scaffolded but has not run: a clean-commit-bound MSFT plan
@@ -72,6 +82,12 @@ use `run-forecast-demo.ps1`; its one-shot builder does not enable Celery
 automation. Compose publishes the API on loopback only. That proof builds from
 the exact reviewed Git commit and pins both API and one-shot builder execution
 to revision-labelled immutable image IDs.
+
+The evidence schema and strict canonical validators are a foundation, not a
+claim of calibration: no unattended outcome resolver, cohort publisher,
+scoreboard, or interval recalibrator is enabled yet. Those actors must bind an
+explicit resolution/selection policy and remain behind the same automation and
+budget controls before they can publish evidence.
 
 See [INSTALL.md](INSTALL.md) for the full Windows/WSL2 setup. Persistent workers
 and Beat are intentionally not safe-by-default startup conveniences: inspect or

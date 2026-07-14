@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -239,6 +240,21 @@ class BarVersionAvailability(Base):
             "adjustment_basis",
             "ts",
             "available_at",
+        ),
+        # The primary key identifies the exact bar version; including the
+        # DB-stamped receipt time in a second candidate key lets immutable
+        # evidence rows bind the receipt timestamp itself through a composite
+        # foreign key rather than copying an unchecked scalar.
+        UniqueConstraint(
+            "symbol",
+            "timespan",
+            "multiplier",
+            "ts",
+            "source",
+            "adjustment_basis",
+            "version_recorded_at",
+            "available_at",
+            name="uq_bar_version_availability_exact_receipt",
         ),
     )
 

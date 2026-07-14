@@ -74,8 +74,42 @@ output and replays the winner or returns `idempotency_in_progress`. Persisted
 post-compute completion time, while `recorded_at` remains its later acceptance
 stamp. This keeps the time-order invariant in one clock domain.
 
-The remaining Phase 3 trust gaps are append-only realized-outcome and calibration
-artifacts, stable idempotency identity across credential/secret rotation, a
-reproducible model registry/leaderboard, and models that empirically beat the
-baselines. Daily forecast manifests/external anchoring remain beyond the per-run
-SHA-256 archive. Later endpoint families remain phased backlog.
+Forecast evidence is append-only and policy-explicit rather than one mutable
+notion of "truth." A realized raw-close outcome carries both the outcome
+resolution-policy hash and the availability-rule-set hash, stores strict
+canonical bytes under a SHA-256 identity, and binds the complete key of one
+`bar_version_availability` row, including its database-stamped `available_at`.
+Before accepting the row, PostgreSQL resolves that exact version across the
+current bar and append-only revisions and derives/checks its close, fetched
+time, and source-as-of time. The target close, copied source value, resolution
+cutoff, and database-stamped seal must form one ordered timeline. A restatement
+can therefore produce new evidence under an explicit policy; it cannot rewrite
+an older outcome row or attach an unreceipted scalar to it.
+
+Calibration/evaluation membership is precommitted separately. A canonical
+cohort manifest identifies exact `(forecast_id, step)` members derived from
+`scheduled_evaluation` archive outputs and binds selection, outcome-resolution,
+and availability policies. PostgreSQL stamps the manifest transaction, then
+accepts its availability receipt only in a later transaction and strictly
+before the earliest target. This second-transaction receipt is the evidence
+that membership was durably visible before outcomes, rather than merely stamped
+inside an uncommitted transaction. PostgreSQL materializes each canonical member
+into a fourth relational table and validates it against the exact archived
+`scheduled_evaluation` output; callers cannot insert projection rows directly.
+All four evidence tables reject update, delete, and truncate. `stockapi_app` has
+`SELECT`/`INSERT` on outcomes, manifests, and availability receipts but
+`SELECT` only on materialized members; the snapshot-builder role has no access.
+
+Migration `0010` and the pure canonical validators establish this storage and
+validation boundary. Its live assertions are wired into the one-command
+throwaway-database gate but await the next runtime execution. No unattended
+outcome resolver, cohort publisher, scoreboard, or interval recalibrator is
+enabled yet; those operational actors must receive explicit policy artifacts
+and automation controls before use.
+
+The remaining Phase 3 trust gaps are the controlled outcome-resolution and
+cohort-publication write paths, scored calibration artifacts, stable
+idempotency identity across credential/secret rotation, a reproducible model
+registry/leaderboard, and models that empirically beat the baselines. Daily
+forecast manifests/external anchoring remain beyond the per-run SHA-256 archive.
+Later endpoint families remain phased backlog.

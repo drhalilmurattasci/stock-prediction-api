@@ -473,7 +473,7 @@ First run pulls images (TimescaleDB, Redis) and the MLflow container pip-install
 Fresh databases create the fixed, non-owner `stockapi_app` and
 `stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
 Existing initialized database directories do not rerun Docker init scripts;
-bootstrap both roles once before applying migrations `0007` through `0009`:
+bootstrap both roles once before applying migrations `0007` through `0010`:
 
 ```powershell
 docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh
@@ -542,7 +542,8 @@ python -c "import os,sqlalchemy as sa; from dotenv import load_dotenv; load_dote
 The empirical database gate is intentionally destructive and must only target
 a specifically designated throwaway TimescaleDB. It drops/recreates the project
 tables before proving migrations, role ACLs, bar revisions, snapshot creation,
-and read-only serving:
+read-only serving, exact-receipt realized-outcome evidence, and pre-outcome
+cohort sealing:
 
 ```powershell
 .\run-live-gate.ps1
@@ -562,9 +563,11 @@ migrations, leaving an empty schema at migration head so the later vendor smoke
 still proves absence. It never makes a vendor call.
 
 ✅ When all rows pass, the database migration, privilege, revision, immutable
-snapshot, runtime-role serving, API-key short circuit, and authenticated HTTP
-forecast boundaries are proven. Polygon credentials and Celery/Beat remain
-outside this destructive gate.
+snapshot, runtime-role serving, API-key short circuit, authenticated HTTP
+forecast, realized-outcome hash/exact-receipt, and cohort post-commit sealing
+boundaries are proven. Polygon credentials and Celery/Beat remain outside this
+destructive gate. The evidence checks prove storage invariants only; they do not
+enable an unattended outcome resolver, cohort publisher, or calibrator.
 
 ### Separately authorized first vendor request
 
