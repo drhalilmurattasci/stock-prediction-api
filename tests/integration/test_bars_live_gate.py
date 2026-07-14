@@ -44,6 +44,7 @@ from typing import Any, Self
 from uuid import UUID
 
 import exchange_calendars
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, make_url, select, text
@@ -82,6 +83,7 @@ from app.schemas.forecast import (
     ForecastStep,
     LookaheadCheck,
 )
+from app.schemas.indicators import IndicatorFilters
 from app.schemas.prices import PriceFilters
 from app.services.forecast_cohort_store import ForecastCohortProof, SqlForecastCohortStore
 from app.services.forecast_cohorts import (
@@ -138,6 +140,7 @@ from app.services.forecast_snapshots import (
     parse_snapshot_payload,
     validate_and_resolve_snapshot,
 )
+from app.services.indicators import WINDOW_POLICY_HASH, read_indicators
 from app.services.market_calendar import latest_completed_xnys_session
 from app.services.prices import read_prices
 from app.services.scheduled_evaluation import (
@@ -2562,6 +2565,57 @@ async def test_two_page_read_covers_all_bars_without_gap_or_dup(engine: AsyncEng
     assert combined == sorted(combined)  # chronological across pages
     assert len(set(combined)) == 5  # no duplicates, no gaps
     assert all(ts.utcoffset() == timedelta(0) for ts in combined)  # TIMESTAMPTZ round-trip
+
+
+async def test_indicator_window_reads_real_postgres_and_validates_xnys_closes(
+    engine: AsyncEngine,
+) -> None:
+    """Prove the bounded derived read over real stored TIMESTAMPTZ rows."""
+
+    calendar = exchange_calendars.get_calendar("XNYS")
+    labels = calendar.sessions_window(pd.Timestamp("2026-07-13"), -34)
+    bars: list[OHLCVBar] = []
+    for index, label in enumerate(labels):
+        observed_at = calendar.session_close(label).to_pydatetime().astimezone(UTC)
+        close = 100.0 + index / 10.0
+        bars.append(
+            OHLCVBar(
+                symbol="INDI",
+                timestamp=observed_at,
+                timespan="day",
+                multiplier=1,
+                open=close - 0.5,
+                high=close + 1.0,
+                low=close - 1.0,
+                close=close,
+                volume=1_000_000.0 + index,
+                vwap=close - 0.1,
+                trade_count=10_000 + index,
+                source="polygon_open_close",
+                adjustment_basis="raw",
+                fetched_at=observed_at + timedelta(minutes=1),
+            )
+        )
+
+    maker = build_sessionmaker(engine)
+    async with maker() as session, session.begin():
+        plan = await upsert_bars(session, bars)
+        assert len(plan.rows) == 34
+        assert plan.revisions == []
+
+    async with maker() as session:
+        response = await read_indicators(session, "INDI", IndicatorFilters())
+        assert session.in_transaction() is False
+
+    assert response.count == 34
+    assert response.window.input_count == 34
+    assert response.window.continuity == "exact_consecutive_regular_session_closes"
+    assert response.window.input_start == bars[0].timestamp
+    assert response.window.input_end == bars[-1].timestamp
+    assert response.window.input_sha256 is not None
+    assert response.window_policy_hash == WINDOW_POLICY_HASH
+    assert response.observations[0].sma is None
+    assert response.observations[-1].macd_signal is not None
 
 
 _RAW_INSERT = text(

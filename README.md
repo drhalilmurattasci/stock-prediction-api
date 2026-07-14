@@ -13,8 +13,9 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 🚧 **The fail-closed forecast/evidence substrate is code-complete through
 migration `0011`, but the product has not yet served a forecast over real
 vendor data.**
-The repository now has API-key auth, bounded `/v1/prices` reads, versioned Polygon
-daily-bar ingestion, append-only restatement history, leakage-aware baselines, an
+The repository now has API-key auth, bounded `/v1/prices` and `/v1/indicators`
+reads, versioned Polygon daily-bar ingestion, append-only restatement history, an
+owned causal indicator library, leakage-aware baselines, an
 immutable point-in-time snapshot builder, snapshot-backed `/v1/forecast`, and an
 insert-only content-hashed forecast-run archive with retry-safe POST idempotency.
 Migrations `0010`-`0011` establish the policy-explicit forecast-evidence
@@ -34,6 +35,18 @@ exchange-session target closes. Adjusted
 prices remain refused until the separate corporate-action ledger exists. The
 route also stays `501` until an operator explicitly pins the code-derived policy
 and availability hashes.
+
+`/v1/indicators/{symbol}` is the second implemented Phase 2 read surface. Version
+one is intentionally fixed to the raw daily `polygon_open_close` lane and the
+newest 258 stored XNYS closes before an optional exclusive timestamp. It rejects
+nonconsecutive session windows and nonpositive or otherwise invalid calculation
+inputs, discloses structural warm-up nulls and window-relative recursive seeds,
+and separates formula-policy, window-policy, and exact-input hashes. The endpoint
+is a current-snapshot calculation, not an availability-as-of reconstruction;
+later restatements can change a historical request, raw values can include
+unresolved corporate-action discontinuities, and it does not assert that the
+newest stored row is the latest completed session. The database is still empty,
+so this API work does not change the real-data/product status above.
 
 Unit/static gates cover the evidence substrate. The destructive TimescaleDB
 integration gate now passes through migration `0011` on real PostgreSQL 17.

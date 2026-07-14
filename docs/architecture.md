@@ -20,6 +20,17 @@ Massive/Polygon `/v1/open-close` raw regular-session daily bars
   -> /v1/forecast
 ```
 
+The same current `bars` table has a deliberately separate read-only analysis
+branch to `/v1/indicators`. Version one selects at most the newest 258 exact
+`polygon_open_close/raw/day/1` rows before an optional exclusive observation
+timestamp, verifies that they are consecutive XNYS regular-session closes, and
+computes the owned causal indicator bundle. Its response identifies the pinned
+formula policy, fixed calculation-window policy, and exact ordered input rows
+independently. EMA, RSI, MACD, and ATR seeds are window-relative, structural
+warm-up stays null, and an `end` bound is not an availability cutoff: this is a
+current-snapshot API, not point-in-time evidence. It neither certifies that the
+latest completed session is present nor reconciles raw split/dividend effects.
+
 The API never creates snapshots on demand. Snapshot rows are born sealed in one
 insert; PostgreSQL stamps `sealed_at`, verifies the SHA-256, and rejects update,
 delete, or truncate. On a builder retry, the builder reconstructs the
@@ -128,7 +139,7 @@ publisher, but has no table- or column-level outcome INSERT. It retains the
 minimum manifest/seal writes and read access required by the internal seam; the
 snapshot-builder role has no outcome-evidence access.
 
-Migration `0010`, the pure canonical validators, and the default-off scheduled
+Migrations `0010`-`0011`, the pure canonical validators, and the default-off scheduled
 evaluation service establish this storage and publication boundary. A scheduled
 spec must pin the snapshot, concrete model version, build revision, selected
 steps, and all forecast/selection/outcome policy hashes. The service archives
