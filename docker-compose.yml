@@ -40,7 +40,7 @@ services:
         "--maxmemory",
         "256mb",
         "--maxmemory-policy",
-        "allkeys-lru",
+        "noeviction",
       ]
     ports:
       - "127.0.0.1:6379:6379"
@@ -104,6 +104,7 @@ services:
       RATE_LIMIT_STORAGE_URI: redis://redis-cache:6379/1
       RATE_LIMIT_DEFAULT: ${RATE_LIMIT_DEFAULT:-120/minute}
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_STORAGE_TIMEOUT_SECONDS: ${RATE_LIMIT_STORAGE_TIMEOUT_SECONDS:-1}
       CELERY_BROKER_URL: redis://redis-celery:6379/0
       CELERY_RESULT_BACKEND: redis://redis-celery:6379/1
       MLFLOW_TRACKING_URI: http://mlflow:5000

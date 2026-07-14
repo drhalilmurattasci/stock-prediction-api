@@ -19,11 +19,12 @@ import hmac
 import math
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import redis.asyncio as aioredis
+import structlog
 from fastapi import status
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
@@ -37,6 +38,14 @@ _RATE_PATTERN = re.compile(r"^\s*(\d+)\s*/\s*(second|minute|hour|day)s?\s*$")
 _WINDOW_SECONDS = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}
 #: Identity hashes are truncated: 128 bits is ample for bucket uniqueness.
 _IDENTITY_HEX_CHARS = 32
+_REDIS_INCREMENT_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return count
+"""
+log = structlog.get_logger(__name__)
 
 
 def parse_rate(rate: str) -> tuple[int, int]:
@@ -64,6 +73,8 @@ class RateLimitBackend(Protocol):
 
     async def increment(self, bucket: str, ttl_seconds: int) -> int: ...
 
+    async def check(self) -> None: ...
+
     async def aclose(self) -> None: ...
 
 
@@ -90,6 +101,9 @@ class MemoryRateLimitBackend:
     async def aclose(self) -> None:
         return None
 
+    async def check(self) -> None:
+        return None
+
     def buckets(self) -> tuple[str, ...]:
         """Test hook: every bucket identifier currently held."""
         return tuple(self._counts)
@@ -102,10 +116,16 @@ class RedisRateLimitBackend:
         self._client = client
 
     async def increment(self, bucket: str, ttl_seconds: int) -> int:
-        count = int(await self._client.incr(bucket))
-        if count == 1:
-            await self._client.expire(bucket, ttl_seconds)
-        return count
+        # INCR and first-hit expiry must be one Redis operation. If a worker
+        # dies between separate commands, the bucket otherwise leaks forever.
+        result = await cast(
+            Awaitable[Any],
+            self._client.eval(_REDIS_INCREMENT_SCRIPT, 1, bucket, str(ttl_seconds)),
+        )
+        return int(result)
+
+    async def check(self) -> None:
+        await cast(Awaitable[Any], self._client.ping())
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -119,6 +139,7 @@ class ApiRateLimiter:
     window_seconds: int
     backend: RateLimitBackend
     identity_secret: str
+    valid_key_identities: frozenset[str] = frozenset()
     enabled: bool = True
     fail_open: bool = False
     scope_prefix: str = "/v1"
@@ -131,7 +152,11 @@ class ApiRateLimiter:
                 api_key.encode("utf-8"),
                 hashlib.sha256,
             ).hexdigest()[:_IDENTITY_HEX_CHARS]
-            return f"key:{digest}"
+            # Only authenticated key material earns a distinct quota. Without
+            # this membership gate, an attacker can rotate arbitrary invalid
+            # header values and receive a fresh pre-auth bucket each time.
+            if digest in self.valid_key_identities:
+                return f"key:{digest}"
         return f"ip:{client_ip}"
 
     async def hit(self, identity: str) -> RateLimitDecision:
@@ -153,18 +178,43 @@ class ApiRateLimiter:
 def build_rate_limiter(settings: Settings) -> ApiRateLimiter:
     """Build the app limiter; a malformed rate spec fails app startup loudly."""
     limit, window_seconds = parse_rate(settings.rate_limit_default)
+    storage_uri = settings.rate_limit_storage_uri
+    if (
+        settings.rate_limit_enabled
+        and settings.app_env in {"staging", "production"}
+        and not storage_uri.startswith(("redis://", "rediss://"))
+    ):
+        raise ValueError("staging/production rate limiting requires shared Redis storage")
     backend: RateLimitBackend
-    if settings.rate_limit_storage_uri.startswith(("redis://", "rediss://")):
-        backend = RedisRateLimitBackend(aioredis.from_url(settings.rate_limit_storage_uri))
-    elif settings.rate_limit_storage_uri.startswith("memory://"):
+    if storage_uri.startswith(("redis://", "rediss://")):
+        timeout = settings.rate_limit_storage_timeout_seconds
+        backend = RedisRateLimitBackend(
+            aioredis.from_url(
+                storage_uri,
+                socket_connect_timeout=timeout,
+                socket_timeout=timeout,
+                retry_on_timeout=False,
+            )
+        )
+    elif storage_uri.startswith("memory://"):
         backend = MemoryRateLimitBackend()
     else:
-        raise ValueError(f"unsupported rate_limit_storage_uri: {settings.rate_limit_storage_uri!r}")
+        raise ValueError(f"unsupported rate_limit_storage_uri: {storage_uri!r}")
+    identity_secret = settings.jwt_secret
+    valid_key_identities = frozenset(
+        hmac.new(
+            identity_secret.encode("utf-8"),
+            api_key.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()[:_IDENTITY_HEX_CHARS]
+        for api_key in settings.api_key_set
+    )
     return ApiRateLimiter(
         limit=limit,
         window_seconds=window_seconds,
         backend=backend,
-        identity_secret=settings.jwt_secret,
+        identity_secret=identity_secret,
+        valid_key_identities=valid_key_identities,
         enabled=settings.rate_limit_enabled,
         fail_open=settings.rate_limit_fail_open,
         scope_prefix=settings.api_v1_prefix,
@@ -189,6 +239,13 @@ def _apply_headers(response: Response, decision: RateLimitDecision) -> None:
     response.headers["RateLimit-Reset"] = str(decision.reset_after)
 
 
+def _path_is_in_scope(path: str, prefix: str) -> bool:
+    normalized = prefix.rstrip("/") or "/"
+    if normalized == "/":
+        return path.startswith("/")
+    return path == normalized or path.startswith(f"{normalized}/")
+
+
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Enforce the shared per-identity quota on every versioned API route.
 
@@ -202,14 +259,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if (
             limiter is None
             or not limiter.enabled
-            or not request.url.path.startswith(limiter.scope_prefix)
+            or not _path_is_in_scope(request.url.path, limiter.scope_prefix)
         ):
             return await call_next(request)
         client_ip = request.client.host if request.client else "unknown"
         identity = limiter.identity_for(request.headers.get(API_KEY_HEADER), client_ip)
         try:
             decision = await limiter.hit(identity)
-        except Exception:  # noqa: BLE001 - storage outage: honor the fail posture.
+        except Exception as exc:  # noqa: BLE001 - storage outage: honor the fail posture.
+            log.warning(
+                "rate_limit_backend_unavailable",
+                path=request.url.path,
+                error_type=type(exc).__name__,
+                fail_open=limiter.fail_open,
+            )
             if limiter.fail_open:
                 return await call_next(request)
             return _envelope(

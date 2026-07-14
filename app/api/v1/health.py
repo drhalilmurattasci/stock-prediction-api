@@ -25,9 +25,14 @@ async def _redis_probe(request: Request) -> None:
     await check_redis(request.app.state.redis_cache)
 
 
+async def _rate_limit_probe(request: Request) -> None:
+    await request.app.state.rate_limiter.backend.check()
+
+
 DEFAULT_READINESS_PROBES: tuple[tuple[str, ReadinessProbe], ...] = (
     ("database", _database_probe),
     ("redis", _redis_probe),
+    ("rate_limit", _rate_limit_probe),
 )
 
 

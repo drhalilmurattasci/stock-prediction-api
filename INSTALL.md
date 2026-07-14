@@ -269,6 +269,7 @@ CELERY_RESULT_BACKEND=redis://localhost:6380/1
 RATE_LIMIT_STORAGE_URI=memory://
 RATE_LIMIT_DEFAULT=120/minute
 RATE_LIMIT_ENABLED=true
+RATE_LIMIT_STORAGE_TIMEOUT_SECONDS=1
 
 # ---- Services ----
 MLFLOW_TRACKING_URI=http://localhost:5000
@@ -356,7 +357,7 @@ services:
         "--maxmemory",
         "256mb",
         "--maxmemory-policy",
-        "allkeys-lru",
+        "noeviction",
       ]
     ports:
       - "127.0.0.1:6379:6379"
