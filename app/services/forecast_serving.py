@@ -10,9 +10,8 @@ Every gate fails closed:
 * only snapshots whose availability evidence verifies against the trusted
   rule set are served — a "not_run"/untrusted snapshot is refused, never
   emitted with a soft warning;
-* an ``Idempotency-Key`` is refused until a persisted forecast-run store can
-  actually honor retry-safe replay, rather than silently treating retries as
-  new runs.
+* every successful response is committed to the forecast-run archive before
+  release, and ``Idempotency-Key`` retries replay its validated canonical model.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core.exceptions import AppError, NotFoundError, NotImplementedYet
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.schemas.forecast import ForecastRequest, ForecastResponse
+from app.services.forecast_run_store import ForecastRunStore, SqlForecastRunStore
 from app.services.forecast_snapshots import (
     SNAPSHOT_SCHEMA_VERSION,
     ForecastInputSnapshotRecord,
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
     from app.config import Settings
 
 _HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_BUILD_REVISION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_BUILD_REVISION_PATH = Path("/app/.stockapi-build-revision")
 
 #: Policy v1 deliberately serves raw closes only. Adjusted targets require the
 #: separate corporate-action ledger promised by the project doctrine; vendor-
@@ -62,6 +65,30 @@ _SERIES_BASIS_BY_TARGET = {
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def read_build_revision(path: Path = _BUILD_REVISION_PATH) -> str | None:
+    """Read the image-attested code identity without inventing a local value."""
+
+    if not path.exists():
+        return None
+    try:
+        revision = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise AppError(
+            "Forecast build revision cannot be read.",
+            code="forecast_build_revision_invalid",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        ) from exc
+    if not revision or revision == "unattested":
+        return None
+    if _BUILD_REVISION_PATTERN.fullmatch(revision) is None:
+        raise AppError(
+            "Forecast build revision is malformed.",
+            code="forecast_build_revision_invalid",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return revision
 
 
 @dataclass(frozen=True)
@@ -147,30 +174,53 @@ def _record_from_row(row: ForecastInputSnapshot) -> ForecastInputSnapshotRecord:
 
 
 @dataclass(frozen=True)
+class SessionForecastInputSnapshotRepository:
+    """Read-only snapshot store bound to an existing transaction/session."""
+
+    session: AsyncSession
+    trusted_availability_rule_set_hash: str | None = None
+
+    async def get(self, snapshot_id: str) -> ForecastInputSnapshotRecord | None:
+        row = await self.session.get(ForecastInputSnapshot, snapshot_id)
+        return None if row is None else _record_from_row(row)
+
+    async def latest(
+        self,
+        selector: ForecastInputSnapshotSelector,
+    ) -> ForecastInputSnapshotRecord | None:
+        result = await self.session.execute(
+            build_latest_snapshot_statement(
+                selector,
+                trusted_availability_rule_set_hash=(self.trusted_availability_rule_set_hash),
+            )
+        )
+        row = result.scalars().first()
+        return None if row is None else _record_from_row(row)
+
+
+@dataclass(frozen=True)
 class SqlForecastInputSnapshotRepository:
-    """Read-only snapshot store over the app's async sessionmaker."""
+    """Read-only snapshot store that owns a short session per lookup."""
 
     sessionmaker: async_sessionmaker[AsyncSession]
     trusted_availability_rule_set_hash: str | None = None
 
     async def get(self, snapshot_id: str) -> ForecastInputSnapshotRecord | None:
         async with self.sessionmaker() as session:
-            row = await session.get(ForecastInputSnapshot, snapshot_id)
-            return None if row is None else _record_from_row(row)
+            return await SessionForecastInputSnapshotRepository(
+                session,
+                self.trusted_availability_rule_set_hash,
+            ).get(snapshot_id)
 
     async def latest(
         self,
         selector: ForecastInputSnapshotSelector,
     ) -> ForecastInputSnapshotRecord | None:
         async with self.sessionmaker() as session:
-            result = await session.execute(
-                build_latest_snapshot_statement(
-                    selector,
-                    trusted_availability_rule_set_hash=(self.trusted_availability_rule_set_hash),
-                )
-            )
-            row = result.scalars().first()
-            return None if row is None else _record_from_row(row)
+            return await SessionForecastInputSnapshotRepository(
+                session,
+                self.trusted_availability_rule_set_hash,
+            ).latest(selector)
 
 
 @dataclass(frozen=True)
@@ -182,19 +232,35 @@ class SnapshotForecastService:
     clock: Callable[[], datetime] = _utc_now
     id_factory: Callable[[], UUID] = uuid4
     code_version: str | None = None
+    run_store: ForecastRunStore | None = None
 
     async def forecast(
         self,
         request: ForecastRequest,
         *,
         idempotency_key: str | None = None,
+        principal: str | None = None,
     ) -> ForecastResponse:
+        if self.run_store is not None:
+            return await self.run_store.execute(
+                request,
+                idempotency_key=idempotency_key,
+                principal=principal,
+                producer=lambda repository: self._produce(request, repository),
+            )
         if idempotency_key is not None:
             raise NotImplementedYet(
                 "Retry-safe forecast creation requires a persisted forecast-run "
                 "store; retry without an Idempotency-Key for one-shot creation.",
-                details={"idempotency_key": idempotency_key},
+                details={"idempotency_requested": True},
             )
+        return await self._produce(request, self.repository)
+
+    async def _produce(
+        self,
+        request: ForecastRequest,
+        repository: ForecastInputSnapshotRepository,
+    ) -> ForecastResponse:
         if request.horizon_unit != "trading_day":
             raise AppError(
                 "only trading_day forecast horizons are servable by policy v1",
@@ -202,7 +268,7 @@ class SnapshotForecastService:
                 status_code=status.HTTP_409_CONFLICT,
             )
         series_basis = self.policy.series_basis_for(request.target)
-        record = await self._load_record(request, series_basis)
+        record = await self._load_record(request, series_basis, repository)
         try:
             # Byte re-canonicalization + SHA-256 of a payload up to 4 MiB is
             # pure CPU; keep it off the event loop.
@@ -281,11 +347,12 @@ class SnapshotForecastService:
         self,
         request: ForecastRequest,
         series_basis: str,
+        repository: ForecastInputSnapshotRepository,
     ) -> ForecastInputSnapshotRecord:
         if request.snapshot_id is not None:
-            record = await self.repository.get(request.snapshot_id)
+            record = await repository.get(request.snapshot_id)
         else:
-            record = await self.repository.latest(
+            record = await repository.latest(
                 ForecastInputSnapshotSelector(
                     resolution_policy_hash=self.policy.resolution_policy_hash,
                     symbol=request.symbol,
@@ -361,5 +428,16 @@ def build_forecast_service(
             resolution_policy_hash=policy_hash,
             trusted_availability_rule_set_hash=trusted_hash,
             seasonal_period=settings.forecast_seasonal_period,
+        ),
+        code_version=read_build_revision(),
+        run_store=SqlForecastRunStore(
+            sessionmaker=sessionmaker,
+            repository_factory=lambda session: SessionForecastInputSnapshotRepository(
+                session,
+                trusted_availability_rule_set_hash=trusted_hash,
+            ),
+            identity_secret=settings.jwt_secret,
+            resolution_policy_hash=policy_hash,
+            availability_rule_set_hash=trusted_hash,
         ),
     )

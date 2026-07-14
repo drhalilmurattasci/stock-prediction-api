@@ -26,15 +26,16 @@ AS_OF = datetime(2026, 7, 10, 21, tzinfo=UTC)
 
 class FakeForecastService:
     def __init__(self) -> None:
-        self.calls: list[tuple[ForecastRequest, str | None]] = []
+        self.calls: list[tuple[ForecastRequest, str | None, str | None]] = []
 
     async def forecast(
         self,
         request: ForecastRequest,
         *,
         idempotency_key: str | None = None,
+        principal: str | None = None,
     ) -> ForecastResponse:
-        self.calls.append((request, idempotency_key))
+        self.calls.append((request, idempotency_key, principal))
         return _response_for(request)
 
 
@@ -44,6 +45,7 @@ class ExplodingForecastService(FakeForecastService):
         request: ForecastRequest,
         *,
         idempotency_key: str | None = None,
+        principal: str | None = None,
     ) -> ForecastResponse:
         raise AssertionError("forecast service must not run before API-key auth")
 
@@ -122,16 +124,23 @@ def test_get_forecast_delegates_normalized_request() -> None:
         )
 
     assert response.status_code == 200
-    request, idempotency_key = service.calls[0]
+    request, idempotency_key, principal = service.calls[0]
     assert request.symbol == "AAPL"
     assert request.interval_coverages == [0.8]
     assert idempotency_key is None
+    assert principal is None
     assert response.json()["provenance"]["model_version"] == "baseline-naive-fixture@1"
 
 
 def test_post_forecast_forwards_idempotency_key_and_return_currency() -> None:
     service = FakeForecastService()
-    app = create_app(Settings(app_env="test", rate_limit_enabled=False))
+    app = create_app(
+        Settings(
+            app_env="test",
+            rate_limit_enabled=False,
+            api_keys="fixture-api-key",
+        )
+    )
     app.dependency_overrides[get_forecast_service] = lambda: service
     payload = {
         "symbol": "aapl",
@@ -147,13 +156,17 @@ def test_post_forecast_forwards_idempotency_key_and_return_currency() -> None:
         response = client.post(
             "/v1/forecast",
             json=payload,
-            headers={"Idempotency-Key": "fixture-idempotency-key"},
+            headers={
+                "Idempotency-Key": "fixture-idempotency-key",
+                "X-API-Key": "fixture-api-key",
+            },
         )
 
     assert response.status_code == 200
-    request, idempotency_key = service.calls[0]
+    request, idempotency_key, principal = service.calls[0]
     assert request.symbol == "AAPL"
     assert idempotency_key == "fixture-idempotency-key"
+    assert principal == "fixture-api-key"
     assert response.json()["currency"] is None
 
 
@@ -206,4 +219,5 @@ def test_forecast_validation_and_openapi_use_the_project_error_envelope() -> Non
     assert "baseline_naive" in descriptions["model"]
     post_parameters = schema["paths"]["/v1/forecast"]["post"]["parameters"]
     idempotency = next(item for item in post_parameters if item["name"] == "Idempotency-Key")
-    assert "return 501" in idempotency["description"]
+    assert "schema-validated stored forecast" in idempotency["description"]
+    assert "credential" in idempotency["description"]

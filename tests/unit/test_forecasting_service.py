@@ -365,5 +365,7 @@ def test_lineage_order_fields_and_offsets_are_canonicalized() -> None:
 
 @pytest.mark.asyncio
 async def test_default_service_remains_fail_closed() -> None:
-    with pytest.raises(NotImplementedYet, match="not enabled"):
+    with pytest.raises(NotImplementedYet, match="not enabled") as excinfo:
         await UnavailableForecastService().forecast(_request(), idempotency_key="fixture-key")
+    assert "fixture-key" not in str(excinfo.value.details)
+    assert excinfo.value.details["idempotency_requested"] is True

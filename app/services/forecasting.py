@@ -89,6 +89,7 @@ class ForecastService(Protocol):
         request: ForecastRequest,
         *,
         idempotency_key: str | None = None,
+        principal: str | None = None,
     ) -> ForecastResponse: ...
 
 
@@ -100,12 +101,13 @@ class UnavailableForecastService:
         request: ForecastRequest,
         *,
         idempotency_key: str | None = None,
+        principal: str | None = None,
     ) -> ForecastResponse:
         raise NotImplementedYet(
             f"Verified snapshot serving is not enabled for {request.symbol}.",
             details={
                 "contract": "ForecastRequest -> ForecastResponse",
-                "idempotency_key": idempotency_key,
+                "idempotency_requested": idempotency_key is not None,
                 "blockers": [
                     "pin the code-derived resolution-policy hash",
                     "pin the trusted availability rule-set hash",

@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Header, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import AwareDatetime, ValidationError
 
+from app.core.security import require_api_key
 from app.schemas.common import ErrorResponse
 from app.schemas.forecast import (
     Coverage,
@@ -145,6 +146,7 @@ async def get_forecast(
 async def create_forecast(
     request: ForecastRequest,
     service: Annotated[ForecastService, Depends(get_forecast_service)],
+    principal: Annotated[str, Depends(require_api_key)],
     idempotency_key: Annotated[
         str | None,
         Header(
@@ -152,10 +154,15 @@ async def create_forecast(
             min_length=1,
             max_length=128,
             description=(
-                "Reserved retry key. Requests carrying it return 501 until the persisted "
-                "forecast-run replay store exists."
+                "Opaque retry key scoped to the current authenticated API credential and "
+                "server identity-secret epoch. Reusing the same key and request replays "
+                "the schema-validated stored forecast; changing the request returns 409."
             ),
         ),
     ] = None,
 ) -> ForecastResponse:
-    return await service.forecast(request, idempotency_key=idempotency_key)
+    return await service.forecast(
+        request,
+        idempotency_key=idempotency_key,
+        principal=principal,
+    )

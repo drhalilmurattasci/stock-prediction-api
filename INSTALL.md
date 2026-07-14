@@ -473,7 +473,7 @@ First run pulls images (TimescaleDB, Redis) and the MLflow container pip-install
 Fresh databases create the fixed, non-owner `stockapi_app` and
 `stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
 Existing initialized database directories do not rerun Docker init scripts;
-bootstrap both roles once before applying migrations `0007` and `0008`:
+bootstrap both roles once before applying migrations `0007` through `0009`:
 
 ```powershell
 docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh

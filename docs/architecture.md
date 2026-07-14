@@ -43,14 +43,20 @@ Adjusted prices require the planned versioned corporate-action
 factor ledger; vendor-rewritten history is not treated as that ledger.
 
 The current serving identity is equally explicit. `model=auto` executes
-`baseline-naive@1`; every invocation receives a new forecast UUID, even when the
-request and snapshot are identical; and the current `feature_set_hash` is the
-content-addressed snapshot ID because the only features are the sealed close
-series. Intervals are prediction intervals derived from baseline residuals, not
+`baseline-naive@1`; every unkeyed invocation receives a new archived forecast UUID,
+while a POST retry in the same authenticated credential/identity-secret epoch,
+with the same `Idempotency-Key` and normalized request, replays the validated
+canonical stored output. Credential or identity-secret rotation intentionally
+starts a new namespace until stable API-principal aliases and secret-version
+lookup land. The current
+`feature_set_hash` is the content-addressed snapshot ID because the only features
+are the sealed close series. Intervals are prediction intervals derived from baseline residuals, not
 confidence intervals for an estimated parameter. Serving reports
 `calibration.method=none`, no held-out coverage evidence, and an
 `uncalibrated:<model-version>` calibration identity.
 
-The remaining Phase 3 trust gaps are held-out calibration artifacts, a persisted
-forecast-run/idempotency store, a model registry/leaderboard, and models that
-empirically beat the baselines. Later endpoint families remain phased backlog.
+The remaining Phase 3 trust gaps are append-only realized-outcome and calibration
+artifacts, stable idempotency identity across credential/secret rotation, a
+reproducible model registry/leaderboard, and models that empirically beat the
+baselines. Daily forecast manifests/external anchoring remain beyond the per-run
+SHA-256 archive. Later endpoint families remain phased backlog.

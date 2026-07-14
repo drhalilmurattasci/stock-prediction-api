@@ -13,7 +13,8 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 🚧 **First honest forecast vertical slice is code-complete; the live DB gate passes.**
 The repository now has API-key auth, bounded `/v1/prices` reads, versioned Polygon
 daily-bar ingestion, append-only restatement history, leakage-aware baselines, an
-immutable point-in-time snapshot builder, and snapshot-backed `/v1/forecast`.
+immutable point-in-time snapshot builder, snapshot-backed `/v1/forecast`, and an
+insert-only content-hashed forecast-run archive with retry-safe POST idempotency.
 
 The initial builder policy is intentionally narrow: Massive/Polygon raw
 regular-session closes from `/v1/open-close` (source `polygon_open_close`) for
@@ -26,9 +27,9 @@ and availability hashes.
 
 Unit/static gates and the one-command destructive TimescaleDB integration gate
 pass locally. `run-live-gate.ps1` is hard-bound to the designated
-`stockapi_test` throwaway database and proves migrations through `0008`, exact
+`stockapi_test` throwaway database and proves migrations through `0009`, exact
 runtime/builder role boundaries, restatement history, historical point-in-time
-snapshot reconstruction, and snapshot-backed serving. Ordinary test runs still
+snapshot reconstruction, archived serving, and schema-validated keyed replay. Ordinary test runs still
 skip that gate when its explicit live-database environment is absent. The first
 real Massive/Polygon call remains a separate credentialed smoke gate.
 That gate now has a one-attempt, fail-closed operator command documented in

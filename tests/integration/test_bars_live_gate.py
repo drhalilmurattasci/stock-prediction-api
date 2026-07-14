@@ -7,10 +7,10 @@ creates or mutates the cluster-global runtime roles: bootstrap them first and
 provide both least-privilege URLs. Never point this gate at shared data. Run with::
 
     docker compose up -d timescaledb          # needs .env credentials
-    $env:TEST_DATABASE_URL = "postgresql+asyncpg://<user>:<pass>@localhost:5432/<db>"
+    $env:TEST_DATABASE_URL = "postgresql+asyncpg://<user>:<pass>@127.0.0.1:5432/<db>"
     # Optional when .env DATABASE_URL does not target the same throwaway DB:
-    $env:TEST_RUNTIME_DATABASE_URL = "postgresql+asyncpg://stockapi_app:<pass>@localhost:5432/<db>"
-    $env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = "postgresql+asyncpg://stockapi_snapshot_builder:<pass>@localhost:5432/<db>"
+    $env:TEST_RUNTIME_DATABASE_URL = "postgresql+asyncpg://stockapi_app:<pass>@127.0.0.1:5432/<db>"
+    $env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = "postgresql+asyncpg://stockapi_snapshot_builder:<pass>@127.0.0.1:5432/<db>"
     $env:TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET = "stockapi-test-only"
     uv run pytest tests/integration -v
 
@@ -45,10 +45,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from app.config import Settings
 from app.db.models.bars import Bar, BarRevision
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
+from app.db.models.predictions import ForecastRun
 from app.db.session import build_engine, build_sessionmaker
 from app.main import create_app
 from app.schemas.forecast import ForecastRequest, ForecastResponse
 from app.schemas.prices import PriceFilters
+from app.services.forecast_runs import (
+    idempotency_digest,
+    output_hash,
+    parse_output,
+    request_hash,
+)
 from app.services.forecast_serving import (
     ForecastServingPolicy,
     SnapshotForecastService,
@@ -177,7 +184,7 @@ def _drop_project_schema(url: str) -> None:
         with sync_engine.begin() as conn:
             conn.execute(
                 text(
-                    "DROP TABLE IF EXISTS forecast_input_snapshots, "
+                    "DROP TABLE IF EXISTS forecast_runs, forecast_input_snapshots, "
                     "bar_version_availability, bars_revisions, bars, alembic_version CASCADE"
                 )
             )
@@ -188,6 +195,8 @@ def _drop_project_schema(url: str) -> None:
                 "require_bar_revision_version_evidence",
                 "version_bar_write",
                 "stamp_bar_version_availability",
+                "reject_forecast_run_mutation",
+                "stamp_forecast_run_recorded_at",
             ):
                 conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
     finally:
@@ -320,7 +329,7 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0008_bar_version_availability"
+        assert version == "0009_forecast_runs"
         hypertables = (
             await conn.execute(
                 text(
@@ -345,6 +354,16 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
             )
         ).scalar_one()
         assert snapshot_index == 1
+        run_indexes = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_indexes WHERE indexname IN "
+                    "('ix_forecast_runs_opportunity_hash', "
+                    "'uq_forecast_runs_scheduled_opportunity')"
+                )
+            )
+        ).scalar_one()
+        assert run_indexes == 2
         pgcrypto = (
             await conn.execute(text("SELECT count(*) FROM pg_extension WHERE extname = 'pgcrypto'"))
         ).scalar_one()
@@ -414,6 +433,14 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
                 ("snapshot_update", "forecast_input_snapshots", "UPDATE"),
                 ("snapshot_delete", "forecast_input_snapshots", "DELETE"),
                 ("snapshot_truncate", "forecast_input_snapshots", "TRUNCATE"),
+                ("run_select", "forecast_runs", "SELECT"),
+                ("run_insert", "forecast_runs", "INSERT"),
+                ("run_update", "forecast_runs", "UPDATE"),
+                ("run_delete", "forecast_runs", "DELETE"),
+                ("run_truncate", "forecast_runs", "TRUNCATE"),
+                ("run_references", "forecast_runs", "REFERENCES"),
+                ("run_trigger", "forecast_runs", "TRIGGER"),
+                ("run_maintain", "forecast_runs", "MAINTAIN"),
             )
         }
         assert privileges == {
@@ -442,6 +469,14 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
             "snapshot_update": False,
             "snapshot_delete": False,
             "snapshot_truncate": False,
+            "run_select": True,
+            "run_insert": True,
+            "run_update": False,
+            "run_delete": False,
+            "run_truncate": False,
+            "run_references": False,
+            "run_trigger": False,
+            "run_maintain": False,
         }
         sequence_usage = (
             await conn.execute(
@@ -531,6 +566,11 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
                 ("snapshot_update", "forecast_input_snapshots", "UPDATE"),
                 ("snapshot_delete", "forecast_input_snapshots", "DELETE"),
                 ("snapshot_truncate", "forecast_input_snapshots", "TRUNCATE"),
+                ("run_select", "forecast_runs", "SELECT"),
+                ("run_insert", "forecast_runs", "INSERT"),
+                ("run_update", "forecast_runs", "UPDATE"),
+                ("run_delete", "forecast_runs", "DELETE"),
+                ("run_truncate", "forecast_runs", "TRUNCATE"),
             )
         }
         assert builder_privileges == {
@@ -549,6 +589,11 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
             "snapshot_update": False,
             "snapshot_delete": False,
             "snapshot_truncate": False,
+            "run_select": False,
+            "run_insert": False,
+            "run_update": False,
+            "run_delete": False,
+            "run_truncate": False,
         }
         for role in ("stockapi_app", "stockapi_snapshot_builder"):
             can_execute_receipt_trigger = (
@@ -561,6 +606,17 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
                 )
             ).scalar_one()
             assert can_execute_receipt_trigger is False
+            for function_name in (
+                "stamp_forecast_run_recorded_at()",
+                "reject_forecast_run_mutation()",
+            ):
+                can_execute_run_trigger = (
+                    await conn.execute(
+                        text("SELECT has_function_privilege(:role, :function_name, 'EXECUTE')"),
+                        {"role": role, "function_name": function_name},
+                    )
+                ).scalar_one()
+                assert can_execute_run_trigger is False
 
 
 async def test_upsert_replay_is_noop_and_restatement_writes_revision(engine: AsyncEngine) -> None:
@@ -978,7 +1034,10 @@ async def test_snapshot_insert_hash_resolution_and_immutability(
     for mutation in (
         "UPDATE forecast_input_snapshots SET symbol = 'MSFT' WHERE snapshot_id = :snapshot_id",
         "DELETE FROM forecast_input_snapshots WHERE snapshot_id = :snapshot_id",
-        "TRUNCATE forecast_input_snapshots",
+        # The run archive now references snapshots. CASCADE reaches both
+        # protected tables so their statement-level immutability triggers,
+        # rather than the FK precheck, must refuse the operation.
+        "TRUNCATE forecast_input_snapshots CASCADE",
     ):
         async with owner_engine.connect() as conn:
             transaction = await conn.begin()
@@ -993,6 +1052,7 @@ async def test_snapshot_insert_hash_resolution_and_immutability(
 async def test_bars_to_verified_snapshot_to_served_forecast(
     engine: AsyncEngine,
     snapshot_builder_engine: AsyncEngine,
+    owner_engine: AsyncEngine,
 ) -> None:
     """Prove the complete privileged-write/read-only-serving chain."""
 
@@ -1161,6 +1221,51 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
             params=params,
             headers={"X-API-Key": api_key},
         )
+        post_payload = {
+            "symbol": "AAPL",
+            "horizon": 5,
+            "horizon_unit": "trading_day",
+            "target": "close",
+            "snapshot_id": current_created.snapshot_id,
+            "model": "baseline_naive",
+            "interval_coverages": [0.8],
+        }
+        retry_headers = {
+            "X-API-Key": api_key,
+            "Idempotency-Key": "live-gate-retry-token",
+        }
+        created = client.post("/v1/forecast", json=post_payload, headers=retry_headers)
+        replayed = client.post("/v1/forecast", json=post_payload, headers=retry_headers)
+        changed_payload = {**post_payload, "horizon": 4}
+        conflict = client.post(
+            "/v1/forecast",
+            json=changed_payload,
+            headers=retry_headers,
+        )
+        contended_key = "live-gate-contended-token"
+        contended_digest = idempotency_digest(
+            principal=api_key,
+            idempotency_key=contended_key,
+            secret=api_settings.jwt_secret,
+        )
+        lock_key = int.from_bytes(
+            bytes.fromhex(contended_digest.removeprefix("hmac-sha256:"))[:8],
+            byteorder="big",
+            signed=True,
+        )
+        async with runtime_maker() as lock_session, lock_session.begin():
+            await lock_session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+            contended = client.post(
+                "/v1/forecast",
+                json=post_payload,
+                headers={
+                    "X-API-Key": api_key,
+                    "Idempotency-Key": contended_key,
+                },
+            )
 
     assert unauthenticated.status_code == 401
     assert unauthenticated.headers["WWW-Authenticate"] == "X-API-Key"
@@ -1171,3 +1276,47 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     assert served.provenance.feature_set_hash == current_created.snapshot_id
     assert served.provenance.lookahead_check.status == "passed"
     assert len(served.forecasts) == 5
+    assert created.status_code == 200
+    assert replayed.status_code == 200
+    assert replayed.content == created.content
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "idempotency_key_conflict"
+    assert "live-gate-retry-token" not in conflict.text
+    assert contended.status_code == 409
+    assert contended.json()["error"]["code"] == "idempotency_in_progress"
+    assert contended_key not in contended.text
+
+    async with runtime_maker() as session:
+        archived = (await session.execute(select(ForecastRun))).scalars().all()
+    assert len(archived) == 2  # one GET run plus one keyed POST; replay adds none
+    keyed = next(row for row in archived if row.idempotency_token_digest is not None)
+    unkeyed = next(row for row in archived if row.idempotency_token_digest is None)
+    assert (
+        keyed.forecast_id == ForecastResponse.model_validate(created.json()).provenance.forecast_id
+    )
+    assert unkeyed.forecast_id == served.provenance.forecast_id
+    assert request_hash(bytes(keyed.canonical_request)) == keyed.request_hash
+    assert output_hash(bytes(keyed.canonical_output)) == keyed.output_hash
+    assert parse_output(bytes(keyed.canonical_output)).provenance.forecast_id == keyed.forecast_id
+    assert keyed.recorded_at >= keyed.generated_at
+    archived_material = (
+        bytes(keyed.canonical_request)
+        + bytes(keyed.canonical_output)
+        + keyed.idempotency_token_digest.encode()
+    )
+    assert api_key.encode() not in archived_material
+    assert b"live-gate-retry-token" not in archived_material
+
+    for mutation in (
+        "UPDATE forecast_runs SET symbol = symbol WHERE forecast_id = :forecast_id",
+        "DELETE FROM forecast_runs WHERE forecast_id = :forecast_id",
+        "TRUNCATE forecast_runs",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match="insert-only"):
+                parameters = (
+                    {"forecast_id": keyed.forecast_id} if ":forecast_id" in mutation else {}
+                )
+                await conn.execute(text(mutation), parameters)
+            await transaction.rollback()

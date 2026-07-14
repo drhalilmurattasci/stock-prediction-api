@@ -12,12 +12,13 @@ from sqlalchemy.dialects import postgresql
 
 from app.config import Settings
 from app.core.exceptions import AppError, NotFoundError, NotImplementedYet
-from app.schemas.forecast import ForecastRequest
+from app.schemas.forecast import ForecastRequest, ForecastResponse
 from app.services.forecast_serving import (
     ForecastServingPolicy,
     SnapshotForecastService,
     build_forecast_service,
     build_latest_snapshot_statement,
+    read_build_revision,
 )
 from app.services.forecast_snapshots import (
     ForecastInputSnapshotPayload,
@@ -113,6 +114,23 @@ class FakeRepository:
     ) -> ForecastInputSnapshotRecord | None:
         self.latest_calls.append(selector)
         return self.record
+
+
+@dataclass
+class FakeRunStore:
+    repository: FakeRepository
+    calls: list[tuple[ForecastRequest, str | None, str | None]] = field(default_factory=list)
+
+    async def execute(
+        self,
+        request: ForecastRequest,
+        *,
+        idempotency_key: str | None,
+        principal: str | None,
+        producer,
+    ) -> ForecastResponse:
+        self.calls.append((request, idempotency_key, principal))
+        return await producer(self.repository)
 
 
 def _service(
@@ -290,10 +308,39 @@ async def test_clock_skew_is_clamped_to_as_of_not_500() -> None:
 async def test_idempotency_key_is_refused_until_a_run_store_exists() -> None:
     service, repository = _service(_record())
 
-    with pytest.raises(NotImplementedYet):
+    with pytest.raises(NotImplementedYet) as excinfo:
         await service.forecast(_request(), idempotency_key="retry-1")
 
     assert repository.get_calls == [] and repository.latest_calls == []
+    assert "retry-1" not in str(excinfo.value.details)
+
+
+async def test_persisted_run_store_owns_snapshot_resolution_and_accepts_keyed_retry() -> None:
+    bound_repository = FakeRepository(_record())
+    run_store = FakeRunStore(bound_repository)
+    fallback_repository = FakeRepository(None)
+    service = SnapshotForecastService(
+        repository=fallback_repository,
+        policy=ForecastServingPolicy(
+            resolution_policy_hash=POLICY_HASH,
+            trusted_availability_rule_set_hash=RULE_SET_HASH,
+        ),
+        clock=lambda: GENERATED_AT,
+        id_factory=lambda: FORECAST_ID,
+        run_store=run_store,
+    )
+
+    response = await service.forecast(
+        _request(),
+        idempotency_key="retry-1",
+        principal="api-principal",
+    )
+
+    assert response.provenance.forecast_id == FORECAST_ID
+    assert run_store.calls == [(_request(), "retry-1", "api-principal")]
+    assert bound_repository.latest_calls
+    assert fallback_repository.get_calls == []
+    assert fallback_repository.latest_calls == []
 
 
 def test_latest_statement_filters_exact_series_and_orders_newest_first() -> None:
@@ -365,6 +412,23 @@ def test_build_forecast_service_is_fail_closed_by_configuration() -> None:
     )
     assert isinstance(service, SnapshotForecastService)
     assert service.policy.seasonal_period == 7
+    assert service.run_store is not None
+
+
+def test_build_revision_is_honest_and_strict(tmp_path) -> None:
+    revision_file = tmp_path / ".stockapi-build-revision"
+    assert read_build_revision(revision_file) is None
+
+    revision_file.write_text("unattested\n", encoding="utf-8")
+    assert read_build_revision(revision_file) is None
+
+    revision_file.write_text("abc123-build.7\n", encoding="utf-8")
+    assert read_build_revision(revision_file) == "abc123-build.7"
+
+    revision_file.write_text("bad revision\n", encoding="utf-8")
+    with pytest.raises(AppError) as excinfo:
+        read_build_revision(revision_file)
+    assert excinfo.value.code == "forecast_build_revision_invalid"
 
 
 def test_dependency_returns_fail_closed_service_until_configured() -> None:

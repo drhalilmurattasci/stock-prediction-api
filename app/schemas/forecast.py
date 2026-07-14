@@ -269,8 +269,8 @@ class ForecastProvenance(ForecastBaseModel):
 
     forecast_id: UUID = Field(
         description=(
-            "Per-run forecast UUID. Repeating an identical request without persisted "
-            "idempotency creates a new identifier."
+            "Persisted forecast-run UUID. A keyed retry replays the same identifier; "
+            "an unkeyed request creates and archives a new run."
         )
     )
     snapshot_id: str = Field(

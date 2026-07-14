@@ -155,9 +155,9 @@ try {
     $builderPassword = [uri]::EscapeDataString($vars.POSTGRES_SNAPSHOT_BUILDER_PASSWORD)
     $database = $vars.POSTGRES_DB
 
-    $env:TEST_DATABASE_URL = "postgresql+asyncpg://stockapi_owner:$ownerPassword@localhost:5432/$database"
-    $env:TEST_RUNTIME_DATABASE_URL = "postgresql+asyncpg://stockapi_app:$runtimePassword@localhost:5432/$database"
-    $env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = "postgresql+asyncpg://stockapi_snapshot_builder:$builderPassword@localhost:5432/$database"
+    $env:TEST_DATABASE_URL = "postgresql+asyncpg://stockapi_owner:$ownerPassword@127.0.0.1:5432/$database"
+    $env:TEST_RUNTIME_DATABASE_URL = "postgresql+asyncpg://stockapi_app:$runtimePassword@127.0.0.1:5432/$database"
+    $env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = "postgresql+asyncpg://stockapi_snapshot_builder:$builderPassword@127.0.0.1:5432/$database"
     $env:TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET = "stockapi-test-only"
     $runningBeforeReset = @(
         docker @dockerArgs compose @composeArgs ps --status running --services

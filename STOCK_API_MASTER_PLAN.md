@@ -929,14 +929,14 @@ A mid-2026 competitive scan (2026-07-06; re-verify periodically) **did not find 
 - **Monetization design:** pricing tiers and quota semantics constrain the P0 rate-limit middleware and the API-key model — decide the tiering shape early even if billing itself ships in P6.
 
 **P0 — Foundations**
-- `Idempotency-Key` on `POST /v1/forecast` and `/v1/backtest` (doctrine-mandated, currently unscheduled) — *S*. *(contract header already stubbed 2026-07-06.)*
+- `Idempotency-Key` on `POST /v1/forecast` and `/v1/backtest` — *S*. **Forecast PARTIAL 2026-07-14:** current credential/identity-secret epoch has HMAC identity, transaction locking, schema-validated canonical replay, and conflict refusal. Stable principal aliases plus previous-secret lookup across rotations and backtest support remain.
 - Decide the API-key CRUD + self-serve key issuance + `GET /v1/usage` schema now to avoid rework — *M*.
 
 **P1 — Ingestion**
 - Vendor cost-guard middleware (per-vendor Redis token buckets; 80% → cache-only + alert, 100% → serve last-known-good with honest freshness headers) — *S*.
 - Synthetic canary symbols (closed-form truth flowing through ingest → adjust → features → forecast, filtered at the API boundary) — *S*.
 - Chaos/gap replay harness (record vendor cassettes now while cheap; replay mutated ones — missing days, late corporate actions, 429 storms) — *M*.
-- Snapshot-pinning schema (`as_of`, `snapshot_id`) must land here so forecasts can reference an immutable snapshot — *L*.
+- Snapshot-pinning schema (`as_of`, `snapshot_id`) — **DONE** (content-addressed immutable inputs, PIT availability evidence, and snapshot-backed serving).
 - `/v1/data-quality/{symbol}` cross-vendor consensus + adjustment-factor ledger (expose mandatory hygiene as product) — *M*.
 - Cross-sectional rank features via Timescale continuous aggregates (licensing-safe edge single-series models structurally lack) — *M*.
 
@@ -946,7 +946,7 @@ A mid-2026 competitive scan (2026-07-06; re-verify periodically) **did not find 
 **P3 — Baseline forecasting**
 - Conformal calibration layer (CQR + Adaptive Conformal Inference) wrapping *every* model incl. the baselines — *M*. **← highest-value: manufactures the calibration wedge — a distribution-free coverage *target* under documented calibration assumptions (exchangeability is fragile on financial series across regime shifts, so pair with regime-conditional/adaptive variants and empirical validation).**
 - Forecast provenance block in the `/v1/forecast` contract — **DONE** (contract locked + hardened 2026-07-06).
-- Tamper-evident forecast hash archive from day one (SHA-256 every forecast + daily Merkle root + full symbol/model/horizon manifest, before outcomes are known) — *S*.
+- Tamper-evident forecast hash archive from day one — **PARTIAL 2026-07-14:** every served forecast now commits canonical request/output bytes with DB-verified SHA-256 and a value-free opportunity identity before release. Daily manifests, Merkle roots, and external anchoring remain.
 - Historical forecast+outcome archive as a sellable research dataset — *S*.
 
 **P4 — ML & backtesting**
