@@ -27,9 +27,11 @@ database-level UPDATE/DELETE/TRUNCATE refusal.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -43,6 +45,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.config import Settings
+from app.core.exceptions import AppError
 from app.db.models.bars import Bar, BarRevision
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.db.models.predictions import ForecastRun
@@ -50,6 +53,7 @@ from app.db.session import build_engine, build_sessionmaker
 from app.main import create_app
 from app.schemas.forecast import ForecastRequest, ForecastResponse
 from app.schemas.prices import PriceFilters
+from app.services.forecast_run_store import SqlForecastRunStore
 from app.services.forecast_runs import (
     idempotency_digest,
     output_hash,
@@ -1214,6 +1218,8 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
         "model": "baseline_naive",
         "coverage": 0.8,
     }
+    async with runtime_maker() as session:
+        archive_before = (await session.execute(text("SELECT clock_timestamp()"))).scalar_one()
     with TestClient(app) as client:
         unauthenticated = client.get("/v1/forecast/AAPL", params=params)
         authenticated = client.get(
@@ -1266,6 +1272,8 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
                     "Idempotency-Key": contended_key,
                 },
             )
+    async with runtime_maker() as session:
+        archive_after = (await session.execute(text("SELECT clock_timestamp()"))).scalar_one()
 
     assert unauthenticated.status_code == 401
     assert unauthenticated.headers["WWW-Authenticate"] == "X-API-Key"
@@ -1298,7 +1306,7 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     assert request_hash(bytes(keyed.canonical_request)) == keyed.request_hash
     assert output_hash(bytes(keyed.canonical_output)) == keyed.output_hash
     assert parse_output(bytes(keyed.canonical_output)).provenance.forecast_id == keyed.forecast_id
-    assert keyed.recorded_at >= keyed.generated_at
+    assert archive_before <= keyed.generated_at <= keyed.recorded_at <= archive_after
     archived_material = (
         bytes(keyed.canonical_request)
         + bytes(keyed.canonical_output)
@@ -1320,3 +1328,183 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
                 )
                 await conn.execute(text(mutation), parameters)
             await transaction.rollback()
+
+    # Block the real service after its snapshot SELECT. Under the former design
+    # that SELECT belonged to the archive transaction and retained the only
+    # pooled connection; the short repository now releases it before CPU work.
+    single_engine = create_async_engine(
+        engine.url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.5,
+    )
+    single_maker = build_sessionmaker(single_engine)
+    run_store = SqlForecastRunStore(
+        sessionmaker=single_maker,
+        identity_secret=api_settings.jwt_secret,
+        resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+        availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+    )
+    snapshot_resolved = threading.Event()
+    release_resolution = threading.Event()
+
+    class _BlockingForecastService(SnapshotForecastService):
+        def _resolve_record(self, record, request, series_basis):
+            resolved = super()._resolve_record(record, request, series_basis)
+            snapshot_resolved.set()
+            if not release_resolution.wait(timeout=5):
+                raise RuntimeError("live pool regression release timed out")
+            return resolved
+
+    future_app_time = archive_after + timedelta(days=1)
+    blocked_service = _BlockingForecastService(
+        repository=SqlForecastInputSnapshotRepository(
+            single_maker,
+            trusted_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        ),
+        policy=ForecastServingPolicy(
+            resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+            trusted_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        ),
+        clock=lambda: future_app_time,
+        run_store=run_store,
+    )
+    blocked_request = ForecastRequest(
+        symbol="AAPL",
+        horizon=2,
+        horizon_unit="trading_day",
+        target="close",
+        snapshot_id=current_created.snapshot_id,
+        model="baseline_naive",
+        interval_coverages=[0.8],
+    )
+    async with single_maker() as session:
+        pool_before = (await session.execute(text("SELECT clock_timestamp()"))).scalar_one()
+    archive_task = asyncio.create_task(blocked_service.forecast(blocked_request))
+    try:
+        assert await asyncio.to_thread(snapshot_resolved.wait, 1)
+        async with single_maker() as session:
+            assert (
+                await asyncio.wait_for(
+                    session.execute(text("SELECT 1")),
+                    timeout=1,
+                )
+            ).scalar_one() == 1
+        release_resolution.set()
+        archived_after_release = await asyncio.wait_for(archive_task, timeout=5)
+        async with single_maker() as session:
+            pool_after = (await session.execute(text("SELECT clock_timestamp()"))).scalar_one()
+            pool_row = await session.get(
+                ForecastRun,
+                archived_after_release.provenance.forecast_id,
+            )
+        assert pool_row is not None
+        stored_pool = parse_output(bytes(pool_row.canonical_output))
+        assert (
+            archived_after_release.provenance.generated_at
+            == pool_row.generated_at
+            == stored_pool.provenance.generated_at
+        )
+        assert pool_before <= pool_row.generated_at <= pool_row.recorded_at <= pool_after
+        assert (
+            archived_after_release.provenance.lookahead_check.checked_at
+            == stored_pool.provenance.lookahead_check.checked_at
+            == pool_row.generated_at
+        )
+        assert output_hash(bytes(pool_row.canonical_output)) == pool_row.output_hash
+        assert archived_after_release.provenance.generated_at != future_app_time
+    finally:
+        release_resolution.set()
+        if not archive_task.done():
+            archive_task.cancel()
+        await asyncio.gather(archive_task, return_exceptions=True)
+        await single_engine.dispose()
+
+    # Two first uses can both execute pure compute, but lock/recheck plus the
+    # full-digest UNIQUE constraint must expose only one persisted winner.
+    race_request = ForecastRequest(
+        symbol="AAPL",
+        horizon=2,
+        horizon_unit="trading_day",
+        target="close",
+        snapshot_id=current_created.snapshot_id,
+        model="baseline_naive",
+        interval_coverages=[0.8],
+    )
+    candidate_a = await service.forecast(race_request)
+    candidate_b = await service.forecast(race_request)
+    assert candidate_a.provenance.forecast_id != candidate_b.provenance.forecast_id
+    race_key = "live-gate-first-use-race"
+    race_principal = "live-gate-race-principal"
+    race_store_a = SqlForecastRunStore(
+        sessionmaker=runtime_maker,
+        identity_secret=api_settings.jwt_secret,
+        resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+        availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+    )
+    race_store_b = SqlForecastRunStore(
+        sessionmaker=runtime_maker,
+        identity_secret=api_settings.jwt_secret,
+        resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+        availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+    )
+    producers_started = 0
+    both_producers_started = asyncio.Event()
+
+    async def _racing_producer(candidate: ForecastResponse) -> ForecastResponse:
+        nonlocal producers_started
+        producers_started += 1
+        if producers_started == 2:
+            both_producers_started.set()
+        await both_producers_started.wait()
+        return candidate
+
+    race_results = await asyncio.gather(
+        race_store_a.execute(
+            race_request,
+            idempotency_key=race_key,
+            principal=race_principal,
+            producer=lambda: _racing_producer(candidate_a),
+        ),
+        race_store_b.execute(
+            race_request,
+            idempotency_key=race_key,
+            principal=race_principal,
+            producer=lambda: _racing_producer(candidate_b),
+        ),
+        return_exceptions=True,
+    )
+    race_responses = [item for item in race_results if isinstance(item, ForecastResponse)]
+    race_errors = [item for item in race_results if isinstance(item, Exception)]
+    assert producers_started == 2
+    assert race_responses
+    assert all(
+        isinstance(item, AppError) and item.code == "idempotency_in_progress"
+        for item in race_errors
+    )
+
+    async def _must_not_recompute() -> ForecastResponse:
+        raise AssertionError("persisted keyed retry invoked the producer")
+
+    race_replay = await race_store_a.execute(
+        race_request,
+        idempotency_key=race_key,
+        principal=race_principal,
+        producer=_must_not_recompute,
+    )
+    assert {item.provenance.forecast_id for item in race_responses} == {
+        race_replay.provenance.forecast_id
+    }
+    race_digest = idempotency_digest(
+        principal=race_principal,
+        idempotency_key=race_key,
+        secret=api_settings.jwt_secret,
+    )
+    async with runtime_maker() as session:
+        assert (
+            await session.execute(
+                select(func.count())
+                .select_from(ForecastRun)
+                .where(ForecastRun.idempotency_token_digest == race_digest)
+            )
+        ).scalar_one() == 1

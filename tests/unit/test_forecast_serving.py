@@ -118,7 +118,7 @@ class FakeRepository:
 
 @dataclass
 class FakeRunStore:
-    repository: FakeRepository
+    completed_at: datetime = GENERATED_AT
     calls: list[tuple[ForecastRequest, str | None, str | None]] = field(default_factory=list)
 
     async def execute(
@@ -130,7 +130,14 @@ class FakeRunStore:
         producer,
     ) -> ForecastResponse:
         self.calls.append((request, idempotency_key, principal))
-        return await producer(self.repository)
+        response = await producer()
+        lookahead = response.provenance.lookahead_check.model_copy(
+            update={"checked_at": self.completed_at}
+        )
+        provenance = response.provenance.model_copy(
+            update={"generated_at": self.completed_at, "lookahead_check": lookahead}
+        )
+        return response.model_copy(update={"provenance": provenance})
 
 
 def _service(
@@ -316,11 +323,10 @@ async def test_idempotency_key_is_refused_until_a_run_store_exists() -> None:
 
 
 async def test_persisted_run_store_owns_snapshot_resolution_and_accepts_keyed_retry() -> None:
-    bound_repository = FakeRepository(_record())
-    run_store = FakeRunStore(bound_repository)
-    fallback_repository = FakeRepository(None)
+    repository = FakeRepository(_record())
+    run_store = FakeRunStore()
     service = SnapshotForecastService(
-        repository=fallback_repository,
+        repository=repository,
         policy=ForecastServingPolicy(
             resolution_policy_hash=POLICY_HASH,
             trusted_availability_rule_set_hash=RULE_SET_HASH,
@@ -338,9 +344,7 @@ async def test_persisted_run_store_owns_snapshot_resolution_and_accepts_keyed_re
 
     assert response.provenance.forecast_id == FORECAST_ID
     assert run_store.calls == [(_request(), "retry-1", "api-principal")]
-    assert bound_repository.latest_calls
-    assert fallback_repository.get_calls == []
-    assert fallback_repository.latest_calls == []
+    assert repository.latest_calls
 
 
 def test_latest_statement_filters_exact_series_and_orders_newest_first() -> None:

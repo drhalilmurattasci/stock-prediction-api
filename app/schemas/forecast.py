@@ -234,7 +234,12 @@ class LookaheadCheck(ForecastBaseModel):
     """Mechanical proof that no feature used data newer than the forecast cutoff."""
 
     status: LookaheadStatus = Field(description="Whether the point-in-time leakage check passed.")
-    checked_at: AwareDatetime = Field(description="When the leakage check was evaluated.")
+    checked_at: AwareDatetime = Field(
+        description=(
+            "Archive database-observed time by which the leakage check had completed "
+            "for persisted responses."
+        )
+    )
     max_feature_available_at: AwareDatetime = Field(
         description="Newest feature availability timestamp included in the forecast input."
     )
@@ -301,7 +306,7 @@ class ForecastProvenance(ForecastBaseModel):
         description="Newest data availability timestamp used across every feature."
     )
     generated_at: AwareDatetime = Field(
-        description="Server timestamp when the forecast was generated."
+        description="Archive database-observed completion timestamp for persisted responses."
     )
     code_version: str | None = Field(
         default=None,

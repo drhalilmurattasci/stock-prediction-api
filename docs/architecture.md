@@ -55,6 +55,16 @@ confidence intervals for an estimated parameter. Serving reports
 `calibration.method=none`, no held-out coverage evidence, and an
 `uncalibrated:<model-version>` calibration identity.
 
+Archive persistence uses an optimistic two-phase flow: a short keyed lookup,
+snapshot loading and pure forecast computation with no archive connection held,
+then a short advisory-lock/recheck/insert transaction. Two simultaneous first
+uses of one key may duplicate bounded computation, but the full-digest unique
+constraint permits exactly one persisted result; the loser discards its local
+output and replays the winner or returns `idempotency_in_progress`. Persisted
+`generated_at` and leakage-check time are the archive database's observed
+post-compute completion time, while `recorded_at` remains its later acceptance
+stamp. This keeps the time-order invariant in one clock domain.
+
 The remaining Phase 3 trust gaps are append-only realized-outcome and calibration
 artifacts, stable idempotency identity across credential/secret rotation, a
 reproducible model registry/leaderboard, and models that empirically beat the

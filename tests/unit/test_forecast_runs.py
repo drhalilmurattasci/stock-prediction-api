@@ -8,6 +8,13 @@ from datetime import UTC, datetime, timedelta, timezone
 from uuid import UUID
 
 import pytest
+from sqlalchemy.exc import (
+    IntegrityError,
+    OperationalError,
+)
+from sqlalchemy.exc import (
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 
 from app.core.exceptions import AppError
 from app.schemas.forecast import (
@@ -162,7 +169,6 @@ def _run_store(
 ) -> SqlForecastRunStore:
     return SqlForecastRunStore(
         sessionmaker=None,  # type: ignore[arg-type]
-        repository_factory=lambda session: None,  # type: ignore[arg-type,return-value]
         identity_secret="fixture-archive-secret",
         resolution_policy_hash=resolution_policy_hash,
         availability_rule_set_hash=availability_rule_set_hash,
@@ -517,60 +523,420 @@ def test_run_store_never_accepts_an_unscoped_idempotency_key() -> None:
     assert "opaque" not in excinfo.value.message
 
 
-async def test_flush_integrity_error_becomes_a_structured_retryable_error() -> None:
-    # A DB-side integrity rejection on insert (e.g. the time_order CHECK under
-    # host clock skew, or the snapshot FK RESTRICT race) must not escape as an
-    # opaque 500 for an otherwise valid request.
-    from sqlalchemy.exc import IntegrityError
+class _FakeResult:
+    def __init__(self, *, scalar: object = None, row: object = None) -> None:
+        self.scalar = scalar
+        self.row = row
 
-    response = _response()
+    def scalar_one(self) -> object:
+        return self.scalar
 
-    class _Ctx:
-        async def __aenter__(self) -> object:
-            return self
+    def scalars(self) -> _FakeResult:
+        return self
 
-        async def __aexit__(self, *exc: object) -> bool:
-            return False
+    def one_or_none(self) -> object:
+        return self.row
 
-    class _FakeSession:
-        async def __aenter__(self) -> _FakeSession:
-            return self
 
-        async def __aexit__(self, *exc: object) -> bool:
-            return False
+class _FakeTransaction:
+    def __init__(self, maker: _FakeSessionMaker) -> None:
+        self.maker = maker
 
-        def begin(self) -> _Ctx:
-            return _Ctx()
+    async def __aenter__(self) -> _FakeTransaction:
+        return self
 
-        def add(self, _row: object) -> None:
-            return None
+    async def __aexit__(self, *exc: object) -> bool:
+        if not any(exc) and self.maker.commit_error is not None:
+            error = self.maker.commit_error
+            self.maker.commit_error = None
+            self.maker.commit_failed = True
+            raise error
+        return False
 
-        async def flush(self) -> None:
-            raise IntegrityError("INSERT", {}, Exception("ck_forecast_runs_time_order"))
 
-    class _FakeMaker:
-        def __call__(self) -> _FakeSession:
-            return _FakeSession()
+class _FakeSession:
+    def __init__(self, maker: _FakeSessionMaker) -> None:
+        self.maker = maker
 
-    store = SqlForecastRunStore(
-        sessionmaker=_FakeMaker(),  # type: ignore[arg-type]
-        repository_factory=lambda _session: None,  # type: ignore[arg-type,return-value]
+    async def __aenter__(self) -> _FakeSession:
+        self.maker.active_sessions += 1
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        self.maker.active_sessions -= 1
+        return False
+
+    def begin(self) -> _FakeTransaction:
+        return _FakeTransaction(self.maker)
+
+    async def execute(self, statement: object, _params: object = None) -> _FakeResult:
+        if self.maker.execute_error is not None:
+            error = self.maker.execute_error
+            self.maker.execute_error = None
+            raise error
+        sql = str(statement)
+        if "clock_timestamp" in sql:
+            return _FakeResult(scalar=self.maker.database_time)
+        if "pg_try_advisory_xact_lock" in sql:
+            return _FakeResult(scalar=True)
+        row = self.maker.reconcile_row if self.maker.flush_attempted else None
+        return _FakeResult(row=row)
+
+    async def get(self, _model: object, _identity: object) -> object:
+        if self.maker.commit_failed and self.maker.reconcile_added_row:
+            return self.maker.added_rows[-1]
+        return None
+
+    def add(self, row: object) -> None:
+        self.maker.added_rows.append(row)
+
+    async def flush(self) -> None:
+        self.maker.flush_attempted = True
+        if self.maker.flush_error is not None:
+            raise self.maker.flush_error
+
+
+class _FakeSessionMaker:
+    def __init__(
+        self,
+        database_time: datetime,
+        *,
+        flush_error: IntegrityError | None = None,
+        commit_error: OperationalError | None = None,
+        execute_error: Exception | None = None,
+        reconcile_row: object = None,
+        reconcile_added_row: bool = False,
+    ) -> None:
+        self.database_time = database_time
+        self.flush_error = flush_error
+        self.commit_error = commit_error
+        self.execute_error = execute_error
+        self.reconcile_row = reconcile_row
+        self.reconcile_added_row = reconcile_added_row
+        self.flush_attempted = False
+        self.commit_failed = False
+        self.active_sessions = 0
+        self.session_count = 0
+        self.added_rows: list[object] = []
+
+    def __call__(self) -> _FakeSession:
+        self.session_count += 1
+        return _FakeSession(self)
+
+
+class _DriverFailure(Exception):
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__("redacted driver detail")
+        self.sqlstate = sqlstate
+
+
+class _ConstraintViolation(_DriverFailure):
+    def __init__(self, constraint_name: str, sqlstate: str) -> None:
+        super().__init__(sqlstate)
+        self.constraint_name = constraint_name
+
+
+def _store_with_maker(maker: _FakeSessionMaker) -> SqlForecastRunStore:
+    return SqlForecastRunStore(
+        sessionmaker=maker,  # type: ignore[arg-type]
         identity_secret="fixture-archive-secret",
         resolution_policy_hash=POLICY_HASH,
         availability_rule_set_hash=RULE_SET_HASH,
-        origin_kind="post",
     )
 
-    async def _producer(_repository: object) -> ForecastResponse:
-        return response
+
+def _integrity_error(constraint_name: str, sqlstate: str) -> IntegrityError:
+    return IntegrityError(
+        "INSERT",
+        {},
+        _ConstraintViolation(constraint_name, sqlstate),
+    )
+
+
+def _operational_error(sqlstate: str) -> OperationalError:
+    return OperationalError("statement", {}, _DriverFailure(sqlstate))
+
+
+async def test_compute_holds_no_session_and_db_time_finalizes_the_archived_response() -> None:
+    database_time = AS_OF + timedelta(minutes=5)
+    maker = _FakeSessionMaker(database_time)
+    store = _store_with_maker(maker)
+    response = _response()
+    future = AS_OF + timedelta(days=1)
+    provisional = response.model_copy(
+        update={
+            "provenance": response.provenance.model_copy(
+                update={
+                    "generated_at": future,
+                    "lookahead_check": response.provenance.lookahead_check.model_copy(
+                        update={"checked_at": future}
+                    ),
+                }
+            )
+        }
+    )
+
+    async def _producer() -> ForecastResponse:
+        assert maker.active_sessions == 0
+        assert maker.session_count == 0
+        return provisional
+
+    archived = await store.execute(
+        _matching_request(response),
+        idempotency_key=None,
+        principal=None,
+        producer=_producer,
+    )
+
+    assert archived.provenance.generated_at == database_time
+    assert archived.provenance.lookahead_check.checked_at == database_time
+    assert future.isoformat().encode() not in canonical_output(archived)
+    assert len(maker.added_rows) == 1
+    row = maker.added_rows[0]
+    assert row.generated_at == database_time
+    stored = parse_output(bytes(row.canonical_output))
+    assert canonical_output(stored) == canonical_output(archived)
+    assert maker.active_sessions == 0
+
+
+async def test_database_completion_time_before_as_of_fails_before_insert() -> None:
+    maker = _FakeSessionMaker(AS_OF - timedelta(seconds=1))
+    store = _store_with_maker(maker)
+
+    async def _producer() -> ForecastResponse:
+        return _response()
 
     with pytest.raises(AppError) as excinfo:
         await store.execute(
-            _matching_request(response),
+            _matching_request(),
             idempotency_key=None,
             principal=None,
-            producer=_producer,  # type: ignore[arg-type]
+            producer=_producer,
         )
-    assert excinfo.value.status_code == 503
-    assert excinfo.value.code == "forecast_archive_write_conflict"
+    assert excinfo.value.code == "forecast_archive_clock_invalid"
+    assert excinfo.value.details == {"retryable": False}
+    assert maker.added_rows == []
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "sqlstate", "expected_status", "expected_code"),
+    [
+        ("ck_forecast_runs_time_order", "23514", 503, "forecast_archive_clock_invalid"),
+        (
+            "ck_forecast_runs_output_hash_matches_payload",
+            "23514",
+            500,
+            "forecast_archive_integrity_failed",
+        ),
+        (
+            "fk_forecast_runs_snapshot_id_forecast_input_snapshots",
+            "23503",
+            503,
+            "forecast_snapshot_unavailable",
+        ),
+    ],
+)
+async def test_integrity_failures_are_classified_without_driver_text(
+    constraint_name: str,
+    sqlstate: str,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    maker = _FakeSessionMaker(
+        AS_OF + timedelta(minutes=5),
+        flush_error=_integrity_error(constraint_name, sqlstate),
+    )
+    store = _store_with_maker(maker)
+
+    async def _producer() -> ForecastResponse:
+        return _response()
+
+    with pytest.raises(AppError) as excinfo:
+        await store.execute(
+            _matching_request(),
+            idempotency_key=None,
+            principal=None,
+            producer=_producer,
+        )
+    assert excinfo.value.status_code == expected_status
+    assert excinfo.value.code == expected_code
+    assert "redacted driver detail" not in excinfo.value.message
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_code", "retryable"),
+    [
+        (
+            _operational_error("42501"),
+            500,
+            "forecast_archive_configuration_invalid",
+            False,
+        ),
+        (
+            SQLAlchemyTimeoutError("pool exhausted"),
+            503,
+            "forecast_archive_unavailable",
+            True,
+        ),
+    ],
+)
+async def test_prewrite_database_failures_distinguish_config_from_transient_capacity(
+    failure: Exception,
+    expected_status: int,
+    expected_code: str,
+    retryable: bool,
+) -> None:
+    maker = _FakeSessionMaker(
+        AS_OF + timedelta(minutes=5),
+        execute_error=failure,
+    )
+    store = _store_with_maker(maker)
+
+    async def _producer() -> ForecastResponse:
+        return _response()
+
+    with pytest.raises(AppError) as excinfo:
+        await store.execute(
+            _matching_request(),
+            idempotency_key=None,
+            principal=None,
+            producer=_producer,
+        )
+    assert excinfo.value.status_code == expected_status
+    assert excinfo.value.code == expected_code
+    assert excinfo.value.details == {"retryable": retryable}
+    assert "pool exhausted" not in excinfo.value.message
+    assert maker.added_rows == []
+
+
+@pytest.mark.parametrize("changed_request", [False, True])
+async def test_idempotency_unique_race_reconciles_to_replay_or_request_conflict(
+    changed_request: bool,
+) -> None:
+    database_time = AS_OF + timedelta(minutes=5)
+    maker = _FakeSessionMaker(database_time)
+    store = _store_with_maker(maker)
+    principal = "credential"
+    retry_key = "retry-key"
+    retry_identity = store._retry_identity(
+        principal=principal,
+        idempotency_key=retry_key,
+    )
+    assert retry_identity is not None
+    winner_response = _response()
+    winner_request = _matching_request(winner_response)
+    winner_payload = canonical_request(winner_request)
+    winner = store._row(
+        request_payload=winner_payload,
+        request_identity=request_hash(winner_payload),
+        retry_identity=retry_identity,
+        response=winner_response,
+    )
+    winner.recorded_at = database_time
+    maker.flush_error = _integrity_error(
+        "uq_forecast_runs_idempotency_token_digest",
+        "23505",
+    )
+    maker.reconcile_row = winner
+    request = winner_request
+    candidate = winner_response
+    if changed_request:
+        request = winner_request.model_copy(update={"interval_coverages": [0.5]})
+        candidate = _response(coverages=(0.5,))
+
+    async def _producer() -> ForecastResponse:
+        return candidate
+
+    if changed_request:
+        with pytest.raises(AppError) as excinfo:
+            await store.execute(
+                request,
+                idempotency_key=retry_key,
+                principal=principal,
+                producer=_producer,
+            )
+        assert excinfo.value.code == "idempotency_key_conflict"
+    else:
+        replayed = await store.execute(
+            request,
+            idempotency_key=retry_key,
+            principal=principal,
+            producer=_producer,
+        )
+        assert canonical_output(replayed) == canonical_output(winner_response)
+
+
+@pytest.mark.parametrize(
+    ("idempotency_key", "principal", "retryable"),
+    [(None, None, False), ("retry-key", "credential", True)],
+)
+async def test_commit_unknown_distinguishes_safe_keyed_retry(
+    idempotency_key: str | None,
+    principal: str | None,
+    retryable: bool,
+) -> None:
+    maker = _FakeSessionMaker(
+        AS_OF + timedelta(minutes=5),
+        commit_error=OperationalError("COMMIT", {}, Exception("connection lost")),
+    )
+    store = _store_with_maker(maker)
+
+    async def _producer() -> ForecastResponse:
+        assert maker.active_sessions == 0
+        return _response()
+
+    with pytest.raises(AppError) as excinfo:
+        await store.execute(
+            _matching_request(),
+            idempotency_key=idempotency_key,
+            principal=principal,
+            producer=_producer,
+        )
+    assert excinfo.value.code == "forecast_archive_commit_unknown"
+    assert excinfo.value.details == {
+        "outcome_unknown": True,
+        "retryable": retryable,
+    }
+
+
+async def test_known_rollback_after_flush_is_retryable_not_commit_unknown() -> None:
+    maker = _FakeSessionMaker(
+        AS_OF + timedelta(minutes=5),
+        commit_error=_operational_error("40001"),
+    )
+    store = _store_with_maker(maker)
+
+    async def _producer() -> ForecastResponse:
+        return _response()
+
+    with pytest.raises(AppError) as excinfo:
+        await store.execute(
+            _matching_request(),
+            idempotency_key=None,
+            principal=None,
+            producer=_producer,
+        )
+    assert excinfo.value.code == "forecast_archive_unavailable"
     assert excinfo.value.details == {"retryable": True}
+
+
+async def test_unknown_commit_reconciles_a_visible_unkeyed_row() -> None:
+    maker = _FakeSessionMaker(
+        AS_OF + timedelta(minutes=5),
+        commit_error=OperationalError("COMMIT", {}, Exception("connection lost")),
+        reconcile_added_row=True,
+    )
+    store = _store_with_maker(maker)
+
+    async def _producer() -> ForecastResponse:
+        return _response()
+
+    reconciled = await store.execute(
+        _matching_request(),
+        idempotency_key=None,
+        principal=None,
+        producer=_producer,
+    )
+    assert canonical_output(reconciled) == canonical_output(
+        parse_output(bytes(maker.added_rows[0].canonical_output))  # type: ignore[attr-defined]
+    )

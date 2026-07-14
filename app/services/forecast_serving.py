@@ -12,6 +12,8 @@ Every gate fails closed:
   emitted with a soft warning;
 * every successful response is committed to the forecast-run archive before
   release, and ``Idempotency-Key`` retries replay its validated canonical model.
+* snapshot loading and forecast computation finish before the archive opens its
+  short lock/recheck/insert transaction, so CPU work cannot starve the DB pool.
 """
 
 from __future__ import annotations
@@ -246,7 +248,7 @@ class SnapshotForecastService:
                 request,
                 idempotency_key=idempotency_key,
                 principal=principal,
-                producer=lambda repository: self._produce(request, repository),
+                producer=lambda: self._produce(request, self.repository),
             )
         if idempotency_key is not None:
             raise NotImplementedYet(
@@ -432,10 +434,6 @@ def build_forecast_service(
         code_version=read_build_revision(),
         run_store=SqlForecastRunStore(
             sessionmaker=sessionmaker,
-            repository_factory=lambda session: SessionForecastInputSnapshotRepository(
-                session,
-                trusted_availability_rule_set_hash=trusted_hash,
-            ),
             identity_secret=settings.jwt_secret,
             resolution_policy_hash=policy_hash,
             availability_rule_set_hash=trusted_hash,
