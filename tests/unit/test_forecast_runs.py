@@ -515,3 +515,62 @@ def test_run_store_never_accepts_an_unscoped_idempotency_key() -> None:
         store._retry_identity(principal=None, idempotency_key="opaque")
     assert excinfo.value.code == "idempotency_principal_required"
     assert "opaque" not in excinfo.value.message
+
+
+async def test_flush_integrity_error_becomes_a_structured_retryable_error() -> None:
+    # A DB-side integrity rejection on insert (e.g. the time_order CHECK under
+    # host clock skew, or the snapshot FK RESTRICT race) must not escape as an
+    # opaque 500 for an otherwise valid request.
+    from sqlalchemy.exc import IntegrityError
+
+    response = _response()
+
+    class _Ctx:
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+    class _FakeSession:
+        async def __aenter__(self) -> _FakeSession:
+            return self
+
+        async def __aexit__(self, *exc: object) -> bool:
+            return False
+
+        def begin(self) -> _Ctx:
+            return _Ctx()
+
+        def add(self, _row: object) -> None:
+            return None
+
+        async def flush(self) -> None:
+            raise IntegrityError("INSERT", {}, Exception("ck_forecast_runs_time_order"))
+
+    class _FakeMaker:
+        def __call__(self) -> _FakeSession:
+            return _FakeSession()
+
+    store = SqlForecastRunStore(
+        sessionmaker=_FakeMaker(),  # type: ignore[arg-type]
+        repository_factory=lambda _session: None,  # type: ignore[arg-type,return-value]
+        identity_secret="fixture-archive-secret",
+        resolution_policy_hash=POLICY_HASH,
+        availability_rule_set_hash=RULE_SET_HASH,
+        origin_kind="post",
+    )
+
+    async def _producer(_repository: object) -> ForecastResponse:
+        return response
+
+    with pytest.raises(AppError) as excinfo:
+        await store.execute(
+            _matching_request(response),
+            idempotency_key=None,
+            principal=None,
+            producer=_producer,  # type: ignore[arg-type]
+        )
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "forecast_archive_write_conflict"
+    assert excinfo.value.details == {"retryable": True}

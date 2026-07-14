@@ -9,6 +9,7 @@ from typing import Protocol, runtime_checkable
 
 from fastapi import status
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.exceptions import AppError
@@ -100,8 +101,20 @@ class SqlForecastRunStore:
             session.add(row)
             # The response is not released until the insert, trigger, hashes,
             # FK, and privilege boundary have all succeeded and the surrounding
-            # context commits.
-            await session.flush()
+            # context commits. A DB-side integrity rejection here (a CHECK such
+            # as time_order under host clock skew, the snapshot FK RESTRICT
+            # race, or a unique digest collision) must surface as a structured,
+            # retryable error rather than an opaque 500 for an otherwise valid
+            # request.
+            try:
+                await session.flush()
+            except IntegrityError as exc:
+                raise AppError(
+                    "Forecast run could not be persisted; retry.",
+                    code="forecast_archive_write_conflict",
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    details={"retryable": True},
+                ) from exc
             return response
 
     def _retry_identity(
