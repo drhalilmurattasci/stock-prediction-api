@@ -101,8 +101,8 @@ All four evidence tables reject update, delete, and truncate. `stockapi_app` has
 `SELECT` only on materialized members; the snapshot-builder role has no access.
 
 Migration `0010` and the pure canonical validators establish this storage and
-validation boundary. Its live assertions are wired into the one-command
-throwaway-database gate but await the next runtime execution. No unattended
+validation boundary. Its assertions pass the one-command throwaway-database
+gate on real PostgreSQL 17. No unattended
 outcome resolver, cohort publisher, scoreboard, or interval recalibrator is
 enabled yet; those operational actors must receive explicit policy artifacts
 and automation controls before use.

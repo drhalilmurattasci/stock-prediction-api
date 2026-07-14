@@ -578,9 +578,13 @@ that authorization):
 
 ```powershell
 .\run-vendor-smoke.ps1 `
-  -Session 2026-07-10 `
+  -Session YYYY-MM-DD `
   -Authorization stockapi-vendor-smoke-only
 ```
+
+`YYYY-MM-DD` is deliberately non-executable documentation: replace it only
+with the exact session date named in the current owner authorization. Examples
+never carry a date forward automatically.
 
 The harness is hard-bound to `MSFT`, `stockapi_app`, and the local
 `stockapi_test` database. It refuses a pre-existing target row and forces one
@@ -602,7 +606,7 @@ First produce a read-only plan; this mode does not require `POLYGON_API_KEY` and
 cannot make a vendor call:
 
 ```powershell
-.\run-vendor-backfill.ps1 -Mode plan -End 2026-07-10
+.\run-vendor-backfill.ps1 -Mode plan -End YYYY-MM-DD
 ```
 
 `-End` must still be the latest completed XNYS session. The plan is hard-bound
@@ -633,11 +637,11 @@ With those exact reviewed values, run:
 ```powershell
 .\run-vendor-backfill.ps1 `
   -Mode execute `
-  -End 2026-07-10 `
+  -End YYYY-MM-DD `
   -PlanId sha256:<64-hex-plan-id> `
   -MaxCalls 257 `
   -Authorization stockapi-msft-backfill-only `
-  -AuthorizationId msft-20260710-a
+  -AuthorizationId msft-YYYYMMDD-a
 ```
 
 The wrapper never accepts the API key on argv. The Python lane disables HTTP
@@ -658,7 +662,7 @@ authorization ID. Recovery is fail-closed:
   ```powershell
   .\run-vendor-backfill.ps1 `
     -Mode repair `
-    -End 2026-07-10 `
+    -End YYYY-MM-DD `
     -PlanId sha256:<current-plan-id>
   ```
 
@@ -690,7 +694,7 @@ so review a fresh read-only plan before authorizing it. Prerequisites are:
 Plan without starting the API or writing a snapshot:
 
 ```powershell
-.\run-forecast-demo.ps1 -Mode plan -End 2026-07-10
+.\run-forecast-demo.ps1 -Mode plan -End YYYY-MM-DD
 ```
 
 `status: ready` binds the exact backfill/version state, stable maximum receipt
@@ -706,7 +710,7 @@ After the owner explicitly authorizes that exact plan, execute:
 ```powershell
 .\run-forecast-demo.ps1 `
   -Mode execute `
-  -End 2026-07-10 `
+  -End YYYY-MM-DD `
   -PlanId sha256:<64-hex-plan-id> `
   -Authorization stockapi-msft-seal-serve-only
 ```

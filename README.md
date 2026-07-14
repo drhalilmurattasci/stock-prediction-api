@@ -11,7 +11,7 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 ## Status
 
 🚧 **First honest forecast vertical slice is code-complete; migration `0010`
-awaits its next live-DB gate execution.**
+is proven on the live PostgreSQL 17 integration gate.**
 The repository now has API-key auth, bounded `/v1/prices` reads, versioned Polygon
 daily-bar ingestion, append-only restatement history, leakage-aware baselines, an
 immutable point-in-time snapshot builder, snapshot-backed `/v1/forecast`, and an
@@ -32,8 +32,7 @@ route also stays `501` until an operator explicitly pins the code-derived policy
 and availability hashes.
 
 Unit/static gates cover the evidence substrate. The destructive TimescaleDB
-integration gate previously passed through `0009`; migration `0010` is now
-wired into that same one-command proof and awaits its next runtime execution.
+integration gate now passes through migration `0010` on real PostgreSQL 17.
 `run-live-gate.ps1` is hard-bound to the designated `stockapi_test` throwaway
 database and checks the complete migration chain, exact
 runtime/builder role boundaries, restatement history, historical point-in-time
