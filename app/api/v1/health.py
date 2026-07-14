@@ -20,7 +20,8 @@ SERVICE_NAME = "stock-prediction-api"
 #: discloses internal topology and credentials -- asyncpg, for instance, renders
 #: 'connection to server at "timescaledb" (172.18.0.2), port 5432 failed: FATAL:
 #: password authentication failed for user "stockapi_app"'. Probes therefore
-#: report only WHICH check failed; the cause stays in server-side logs.
+#: report only WHICH check failed; logs retain a safe failure class for
+#: correlation without copying driver messages that may contain credentials.
 UNAVAILABLE_DETAIL = "dependency check failed"
 ReadinessProbe = Callable[[Request], Awaitable[None]]
 
@@ -59,13 +60,14 @@ async def readyz(request: Request, response: Response) -> ReadinessResponse:
             checks.append(ReadinessCheck(name=name, ok=True))
         except Exception as exc:  # noqa: BLE001 - report failure, never crash the probe
             # Never reflect the dependency's exception text to an unauthenticated
-            # caller (see UNAVAILABLE_DETAIL). The request-id is already bound to
-            # the log context, so operators can correlate this with the request.
+            # caller (see UNAVAILABLE_DETAIL), including through logs. The
+            # request-id is already bound for correlation; the exception class
+            # is sufficient to route diagnosis without copying a driver message
+            # that may itself contain a DSN or credential.
             log.warning(
                 "readiness_probe_failed",
                 check=name,
                 error_type=type(exc).__name__,
-                error=str(exc),
             )
             checks.append(ReadinessCheck(name=name, ok=False, detail=UNAVAILABLE_DETAIL))
 

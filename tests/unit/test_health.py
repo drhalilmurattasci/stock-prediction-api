@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from app.api.v1 import health as health_module
 from app.api.v1.health import UNAVAILABLE_DETAIL
 from app.config import Settings
 from app.main import create_app
@@ -71,7 +72,7 @@ def test_readyz_reports_degraded_probe():
     }
 
 
-def test_readyz_never_reflects_dependency_exception_text():
+def test_readyz_never_reflects_dependency_exception_text(monkeypatch):
     # /readyz is public and unmetered. A real asyncpg failure renders internal
     # topology and credentials; none of it may reach the response body.
     secret_rendering = (
@@ -81,6 +82,14 @@ def test_readyz_never_reflects_dependency_exception_text():
 
     async def leaking_probe(_request: Request) -> None:
         raise ConnectionError(secret_rendering)
+
+    events: list[tuple[str, dict[str, object]]] = []
+
+    class CapturingLog:
+        def warning(self, event: str, **kwargs: object) -> None:
+            events.append((event, kwargs))
+
+    monkeypatch.setattr(health_module, "log", CapturingLog())
 
     app = create_app(
         Settings(app_env="test", rate_limit_enabled=False),
@@ -95,6 +104,13 @@ def test_readyz_never_reflects_dependency_exception_text():
     for disclosed in ("timescaledb", "172.18.0.2", "5432", "stockapi_app", "password"):
         assert disclosed not in body
     assert "ConnectionError" not in body
+    assert events == [
+        (
+            "readiness_probe_failed",
+            {"check": "database", "error_type": "ConnectionError"},
+        )
+    ]
+    assert secret_rendering not in repr(events)
 
 
 def test_test_factory_disables_default_rate_limit(client):
