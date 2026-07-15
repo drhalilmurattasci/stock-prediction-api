@@ -129,6 +129,19 @@ def test_identity_binds_general_series_semantics_and_bucket_policies() -> None:
         FINITE_SAMPLE_POLICY_VERSION
     )
     assert document["buckets"][0]["correction_policy_version"] == (ABSOLUTE_RESIDUAL_POLICY_VERSION)
+    assert document["buckets"][0]["value_f64_be"] == "3fe0000000000000"
+    assert "value" not in document["buckets"][0]
+
+    def assert_no_json_float(value: object) -> None:
+        assert not isinstance(value, float)
+        if isinstance(value, dict):
+            for item in value.values():
+                assert_no_json_float(item)
+        elif isinstance(value, list):
+            for item in value:
+                assert_no_json_float(item)
+
+    assert_no_json_float(document)
     parsed = parse_calibration_set(canonical)
     assert parsed.target == "adjusted_close"
     assert parsed.series_basis == "split_dividend_adjusted"
@@ -287,6 +300,47 @@ def test_parse_rejects_tampered_rank() -> None:
 
     with pytest.raises(ForecastCalibrationSetValidationError):
         parse_calibration_set(_mutate(canonical, bump_rank))
+
+
+def test_parse_rejects_legacy_numeric_bucket_value() -> None:
+    canonical = canonical_calibration_set(_set())
+
+    def restore_legacy_value(doc: dict[str, object]) -> None:
+        buckets = doc["buckets"]
+        assert isinstance(buckets, list)
+        bucket = buckets[0]
+        assert isinstance(bucket, dict)
+        bucket["value"] = 0.5
+        bucket.pop("value_f64_be")
+
+    with pytest.raises(ForecastCalibrationSetValidationError, match="unknown or missing"):
+        parse_calibration_set(_mutate(canonical, restore_legacy_value))
+
+
+@pytest.mark.parametrize(
+    "value_f64_be",
+    [
+        "3FE0000000000000",
+        "3fe0",
+        "7ff0000000000000",
+        "7ff8000000000000",
+        "8000000000000000",
+    ],
+)
+def test_parse_rejects_malformed_nonfinite_or_noncanonical_float_bits(
+    value_f64_be: str,
+) -> None:
+    canonical = canonical_calibration_set(_set())
+
+    def replace_value_bits(doc: dict[str, object]) -> None:
+        buckets = doc["buckets"]
+        assert isinstance(buckets, list)
+        bucket = buckets[0]
+        assert isinstance(bucket, dict)
+        bucket["value_f64_be"] = value_f64_be
+
+    with pytest.raises(ForecastCalibrationSetValidationError):
+        parse_calibration_set(_mutate(canonical, replace_value_bits))
 
 
 def test_parse_rejects_tampered_interval_policy_version() -> None:

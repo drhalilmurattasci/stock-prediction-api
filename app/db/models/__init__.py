@@ -12,6 +12,12 @@ from app.db.models.corporate_actions import (
     CorporateActionCollectionMember,
     CorporateActionVersion,
 )
+from app.db.models.forecast_calibration import (
+    ForecastFittedCalibrationSet,
+    ForecastHeldoutCoverageRelease,
+    ForecastHeldoutCoverageReleaseAvailability,
+    ForecastHeldoutCoverageReleaseBucket,
+)
 from app.db.models.forecast_evidence import (
     ForecastOutcomeCohortAvailability,
     ForecastOutcomeCohortManifest,
@@ -36,6 +42,10 @@ __all__ = [
     "CorporateActionCollectionMember",
     "CorporateActionVersion",
     "ForecastInputSnapshot",
+    "ForecastFittedCalibrationSet",
+    "ForecastHeldoutCoverageRelease",
+    "ForecastHeldoutCoverageReleaseAvailability",
+    "ForecastHeldoutCoverageReleaseBucket",
     "ForecastOutcomeCohortAvailability",
     "ForecastOutcomeCohortManifest",
     "ForecastOutcomeCohortMember",

@@ -4,11 +4,20 @@ The authoritative product roadmap remains
 [STOCK_API_MASTER_PLAN.md](../STOCK_API_MASTER_PLAN.md). This page records the
 implemented first-forecast trust boundary.
 
-The schema head is `0014_vendor_campaign_anchor`. No real vendor-to-forecast proof is
+The schema head is `0015_calibration_evidence`. No real vendor-to-forecast proof is
 recorded yet; ordinary live-gate verification seeds only labelled synthetic
 throwaway evidence and cleans it before returning. The diagrams below describe
 enforced code and persistence boundaries, not populated production evidence or
 validated calibration.
+
+Calibration evidence is reconstructed from one repeatable-read, read-only
+snapshot of a sealed cohort, its scheduled forecast archive rows, and the exact
+authorized outcome publications. A database-side aggregate rejects snapshots
+whose canonical run/outcome payloads exceed 128 MiB before those rows are
+materialized, and publication reloads both immutable source cohorts through the
+trusted reader before opening its write transaction. Fitted-set v2 and held-out
+release v1 use strict canonical bytes and binary64 hex identities. The persisted held-out
+artifact is descriptive only; it is not an acceptance or serving decision.
 
 ```text
 Massive/Polygon `/v1/open-close` raw regular-session daily bars

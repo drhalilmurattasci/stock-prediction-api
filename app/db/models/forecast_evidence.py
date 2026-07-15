@@ -373,6 +373,13 @@ class ForecastRealizedOutcomePublication(Base):
             ),
             ondelete="RESTRICT",
         ),
+        Index(
+            "ix_forecast_realized_outcome_publications_cohort_member",
+            "cohort_id",
+            "forecast_id",
+            "step",
+            "outcome_id",
+        ),
     )
 
     outcome_id: Mapped[str] = mapped_column(

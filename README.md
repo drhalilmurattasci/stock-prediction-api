@@ -11,7 +11,7 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 ## Status
 
 🚧 **The fail-closed data/forecast evidence substrate is code-complete through
-migration `0014_vendor_campaign_anchor`, but the product has not yet served a
+migration `0015_calibration_evidence`, but the product has not yet served a
 forecast over real vendor data.**
 The repository now has API-key auth, bounded `/v1/prices` and `/v1/indicators`
 reads, versioned Polygon daily-bar ingestion, append-only restatement history, an
@@ -26,6 +26,17 @@ first target so later evaluation cannot silently cherry-pick membership. An
 immutable policy registry and database-enforced receipt fence close the cutoff
 race; runtime outcome writes are possible only through a bounded canonical
 publisher that records the exact authorizing cohort member.
+
+Migration `0015` adds the policy-neutral calibration persistence boundary: one
+read-only repeatable snapshot reconstructs an exact cohort/run/outcome proof,
+with a database-computed 128 MiB cumulative canonical-byte ceiling before heavy
+rows are materialized. Publication reloads both source cohorts through that
+trusted reader before any write; fitted conformal sets and held-out coverage
+releases are content-addressed, append-only, and independently replayable from
+those proofs. Held-out releases
+are schema-labelled `descriptive-only` and contain no acceptance, promotion, or
+serving field. A separate prospective evaluation and promotion policy is still
+required before any calibration set can become serving-eligible.
 
 Migrations `0012`-`0013` add the missing corporate-action and adjustment
 boundary: append-only content-addressed split/dividend collections and exact
@@ -72,8 +83,10 @@ checkpoint above the database was empty; this API surface alone is not evidence
 of a real-data forecast.
 
 Unit/static gates cover the evidence substrate. The destructive TimescaleDB
-integration gate passes through migration `0014_vendor_campaign_anchor` on real
-PostgreSQL 17. The dedicated `live-postgres` GitHub Actions job provisions a
+integration gate is wired through migration `0015_calibration_evidence`;
+the last remote execution proved `0014`, while the new `0015` publisher and ACL
+boundary still require the separately controlled live-gate run. The dedicated
+`live-postgres` GitHub Actions job provisions a
 fresh digest-pinned TimescaleDB for every push and pull request, initializes the
 fixed runtime roles from the repository bootstrap, and runs only the destructive
 Postgres module with generated ephemeral credentials. It supplies no vendor
@@ -81,7 +94,7 @@ secret, keeps automation disabled, and removes the container and anonymous
 database volume even after failure.
 `run-live-gate.ps1` is hard-bound to the designated `stockapi_test` throwaway
 database and checks a fresh empty-schema upgrade to head plus the gate's empty
-`0014` to `0007` to `0014` downgrade/upgrade cycle, exact
+`0015` to `0007` to `0015` downgrade/upgrade cycle, exact
 runtime/builder role boundaries, restatement history, historical point-in-time
 snapshot reconstruction, archived serving, schema-validated keyed replay, and
 the outcome/cohort hash, exact-receipt, immutability, role-boundary, and

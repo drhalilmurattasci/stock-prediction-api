@@ -171,6 +171,14 @@ def test_policy_registry_and_publication_models_bind_exact_provenance() -> None:
         "step",
     )
     assert cohort_member_key.ondelete == "RESTRICT"
+    assert {
+        index.name: tuple(column.name for column in index.columns) for index in publications.indexes
+    }["ix_forecast_realized_outcome_publications_cohort_member"] == (
+        "cohort_id",
+        "forecast_id",
+        "step",
+        "outcome_id",
+    )
     assert {field.name for field in fields(ForecastOutcomePublicationRecord)} == set(
         publications.c.keys()
     )

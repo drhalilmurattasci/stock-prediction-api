@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import re
+import struct
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -63,6 +64,7 @@ _CORRECTION_POLICY_VERSIONS: dict[CalibrationMethod, str] = {
     "conformal_quantile_regression": CQR_POLICY_VERSION,
 }
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_FLOAT_BITS_PATTERN = re.compile(r"^[0-9a-f]{16}$")
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-_:]{0,31}$")
 
@@ -122,7 +124,10 @@ def canonical_calibration_set(calibration_set: FittedCalibrationSet) -> bytes:
                 "horizon": bucket.horizon,
                 "quantile_selection_policy_version": (bucket.calibration.selection.policy_version),
                 "rank": bucket.calibration.selection.rank,
-                "value": _canonical_float(bucket.calibration.selection.value, "bucket value"),
+                "value_f64_be": _float_bits(
+                    bucket.calibration.selection.value,
+                    "bucket value",
+                ),
             }
             for bucket in normalized.buckets
         ],
@@ -231,7 +236,7 @@ def parse_calibration_set(canonical_set: bytes) -> FittedCalibrationSet:
         "horizon",
         "quantile_selection_policy_version",
         "rank",
-        "value",
+        "value_f64_be",
     }
     buckets: list[FittedCalibrationBucket] = []
     for index, raw in enumerate(raw_buckets):
@@ -245,7 +250,7 @@ def parse_calibration_set(canonical_set: bytes) -> FittedCalibrationSet:
                 coverage_millis=raw["coverage_millis"],
                 fit_sample_count=raw["fit_sample_count"],
                 rank=raw["rank"],
-                value=raw["value"],
+                value_f64_be=raw["value_f64_be"],
                 quantile_selection_policy_version=raw["quantile_selection_policy_version"],
                 correction_policy_version=raw["correction_policy_version"],
                 method=method,
@@ -522,7 +527,7 @@ def _bucket(
     coverage_millis: object,
     fit_sample_count: object,
     rank: object,
-    value: object,
+    value_f64_be: object,
     quantile_selection_policy_version: object,
     correction_policy_version: object,
     method: CalibrationMethod,
@@ -549,7 +554,7 @@ def _bucket(
             coverage=millis / 1000,
             sample_count=_positive_integer(fit_sample_count, f"{label}.fit_sample_count"),
             rank=_positive_integer(rank, f"{label}.rank"),
-            value=_number(value, f"{label}.value"),
+            value=_parse_float_bits(value_f64_be, f"{label}.value_f64_be"),
             policy_version=quantile_policy,
         )
         correction = correction_type(
@@ -637,18 +642,25 @@ def _positive_integer(value: object, label: str) -> int:
     return value
 
 
-def _number(value: object, label: str) -> float:
+def _finite(value: object, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ForecastCalibrationSetValidationError(f"{label} must be numeric")
     converted = float(value)
     if not math.isfinite(converted):
         raise ForecastCalibrationSetValidationError(f"{label} must be finite")
-    return converted
-
-
-def _canonical_float(value: object, label: str) -> float:
-    converted = _number(value, label)
     return 0.0 if converted == 0.0 else converted
+
+
+def _float_bits(value: object, label: str) -> str:
+    return struct.pack(">d", _finite(value, label)).hex()
+
+
+def _parse_float_bits(value: object, label: str) -> float:
+    if not isinstance(value, str) or _FLOAT_BITS_PATTERN.fullmatch(value) is None:
+        raise ForecastCalibrationSetValidationError(
+            f"{label} must be 16 lowercase hexadecimal digits"
+        )
+    return _finite(struct.unpack(">d", bytes.fromhex(value))[0], label)
 
 
 def _coverage_millis(value: float) -> int:

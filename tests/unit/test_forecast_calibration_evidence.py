@@ -673,6 +673,7 @@ def test_wilson_boundaries_are_exact(
         fitted,
         fit_dataset=fit,
         heldout_dataset=heldout,
+        confidence_level=0.95,
     ).buckets[0]
     assert bucket.covered_count == expected_hits
     if expected_hits:
@@ -702,6 +703,7 @@ def test_heldout_rejects_overlap_scope_drift_and_forged_fit() -> None:
             fitted,
             fit_dataset=fit,
             heldout_dataset=overlapping,
+            confidence_level=0.95,
         )
 
     heldout = _dataset(
@@ -722,6 +724,7 @@ def test_heldout_rejects_overlap_scope_drift_and_forged_fit() -> None:
             fitted,
             fit_dataset=fit,
             heldout_dataset=drifted,
+            confidence_level=0.95,
         )
 
     forged_bucket = replace(
@@ -737,6 +740,7 @@ def test_heldout_rejects_overlap_scope_drift_and_forged_fit() -> None:
             forged,
             fit_dataset=fit,
             heldout_dataset=heldout,
+            confidence_level=0.95,
         )
 
 
@@ -764,6 +768,7 @@ def test_signed_cqr_correction_is_applied_on_heldout_rows() -> None:
         fitted,
         fit_dataset=fit,
         heldout_dataset=heldout,
+        confidence_level=0.95,
     ).buckets[0]
     # A -2 correction shrinks [98, 102] to the inclusive singleton [100, 100].
     assert fitted.buckets[0].calibration.selection.value == -2.0

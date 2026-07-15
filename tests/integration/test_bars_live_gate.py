@@ -23,11 +23,14 @@ actually reject NaN/Infinity under Postgres NaN ordering, and the API
 statement-timeout cancels a pathological statement.
 The same command also proves forecast-input snapshot SHA-256 enforcement,
 idempotent insertion, semantic collision rejection, pure resolution, and
-database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0014`` wire
+database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0015`` wire
 the same gate to check content-addressed realized outcomes, immutable policy
 registration, the direct receipt-writer cutoff fence, source-bound publication,
 and cohort manifests whose availability can be sealed only after the manifest
-commits and before its first target.
+commits and before its first target. Migration ``0015`` additionally exercises
+runtime-only fitted-set and descriptive held-out publishers, post-commit release
+availability, replay, normalized projections, run-scope binding, and append-only
+database enforcement.
 """
 
 from __future__ import annotations
@@ -73,6 +76,12 @@ from app.db.models.corporate_actions import (
     CorporateActionCollection,
     CorporateActionCollectionMember,
     CorporateActionVersion,
+)
+from app.db.models.forecast_calibration import (
+    ForecastFittedCalibrationSet,
+    ForecastHeldoutCoverageRelease,
+    ForecastHeldoutCoverageReleaseAvailability,
+    ForecastHeldoutCoverageReleaseBucket,
 )
 from app.db.models.forecast_evidence import (
     ForecastOutcomeCohortAvailability,
@@ -125,8 +134,28 @@ from app.services.corporate_actions import (
     build_dividend_collection,
     build_split_collection,
 )
+from app.services.forecast_calibration_evidence import (
+    CalibrationFitBucket,
+    estimate_heldout_coverage,
+    fit_empirical_residual_calibration_set,
+)
+from app.services.forecast_calibration_evidence_store import (
+    SqlForecastCalibrationEvidenceReader,
+)
+from app.services.forecast_calibration_release_store import (
+    SqlHeldoutCoverageReleaseStore,
+)
+from app.services.forecast_calibration_releases import (
+    HELDOUT_COVERAGE_RELEASE_SCOPE,
+    build_heldout_coverage_release,
+)
+from app.services.forecast_calibration_sets import (
+    calibration_set_version_for,
+    canonical_calibration_set,
+)
 from app.services.forecast_cohort_store import ForecastCohortProof, SqlForecastCohortStore
 from app.services.forecast_cohorts import (
+    CohortPurpose,
     ForecastCohortManifest,
     ForecastCohortMember,
     canonical_cohort_manifest,
@@ -401,7 +430,12 @@ def _drop_project_schema(url: str) -> None:
         with sync_engine.begin() as conn:
             conn.execute(
                 text(
-                    "DROP TABLE IF EXISTS adjustment_factor_set_availability, "
+                    "DROP TABLE IF EXISTS "
+                    "forecast_heldout_coverage_release_availability, "
+                    "forecast_heldout_coverage_release_buckets, "
+                    "forecast_heldout_coverage_releases, "
+                    "forecast_fitted_calibration_sets, "
+                    "adjustment_factor_set_availability, "
                     "adjustment_factor_entries, adjustment_factor_sets, "
                     "vendor_acquisition_campaign_anchors, "
                     "corporate_action_collection_availability, "
@@ -441,8 +475,21 @@ def _drop_project_schema(url: str) -> None:
                 "reject_adjustment_factor_mutation",
                 "stamp_adjustment_factor_set_availability",
                 "reject_vendor_acquisition_anchor_mutation",
+                "reject_forecast_calibration_evidence_mutation",
+                "stamp_forecast_heldout_coverage_release_availability",
             ):
                 conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
+            conn.execute(text("DROP FUNCTION IF EXISTS publish_fitted_calibration_set(bytea)"))
+            conn.execute(
+                text("DROP FUNCTION IF EXISTS publish_forecast_heldout_coverage_release(bytea)")
+            )
+            conn.execute(text("DROP FUNCTION IF EXISTS canonical_forecast_calibration_json(jsonb)"))
+            conn.execute(
+                text(
+                    "DROP FUNCTION IF EXISTS "
+                    "publish_forecast_heldout_coverage_release_receipt(varchar)"
+                )
+            )
             conn.execute(
                 text("DROP FUNCTION IF EXISTS forecast_bar_series_fence_id(text, text, text)")
             )
@@ -1020,7 +1067,7 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0014_vendor_campaign_anchor"
+        assert version == "0015_calibration_evidence"
         hypertables = (
             await conn.execute(
                 text(
@@ -1523,7 +1570,7 @@ async def test_nonempty_policy_registry_refuses_downgrade(
     assert "cannot downgrade nonempty outcome-policy evidence" in combined
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0014_vendor_campaign_anchor"
+    assert version == "0015_calibration_evidence"
 
 
 async def test_corporate_action_publication_replay_correction_and_withdrawal(
@@ -2236,7 +2283,7 @@ async def test_adjustment_factor_publication_replay_receipt_projection_and_lock(
     )
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0014_vendor_campaign_anchor"
+    assert version == "0015_calibration_evidence"
 
 
 async def test_adjustment_decimal_kernel_is_exact_decimal34(
@@ -2807,6 +2854,166 @@ async def test_forecast_evidence_schema_and_role_boundaries(
                         ":function_name, 'EXECUTE')"
                     ),
                     {"function_name": function_name},
+                )
+            ).one()
+            assert runtime is True
+            assert builder is False
+
+
+async def test_calibration_evidence_schema_and_role_boundaries(
+    owner_engine: AsyncEngine,
+) -> None:
+    tables = (
+        "forecast_fitted_calibration_sets",
+        "forecast_heldout_coverage_releases",
+        "forecast_heldout_coverage_release_buckets",
+        "forecast_heldout_coverage_release_availability",
+    )
+    async with owner_engine.connect() as conn:
+        present = set(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT tablename FROM pg_tables "
+                        "WHERE schemaname = 'public' AND tablename = ANY(:tables)"
+                    ),
+                    {"tables": list(tables)},
+                )
+            ).scalars()
+        )
+        assert present == set(tables)
+
+        constraints = set(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT constraint_name FROM information_schema.table_constraints "
+                        "WHERE table_schema = 'public' AND table_name = ANY(:tables)"
+                    ),
+                    {"tables": list(tables)},
+                )
+            ).scalars()
+        )
+        assert {
+            "pk_forecast_fitted_calibration_sets",
+            "pk_forecast_heldout_coverage_releases",
+            "pk_forecast_heldout_coverage_release_buckets",
+            "pk_forecast_heldout_coverage_release_availability",
+            "uq_fitted_calibration_sets_cohort_method",
+        } <= constraints
+        assert any(
+            name.startswith("ck_forecast_fitted_calibration_sets_calibration_")
+            for name in constraints
+        )
+        assert any(
+            name.startswith("ck_forecast_heldout_coverage_releases_scope_") for name in constraints
+        )
+        assert any(
+            name.startswith("ck_forecast_heldout_coverage_releases_release_")
+            for name in constraints
+        )
+
+        publication_index = (
+            await conn.execute(
+                text(
+                    "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' "
+                    "AND tablename = 'forecast_realized_outcome_publications' "
+                    "AND indexname = "
+                    "'ix_forecast_realized_outcome_publications_cohort_member'"
+                )
+            )
+        ).scalar_one()
+        assert "(cohort_id, forecast_id, step, outcome_id)" in publication_index
+
+        trigger_rows = (
+            await conn.execute(
+                text(
+                    "SELECT relation.relname, trigger.tgname FROM pg_trigger AS trigger "
+                    "JOIN pg_class AS relation ON relation.oid = trigger.tgrelid "
+                    "WHERE NOT trigger.tgisinternal AND relation.relname = ANY(:tables)"
+                ),
+                {"tables": list(tables)},
+            )
+        ).all()
+        triggers = {tuple(row) for row in trigger_rows}
+        for table_name in tables:
+            assert (table_name, f"{table_name}_no_row_mutation") in triggers
+            assert (table_name, f"{table_name}_no_truncate") in triggers
+        assert (
+            "forecast_heldout_coverage_release_availability",
+            "forecast_heldout_coverage_release_availability_stamp",
+        ) in triggers
+
+        for table_name in tables:
+            runtime = (
+                await conn.execute(
+                    text(
+                        "SELECT has_table_privilege('stockapi_app', :table, 'SELECT'), "
+                        "has_table_privilege('stockapi_app', :table, 'INSERT'), "
+                        "has_table_privilege('stockapi_app', :table, 'UPDATE'), "
+                        "has_table_privilege('stockapi_app', :table, 'DELETE'), "
+                        "has_table_privilege('stockapi_app', :table, 'TRUNCATE'), "
+                        "has_any_column_privilege('stockapi_app', :table, 'INSERT'), "
+                        "has_any_column_privilege('stockapi_app', :table, 'UPDATE'), "
+                        "has_any_column_privilege('stockapi_app', :table, 'REFERENCES')"
+                    ),
+                    {"table": table_name},
+                )
+            ).one()
+            assert tuple(runtime) == (True, False, False, False, False, False, False, False)
+            builder = (
+                await conn.execute(
+                    text(
+                        "SELECT has_table_privilege("
+                        "'stockapi_snapshot_builder', :table, 'SELECT'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table, 'INSERT'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table, 'UPDATE'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table, 'DELETE'), "
+                        "has_table_privilege("
+                        "'stockapi_snapshot_builder', :table, 'TRUNCATE'), "
+                        "has_any_column_privilege("
+                        "'stockapi_snapshot_builder', :table, 'SELECT')"
+                    ),
+                    {"table": table_name},
+                )
+            ).one()
+            assert tuple(builder) == (False, False, False, False, False, False)
+
+        for function_name in (
+            "canonical_forecast_calibration_json(jsonb)",
+            "reject_forecast_calibration_evidence_mutation()",
+            "stamp_forecast_heldout_coverage_release_availability()",
+        ):
+            runtime, builder = (
+                await conn.execute(
+                    text(
+                        "SELECT has_function_privilege("
+                        "'stockapi_app', :function, 'EXECUTE'), "
+                        "has_function_privilege("
+                        "'stockapi_snapshot_builder', :function, 'EXECUTE')"
+                    ),
+                    {"function": function_name},
+                )
+            ).one()
+            assert runtime is False
+            assert builder is False
+        for function_name in (
+            "publish_fitted_calibration_set(bytea)",
+            "publish_forecast_heldout_coverage_release(bytea)",
+            "publish_forecast_heldout_coverage_release_receipt(varchar)",
+        ):
+            runtime, builder = (
+                await conn.execute(
+                    text(
+                        "SELECT has_function_privilege("
+                        "'stockapi_app', :function, 'EXECUTE'), "
+                        "has_function_privilege("
+                        "'stockapi_snapshot_builder', :function, 'EXECUTE')"
+                    ),
+                    {"function": function_name},
                 )
             ).one()
             assert runtime is True
@@ -4357,6 +4564,7 @@ def _forecast_snapshot_record(
     symbol: str = "AAPL",
     as_of: datetime | None = None,
     target_times: tuple[datetime, ...] | None = None,
+    horizon_unit: str = "calendar_day",
 ) -> ForecastInputSnapshotRecord:
     snapshot_as_of = as_of or datetime(2026, 7, 10, 21, tzinfo=UTC)
     return build_snapshot_record(
@@ -4364,7 +4572,7 @@ def _forecast_snapshot_record(
             resolution_policy_hash=policy_hash,
             symbol=symbol,
             target="close",
-            horizon_unit="calendar_day",
+            horizon_unit=horizon_unit,
             series_basis="raw",
             input_timespan="day",
             input_multiplier=1,
@@ -5265,3 +5473,562 @@ async def test_persisted_factor_to_adjusted_forecast_snapshot_live_chain(
                 )
         finally:
             await transaction.rollback()
+
+
+@dataclass(frozen=True, repr=False)
+class _LiveCalibrationCohort:
+    proof: ForecastCohortProof
+    sources: tuple[ForecastOutcomePublicationSource, ...]
+    target_time: datetime
+    symbol: str
+
+
+async def _archive_live_calibration_cohort(
+    *,
+    engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+    outcome_policy: ForecastOutcomeResolutionPolicy,
+    purpose: CohortPurpose,
+    selection_policy_hash: str,
+    forecast_resolution_policy_hash: str,
+    forecast_availability_rule_set_hash: str,
+    symbol: str,
+    target_time: datetime,
+    forecast_ids: tuple[UUID, ...],
+) -> _LiveCalibrationCohort:
+    """Archive and prospectively seal one bounded synthetic cohort."""
+
+    if len(forecast_ids) != 4:
+        raise AssertionError("live calibration fixtures require exactly four members")
+    runtime_maker = build_sessionmaker(engine)
+    snapshots: list[ForecastInputSnapshotRecord] = []
+    run_values: list[dict[str, object]] = []
+    for index, forecast_id in enumerate(forecast_ids):
+        snapshot = _forecast_snapshot_record(
+            final_value=95.0 + index,
+            policy_hash=forecast_resolution_policy_hash,
+            symbol=symbol,
+            as_of=target_time - timedelta(minutes=10, seconds=index),
+            target_times=(target_time,),
+            horizon_unit="trading_day",
+        )
+        snapshots.append(snapshot)
+        response = _scheduled_response(
+            forecast_id=forecast_id,
+            snapshot=snapshot,
+            target_time=target_time,
+        )
+        request = ForecastRequest(
+            symbol=symbol,
+            horizon=1,
+            horizon_unit="trading_day",
+            target="close",
+            snapshot_id=snapshot.snapshot_id,
+            model="baseline_naive",
+            interval_coverages=[0.8],
+        )
+        request_bytes = canonical_request(request)
+        output_bytes = canonical_output(response)
+        run_values.append(
+            {
+                "forecast_id": forecast_id,
+                "schema_version": 1,
+                "origin_kind": "scheduled_evaluation",
+                "idempotency_token_digest": None,
+                "request_hash": request_hash(request_bytes),
+                "opportunity_hash": opportunity_hash(
+                    response,
+                    resolution_policy_hash=forecast_resolution_policy_hash,
+                    availability_rule_set_hash=forecast_availability_rule_set_hash,
+                    origin_kind="scheduled_evaluation",
+                ),
+                "output_hash": output_hash(output_bytes),
+                "snapshot_id": snapshot.snapshot_id,
+                "resolution_policy_hash": forecast_resolution_policy_hash,
+                "availability_rule_set_hash": forecast_availability_rule_set_hash,
+                "symbol": response.symbol,
+                "target": response.target,
+                "horizon": response.horizon,
+                "horizon_unit": response.horizon_unit,
+                "series_basis": response.provenance.series_basis,
+                "as_of": response.as_of,
+                "max_available_at": response.provenance.max_available_at,
+                "model_version": response.provenance.model_version,
+                "feature_set_hash": response.provenance.feature_set_hash,
+                "code_version": response.provenance.code_version,
+                "calibration_set_version": response.calibration.calibration_set_version,
+                "calibration_method": response.calibration.method,
+                "generated_at": response.provenance.generated_at,
+                "canonical_request": request_bytes,
+                "canonical_output": output_bytes,
+            }
+        )
+
+    async with snapshot_builder_engine.begin() as conn:
+        for snapshot in snapshots:
+            await conn.execute(pg_insert(ForecastInputSnapshot).values(**_record_values(snapshot)))
+    async with engine.begin() as conn:
+        for values in run_values:
+            await conn.execute(pg_insert(ForecastRun).values(**values))
+
+    async with runtime_maker() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(ForecastRun)
+                    .where(ForecastRun.forecast_id.in_(forecast_ids))
+                    .order_by(ForecastRun.forecast_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == len(forecast_ids)
+    members = tuple(member_from_scheduled_run(row, step=1) for row in rows)
+    manifest = ForecastCohortManifest(
+        purpose=purpose,
+        selection_policy_hash=selection_policy_hash,
+        outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
+        members=members,
+    )
+    proof = await SqlForecastCohortStore(runtime_maker).publish(manifest)
+    assert proof.seal.sealed_at < target_time
+    return _LiveCalibrationCohort(
+        proof=proof,
+        sources=tuple(
+            ForecastOutcomePublicationSource(
+                cohort_id=proof.record.cohort_id,
+                forecast_id=member.forecast_id,
+                step=member.step,
+            )
+            for member in proof.manifest.members
+        ),
+        target_time=target_time,
+        symbol=symbol,
+    )
+
+
+async def _wait_for_live_database_time(
+    maker: async_sessionmaker[AsyncSession],
+    moment: datetime,
+) -> None:
+    while True:
+        async with maker() as session:
+            now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+        remaining = (moment - now).total_seconds()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining + 0.02, 0.25))
+
+
+async def _live_calibration_outcome_payload(
+    maker: async_sessionmaker[AsyncSession],
+    *,
+    outcome_policy: ForecastOutcomeResolutionPolicy,
+    symbol: str,
+    target_time: datetime,
+) -> RealizedOutcomePayload:
+    async with maker() as session:
+        bar = (
+            await session.execute(
+                select(Bar).where(
+                    Bar.symbol == symbol,
+                    Bar.ts == target_time,
+                    Bar.source == "polygon_open_close",
+                    Bar.adjustment_basis == "raw",
+                )
+            )
+        ).scalar_one()
+        receipt = (
+            await session.execute(
+                select(BarVersionAvailability).where(
+                    BarVersionAvailability.symbol == symbol,
+                    BarVersionAvailability.ts == target_time,
+                    BarVersionAvailability.source == "polygon_open_close",
+                    BarVersionAvailability.adjustment_basis == "raw",
+                    BarVersionAvailability.version_recorded_at == bar.recorded_at,
+                )
+            )
+        ).scalar_one()
+    source = BarVersionEvidence(
+        symbol=symbol,
+        timespan="day",
+        multiplier=1,
+        observed_at=target_time,
+        source="polygon_open_close",
+        adjustment_basis="raw",
+        fetched_at=bar.fetched_at,
+        source_as_of=bar.as_of,
+        version_recorded_at=bar.recorded_at,
+        available_at=receipt.available_at,
+        field="close",
+        value=bar.close,
+    )
+    cutoff = outcome_policy.cutoff_for(target_time)
+    assert source.available_at <= cutoff
+    return RealizedOutcomePayload(
+        outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
+        resolution_cutoff=cutoff,
+        symbol=symbol,
+        target="close",
+        series_basis="raw",
+        target_time=target_time,
+        currency="USD",
+        realized_value=bar.close,
+        source_version=source,
+    )
+
+
+async def test_calibration_publishers_replay_fence_scope_and_immutability(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+    snapshot_builder_engine: AsyncEngine,
+    migrated_database_url: LiveDatabaseUrls,
+) -> None:
+    """Prove migration 0015's callable boundary on real PostgreSQL.
+
+    All evidence is labelled synthetic and remains confined to the throwaway
+    database. The wrong-symbol cohort makes the database publisher, not only
+    the Python reader, reject a held-out run-scope substitution.
+    """
+
+    runtime_maker = build_sessionmaker(engine)
+    async with runtime_maker() as session:
+        database_now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+    fit_target = database_now + timedelta(seconds=12)
+    heldout_target = fit_target + timedelta(seconds=1)
+    outcome_policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=10)
+    await SqlForecastOutcomePolicyStore(runtime_maker).register(outcome_policy)
+    forecast_policy_hash = "sha256:" + "a" * 64
+    forecast_rule_set_hash = "sha256:" + "b" * 64
+
+    def ids(prefix: str) -> tuple[UUID, ...]:
+        return tuple(UUID(f"{prefix}000000-0000-0000-0000-{number:012d}") for number in range(1, 5))
+
+    fit = await _archive_live_calibration_cohort(
+        engine=engine,
+        snapshot_builder_engine=snapshot_builder_engine,
+        outcome_policy=outcome_policy,
+        purpose="calibration_fit",
+        selection_policy_hash="sha256:" + "c" * 64,
+        forecast_resolution_policy_hash=forecast_policy_hash,
+        forecast_availability_rule_set_hash=forecast_rule_set_hash,
+        symbol="CAL",
+        target_time=fit_target,
+        forecast_ids=ids("71"),
+    )
+    heldout = await _archive_live_calibration_cohort(
+        engine=engine,
+        snapshot_builder_engine=snapshot_builder_engine,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        selection_policy_hash="sha256:" + "d" * 64,
+        forecast_resolution_policy_hash=forecast_policy_hash,
+        forecast_availability_rule_set_hash=forecast_rule_set_hash,
+        symbol="CAL",
+        target_time=heldout_target,
+        forecast_ids=ids("72"),
+    )
+    wrong_scope = await _archive_live_calibration_cohort(
+        engine=engine,
+        snapshot_builder_engine=snapshot_builder_engine,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        selection_policy_hash="sha256:" + "e" * 64,
+        forecast_resolution_policy_hash=forecast_policy_hash,
+        forecast_availability_rule_set_hash=forecast_rule_set_hash,
+        symbol="BAD",
+        target_time=heldout_target,
+        forecast_ids=ids("73"),
+    )
+
+    await _wait_for_live_database_time(runtime_maker, heldout_target)
+    bar_inputs = (
+        OHLCVBar(
+            symbol="CAL",
+            timestamp=fit_target,
+            timespan="day",
+            multiplier=1,
+            open=100.0,
+            high=102.0,
+            low=99.0,
+            close=101.0,
+            volume=1_000.0,
+            source="polygon_open_close",
+            adjustment_basis="raw",
+            fetched_at=fit_target,
+        ),
+        OHLCVBar(
+            symbol="CAL",
+            timestamp=heldout_target,
+            timespan="day",
+            multiplier=1,
+            open=102.0,
+            high=104.0,
+            low=101.0,
+            close=103.0,
+            volume=1_100.0,
+            source="polygon_open_close",
+            adjustment_basis="raw",
+            fetched_at=heldout_target,
+        ),
+        OHLCVBar(
+            symbol="BAD",
+            timestamp=heldout_target,
+            timespan="day",
+            multiplier=1,
+            open=98.0,
+            high=100.0,
+            low=97.0,
+            close=99.0,
+            volume=900.0,
+            source="polygon_open_close",
+            adjustment_basis="raw",
+            fetched_at=heldout_target,
+        ),
+    )
+    async with runtime_maker() as session, session.begin():
+        write_plan = await upsert_bars(session, bar_inputs)
+    async with runtime_maker() as session, session.begin():
+        assert await finalize_bar_version_availability(session, write_plan.rows) == 3
+
+    await _wait_for_live_database_time(
+        runtime_maker,
+        outcome_policy.cutoff_for(heldout_target),
+    )
+    payloads = {
+        ("CAL", fit_target): await _live_calibration_outcome_payload(
+            runtime_maker,
+            outcome_policy=outcome_policy,
+            symbol="CAL",
+            target_time=fit_target,
+        ),
+        ("CAL", heldout_target): await _live_calibration_outcome_payload(
+            runtime_maker,
+            outcome_policy=outcome_policy,
+            symbol="CAL",
+            target_time=heldout_target,
+        ),
+        ("BAD", heldout_target): await _live_calibration_outcome_payload(
+            runtime_maker,
+            outcome_policy=outcome_policy,
+            symbol="BAD",
+            target_time=heldout_target,
+        ),
+    }
+    outcome_store = SqlForecastOutcomeStore(
+        sessionmaker=runtime_maker,
+        outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+        availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
+    )
+    for cohort in (fit, heldout, wrong_scope):
+        payload = payloads[(cohort.symbol, cohort.target_time)]
+        for source in cohort.sources:
+            published_outcome = await outcome_store.publish(payload, source=source)
+            assert published_outcome.publication.cohort_id == cohort.proof.record.cohort_id
+            assert published_outcome.publication.forecast_id == source.forecast_id
+
+    evidence_reader = SqlForecastCalibrationEvidenceReader(runtime_maker)
+    fit_dataset = await evidence_reader.read_validated(fit.proof.record.cohort_id)
+    heldout_dataset = await evidence_reader.read_validated(heldout.proof.record.cohort_id)
+    fitted_set = fit_empirical_residual_calibration_set(
+        fit_dataset,
+        buckets=[CalibrationFitBucket(horizon=1, coverage=0.8)],
+    )
+    heldout_evidence = estimate_heldout_coverage(
+        fitted_set,
+        fit_dataset=fit_dataset,
+        heldout_dataset=heldout_dataset,
+        confidence_level=0.95,
+    )
+    release = build_heldout_coverage_release(fitted_set, heldout_evidence)
+    canonical_set = canonical_calibration_set(fitted_set)
+
+    # Content and public availability must be separate transactions. This
+    # attempt is rolled back before exercising the store's intended path.
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            set_id = (
+                await conn.execute(
+                    text("SELECT publish_fitted_calibration_set(:canonical_set)"),
+                    {"canonical_set": canonical_set},
+                )
+            ).scalar_one()
+            release_id = (
+                await conn.execute(
+                    text("SELECT publish_forecast_heldout_coverage_release(:canonical_release)"),
+                    {"canonical_release": release.canonical_release},
+                )
+            ).scalar_one()
+            assert set_id == calibration_set_version_for(fitted_set)
+            assert release_id == release.release_id
+            with pytest.raises(DBAPIError, match="requires a later transaction") as excinfo:
+                await conn.execute(
+                    text(
+                        "SELECT * FROM "
+                        "publish_forecast_heldout_coverage_release_receipt(:release_id)"
+                    ),
+                    {"release_id": release.release_id},
+                )
+            assert getattr(excinfo.value.orig, "sqlstate", None) == "55000"
+        finally:
+            await transaction.rollback()
+
+    release_store = SqlHeldoutCoverageReleaseStore(runtime_maker)
+    published = await release_store.publish(
+        fitted_set,
+        heldout_cohort_id=heldout.proof.record.cohort_id,
+        confidence_level=0.95,
+    )
+    replayed = await release_store.publish(
+        fitted_set,
+        heldout_cohort_id=heldout.proof.record.cohort_id,
+        confidence_level=0.95,
+    )
+    assert replayed == published
+    assert published.release.release_id == release.release_id
+    assert published.release_record.evidence_scope == HELDOUT_COVERAGE_RELEASE_SCOPE
+    assert published.availability.sealer_xid != published.release_record.creator_xid
+    assert published.availability.available_at >= published.release_record.recorded_at
+
+    async with runtime_maker() as session:
+        fitted_row = await session.get(
+            ForecastFittedCalibrationSet,
+            calibration_set_version_for(fitted_set),
+        )
+        release_row = await session.get(ForecastHeldoutCoverageRelease, release.release_id)
+        bucket_rows = (
+            (
+                await session.execute(
+                    select(ForecastHeldoutCoverageReleaseBucket).where(
+                        ForecastHeldoutCoverageReleaseBucket.release_id == release.release_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        receipt_row = await session.get(
+            ForecastHeldoutCoverageReleaseAvailability,
+            release.release_id,
+        )
+    assert fitted_row is not None
+    assert bytes(fitted_row.canonical_set) == canonical_set
+    assert fitted_row.cohort_id == fit.proof.record.cohort_id
+    assert release_row is not None
+    assert bytes(release_row.canonical_release) == release.canonical_release
+    assert release_row.heldout_cohort_id == heldout.proof.record.cohort_id
+    assert release_row.bucket_count == len(bucket_rows) == 1
+    assert bucket_rows[0].sample_count == 4
+    assert receipt_row is not None
+    assert receipt_row.release_recorded_at == release_row.recorded_at
+
+    # Rebind otherwise-valid release bytes to a complete held-out cohort whose
+    # archived runs say BAD instead of CAL. The trusted DB publisher must not
+    # rely on caller-side proof validation for this semantic boundary.
+    forged_document = json.loads(release.canonical_release)
+    forged_document["heldout_cohort_id"] = wrong_scope.proof.record.cohort_id
+    forged_document["heldout_selection_policy_hash"] = (
+        wrong_scope.proof.manifest.selection_policy_hash
+    )
+    forged_document["heldout_evidence_digest"] = "sha256:" + "f" * 64
+    forged_release = json.dumps(
+        forged_document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            with pytest.raises(
+                DBAPIError,
+                match="held-out release scope differs from its forecast cohort",
+            ) as excinfo:
+                await conn.execute(
+                    text("SELECT publish_forecast_heldout_coverage_release(:canonical_release)"),
+                    {"canonical_release": forged_release},
+                )
+            assert getattr(excinfo.value.orig, "sqlstate", None) == "23000"
+        finally:
+            await transaction.rollback()
+
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            with pytest.raises(DBAPIError, match="permission denied"):
+                await conn.execute(
+                    text(
+                        "INSERT INTO forecast_fitted_calibration_sets "
+                        "SELECT * FROM forecast_fitted_calibration_sets WHERE false"
+                    )
+                )
+        finally:
+            await transaction.rollback()
+
+    mutations = (
+        (
+            "UPDATE forecast_fitted_calibration_sets SET symbol = symbol "
+            "WHERE calibration_set_version = :identity",
+            calibration_set_version_for(fitted_set),
+        ),
+        (
+            "DELETE FROM forecast_heldout_coverage_releases WHERE release_id = :identity",
+            release.release_id,
+        ),
+        (
+            "UPDATE forecast_heldout_coverage_release_buckets "
+            "SET covered_count = covered_count WHERE release_id = :identity",
+            release.release_id,
+        ),
+        (
+            "DELETE FROM forecast_heldout_coverage_release_availability "
+            "WHERE release_id = :identity",
+            release.release_id,
+        ),
+    )
+    for statement, identity in mutations:
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(
+                    DBAPIError,
+                    match="forecast calibration evidence is append-only",
+                ):
+                    await conn.execute(text(statement), {"identity": identity})
+            finally:
+                await transaction.rollback()
+    for table_name in (
+        "forecast_fitted_calibration_sets",
+        "forecast_heldout_coverage_releases",
+        "forecast_heldout_coverage_release_buckets",
+        "forecast_heldout_coverage_release_availability",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            try:
+                with pytest.raises(
+                    DBAPIError,
+                    match="forecast calibration evidence is append-only",
+                ):
+                    await conn.execute(text(f"TRUNCATE {table_name} CASCADE"))
+            finally:
+                await transaction.rollback()
+
+    downgrade = await asyncio.to_thread(
+        _invoke_alembic,
+        migrated_database_url.owner,
+        "downgrade",
+        "0014_vendor_campaign_anchor",
+    )
+    assert downgrade.returncode != 0
+    assert "cannot downgrade nonempty forecast calibration evidence" in (
+        f"{downgrade.stdout}\n{downgrade.stderr}"
+    )
+    async with owner_engine.connect() as conn:
+        version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
+    assert version == "0015_calibration_evidence"

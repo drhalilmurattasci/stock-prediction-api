@@ -46,7 +46,7 @@ $buildContext = $null
 $buildContextRegistered = $false
 $worktreeRoot = $null
 $expectedTimescaleImage = "timescale/timescaledb:2.28.2-pg17"
-$expectedMigrationHead = "0014_vendor_campaign_anchor"
+$expectedMigrationHead = "0015_calibration_evidence"
 $maxRecoveryCalls = 5
 $maxCampaignCalls = 264
 

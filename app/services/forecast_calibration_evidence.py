@@ -348,7 +348,7 @@ def estimate_heldout_coverage(
     *,
     fit_dataset: CalibrationEvidenceSet,
     heldout_dataset: CalibrationEvidenceSet,
-    confidence_level: float = 0.95,
+    confidence_level: float,
 ) -> HeldoutCoverageEvidence:
     """Apply one reproducible fit to a disjoint cohort and report Wilson evidence."""
 
@@ -404,7 +404,7 @@ def estimate_heldout_coverage(
                 raise ForecastCalibrationEvidenceError(
                     "fitted correction cannot be applied to held-out evidence"
                 ) from exc
-        low, high = _wilson_interval(hits, len(population), confidence)
+        low, high = wilson_interval(hits, len(population), confidence_level=confidence)
         rows.append(
             HeldoutCoverageBucket(
                 horizon=bucket.horizon,
@@ -1057,7 +1057,15 @@ def _interval_for(observation, coverage: float) -> CalibrationIntervalObservatio
     return matches[0]
 
 
-def _wilson_interval(successes: int, sample_count: int, confidence: float) -> tuple[float, float]:
+def wilson_interval(
+    successes: int,
+    sample_count: int,
+    *,
+    confidence_level: float,
+) -> tuple[float, float]:
+    """Return the deterministic two-sided Wilson score interval."""
+
+    confidence = _open_probability(confidence_level, "confidence_level")
     if (
         type(successes) is not int
         or type(sample_count) is not int
@@ -1184,6 +1192,7 @@ __all__ = [
     "CalibrationIntervalObservation",
     "CalibrationJoinMemberProof",
     "CalibrationObservation",
+    "FitMethod",
     "ForecastCalibrationEvidenceError",
     "HeldoutCoverageBucket",
     "HeldoutCoverageEvidence",
@@ -1192,4 +1201,5 @@ __all__ = [
     "fit_cqr_calibration_set",
     "fit_empirical_residual_calibration_set",
     "join_calibration_evidence",
+    "wilson_interval",
 ]

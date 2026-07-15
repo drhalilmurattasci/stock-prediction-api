@@ -476,7 +476,7 @@ Fresh databases create the fixed, non-owner `stockapi_app` and
 `stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
 Existing initialized database directories do not rerun Docker init scripts;
 bootstrap both roles once before applying migrations `0006` through the current
-head, `0014_vendor_campaign_anchor`:
+head, `0015_calibration_evidence`:
 
 ```powershell
 docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh
@@ -563,7 +563,7 @@ processes could race it. All mutating operator wrappers share one machine-wide
 mutex, and the fixture holds the same PostgreSQL vendor-operation advisory lock
 used by direct smoke/acquisition/backfill/demo lanes across reset and teardown. The module
 fixture then drops its seeded test data and reapplies
-migrations, leaving an empty schema at migration head `0014_vendor_campaign_anchor` so the later vendor smoke
+migrations, leaving an empty schema at migration head `0015_calibration_evidence` so the later vendor smoke
 still proves absence. It never makes a vendor call.
 
 CI proves the same database boundary on every push and pull request in the
@@ -694,7 +694,7 @@ With those exact freshly reviewed values, execution is:
 
 The wrapper scrubs ambient vendor credentials so the key can come only from
 ignored `.env`, disables ambient HTTP proxy inheritance, pins and health-checks
-the local Docker Desktop database at migration head `0014_vendor_campaign_anchor`, and refuses the API,
+the local Docker Desktop database at migration head `0015_calibration_evidence`, and refuses the API,
 worker, Beat, snapshot-builder, native Celery/uvicorn, or another mutating
 operator. Execute revalidates
 the exact one-line plan and runs the reviewed code from a detached Git worktree;
