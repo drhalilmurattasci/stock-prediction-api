@@ -393,8 +393,11 @@ def test_build_forecast_service_is_fail_closed_by_configuration() -> None:
     sessionmaker = object()  # never touched before a request executes
 
     # Fully unset -> serving was never enabled -> None (route stays 501).
-    assert build_forecast_service(Settings(app_env="test"), sessionmaker) is None  # type: ignore[arg-type]
+    assert (
+        build_forecast_service(Settings(_env_file=None, app_env="test"), sessionmaker) is None  # type: ignore[arg-type]
+    )
     blank = Settings(
+        _env_file=None,
         app_env="test",
         forecast_resolution_policy_hash="",
         forecast_trusted_availability_rule_set_hash="   ",
@@ -411,11 +414,15 @@ def test_build_forecast_service_is_fail_closed_by_configuration() -> None:
         },
     ):
         with pytest.raises(AppError) as excinfo:
-            build_forecast_service(Settings(app_env="test", **overrides), sessionmaker)  # type: ignore[arg-type]
+            build_forecast_service(
+                Settings(_env_file=None, app_env="test", **overrides),
+                sessionmaker,  # type: ignore[arg-type]
+            )
         assert excinfo.value.code == "forecast_serving_misconfigured"
 
     service = build_forecast_service(
         Settings(
+            _env_file=None,
             app_env="test",
             forecast_resolution_policy_hash=POLICY_HASH,
             forecast_trusted_availability_rule_set_hash=RULE_SET_HASH,
@@ -447,7 +454,9 @@ def test_build_revision_is_honest_and_strict(tmp_path) -> None:
 def test_dependency_returns_fail_closed_service_until_configured() -> None:
     unconfigured = SimpleNamespace(
         app=SimpleNamespace(
-            state=SimpleNamespace(settings=Settings(app_env="test"), sessionmaker=object())
+            state=SimpleNamespace(
+                settings=Settings(_env_file=None, app_env="test"), sessionmaker=object()
+            )
         )
     )
     assert isinstance(get_forecast_service(unconfigured), UnavailableForecastService)  # type: ignore[arg-type]
@@ -456,6 +465,7 @@ def test_dependency_returns_fail_closed_service_until_configured() -> None:
         app=SimpleNamespace(
             state=SimpleNamespace(
                 settings=Settings(
+                    _env_file=None,
                     app_env="test",
                     forecast_resolution_policy_hash=POLICY_HASH,
                     forecast_trusted_availability_rule_set_hash=RULE_SET_HASH,

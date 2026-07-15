@@ -81,7 +81,7 @@ async def test_batch_sorts_deduplicates_and_reports_created_replayed_deferred(
 
 async def test_batch_refuses_unset_or_wrong_policy_hash_before_database_use() -> None:
     for settings in (
-        Settings(app_env="test"),
+        Settings(_env_file=None, app_env="test"),
         _settings(forecast_resolution_policy_hash="sha256:" + "0" * 64),
         _settings(forecast_trusted_availability_rule_set_hash="sha256:" + "0" * 64),
     ):

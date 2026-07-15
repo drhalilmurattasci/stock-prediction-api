@@ -29,6 +29,7 @@ KEYS = "k-alpha,k-bravo"
 
 def _app(rate: str = "1/minute", **settings_overrides: object):
     settings = Settings(
+        _env_file=None,
         app_env="test",
         rate_limit_enabled=True,
         rate_limit_default=rate,

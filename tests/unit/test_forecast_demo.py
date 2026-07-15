@@ -995,3 +995,10 @@ def test_wrapper_uses_one_shot_builder_and_never_starts_vendor_workers() -> None
         assert "@dockerArgs compose @composeArgs" in operator
         assert '"COMPOSE_ENV_FILES"' in operator
         assert '"COMPOSE_DISABLE_ENV_FILE"' in operator
+
+
+def test_release_image_is_bound_to_the_exact_github_revision() -> None:
+    root = Path(__file__).resolve().parents[2]
+    workflow = (root / ".github/workflows/cd.yml").read_text(encoding="utf-8")
+
+    assert "STOCKAPI_BUILD_REVISION=${{ github.sha }}" in workflow

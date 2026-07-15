@@ -171,7 +171,7 @@ def test_post_forecast_forwards_idempotency_key_and_return_currency() -> None:
 
 
 def test_default_forecast_service_stays_fail_closed() -> None:
-    app = create_app(Settings(app_env="test", rate_limit_enabled=False))
+    app = create_app(Settings(_env_file=None, app_env="test", rate_limit_enabled=False))
     with TestClient(app) as client:
         response = client.get(
             "/v1/forecast/AAPL",
