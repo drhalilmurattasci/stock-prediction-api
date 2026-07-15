@@ -9,6 +9,8 @@ from datetime import date
 import pytest
 
 from app.services.forecast_calibration_sets import (
+    INTERVAL_POLICY_VERSION,
+    WINDOW_DATE_POLICY_VERSION,
     FittedCalibrationBucket,
     FittedCalibrationSet,
     ForecastCalibrationSetValidationError,
@@ -16,12 +18,21 @@ from app.services.forecast_calibration_sets import (
     canonical_calibration_set,
     parse_calibration_set,
 )
-from ml.calibration.conformal import fit_absolute_residual, fit_cqr
+from ml.calibration.conformal import (
+    ABSOLUTE_RESIDUAL_POLICY_VERSION,
+    CQR_POLICY_VERSION,
+    FINITE_SAMPLE_POLICY_VERSION,
+    fit_absolute_residual,
+    fit_cqr,
+)
 
 _H = "sha256:" + "0" * 64
 _H2 = "sha256:" + "1" * 64
 _H3 = "sha256:" + "2" * 64
 _H4 = "sha256:" + "3" * 64
+_H5 = "sha256:" + "4" * 64
+_H6 = "sha256:" + "5" * 64
+_H7 = "sha256:" + "6" * 64
 
 
 def _abs_bucket(horizon: int, coverage: float, *, n: int = 20) -> FittedCalibrationBucket:
@@ -46,6 +57,16 @@ def _cqr_bucket(horizon: int, coverage: float, *, n: int = 20) -> FittedCalibrat
 def _set(**overrides: object) -> FittedCalibrationSet:
     base: dict[str, object] = {
         "model_version": "baseline-naive@1",
+        "symbol": "MSFT",
+        "target": "close",
+        "series_basis": "raw",
+        "horizon_unit": "trading_day",
+        "currency": "USD",
+        "source_calibration_set_version": "uncalibrated:baseline-naive@1",
+        "source_calibration_method": "none",
+        "forecast_resolution_policy_hash": _H5,
+        "forecast_availability_rule_set_hash": _H6,
+        "fit_evidence_digest": _H7,
         "method": "empirical_residual",
         "window_start": date(2026, 1, 5),
         "window_end": date(2026, 3, 10),
@@ -53,7 +74,7 @@ def _set(**overrides: object) -> FittedCalibrationSet:
         "cohort_id": _H,
         "selection_policy_hash": _H2,
         "outcome_resolution_policy_hash": _H3,
-        "availability_rule_set_hash": _H4,
+        "outcome_availability_rule_set_hash": _H4,
         "buckets": (_abs_bucket(1, 0.8), _abs_bucket(1, 0.5), _abs_bucket(5, 0.8)),
     }
     base.update(overrides)
@@ -73,7 +94,46 @@ def test_round_trips_and_is_deterministic() -> None:
     parsed = parse_calibration_set(canonical)
     assert canonical_calibration_set(parsed) == canonical  # round-trip stable
     assert parsed.method == "empirical_residual"
+    assert parsed.symbol == "MSFT"
+    assert parsed.target == "close"
+    assert parsed.series_basis == "raw"
+    assert parsed.horizon_unit == "trading_day"
+    assert parsed.currency == "USD"
+    assert parsed.interval_policy_version == INTERVAL_POLICY_VERSION
+    assert parsed.window_date_policy_version == WINDOW_DATE_POLICY_VERSION
     assert len(parsed.buckets) == 3
+
+
+def test_identity_binds_general_series_semantics_and_bucket_policies() -> None:
+    calibration_set = _set(
+        symbol="BRK.B",
+        target="adjusted_close",
+        series_basis="split_dividend_adjusted",
+        horizon_unit="trading_session",
+        currency="EUR",
+    )
+    canonical = canonical_calibration_set(calibration_set)
+    document = json.loads(canonical)
+    assert document["symbol"] == "BRK.B"
+    assert document["target"] == "adjusted_close"
+    assert document["series_basis"] == "split_dividend_adjusted"
+    assert document["horizon_unit"] == "trading_session"
+    assert document["currency"] == "EUR"
+    assert document["forecast_resolution_policy_hash"] == _H5
+    assert document["forecast_availability_rule_set_hash"] == _H6
+    assert document["fit_evidence_digest"] == _H7
+    assert document["outcome_availability_rule_set_hash"] == _H4
+    assert document["interval_policy_version"] == INTERVAL_POLICY_VERSION
+    assert document["window_date_policy_version"] == WINDOW_DATE_POLICY_VERSION
+    assert document["buckets"][0]["quantile_selection_policy_version"] == (
+        FINITE_SAMPLE_POLICY_VERSION
+    )
+    assert document["buckets"][0]["correction_policy_version"] == (ABSOLUTE_RESIDUAL_POLICY_VERSION)
+    parsed = parse_calibration_set(canonical)
+    assert parsed.target == "adjusted_close"
+    assert parsed.series_basis == "split_dividend_adjusted"
+    assert parsed.source_calibration_method == "none"
+    assert parsed.source_calibration_set_version == "uncalibrated:baseline-naive@1"
 
 
 def test_bucket_order_does_not_change_identity() -> None:
@@ -99,6 +159,8 @@ def test_cqr_method_round_trips() -> None:
         buckets=(_cqr_bucket(1, 0.8), _cqr_bucket(3, 0.9)),
     )
     canonical = canonical_calibration_set(calibration_set)
+    document = json.loads(canonical)
+    assert document["buckets"][0]["correction_policy_version"] == CQR_POLICY_VERSION
     assert canonical_calibration_set(parse_calibration_set(canonical)) == canonical
 
 
@@ -141,6 +203,53 @@ def test_bad_hash_rejected() -> None:
         canonical_calibration_set(_set(cohort_id="not-a-hash"))
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("symbol", "msft"),
+        ("symbol", "MS FT"),
+        ("symbol", "A" * 33),
+        ("target", ""),
+        ("target", "x" * 33),
+        ("series_basis", " raw"),
+        ("series_basis", "x" * 33),
+        ("horizon_unit", ""),
+        ("horizon_unit", "x" * 33),
+        ("currency", ""),
+        ("currency", "x" * 17),
+    ],
+)
+def test_invalid_or_unbounded_series_semantics_are_rejected(field: str, value: str) -> None:
+    with pytest.raises(ForecastCalibrationSetValidationError):
+        canonical_calibration_set(_set(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_calibration_method", "empirical_residual"),
+        ("source_calibration_set_version", "sha256:" + "9" * 64),
+    ],
+)
+def test_source_calibration_identity_must_be_v1_uncalibrated(
+    field: str,
+    value: str,
+) -> None:
+    with pytest.raises(ForecastCalibrationSetValidationError, match="uncalibrated"):
+        canonical_calibration_set(_set(**{field: value}))
+
+
+@pytest.mark.parametrize("policy_location", ["quantile", "correction"])
+def test_policy_versions_are_revalidated_before_persistence(policy_location: str) -> None:
+    bucket = _abs_bucket(1, 0.8)
+    if policy_location == "quantile":
+        object.__setattr__(bucket.calibration.selection, "policy_version", "tampered-v1")
+    else:
+        object.__setattr__(bucket.calibration, "policy_version", "tampered-v1")
+    with pytest.raises(ForecastCalibrationSetValidationError):
+        canonical_calibration_set(_set(buckets=(bucket,)))
+
+
 def test_parse_rejects_unknown_key() -> None:
     canonical = canonical_calibration_set(_set())
     tampered = _mutate(canonical, lambda doc: doc.__setitem__("surprise", 1))
@@ -150,7 +259,11 @@ def test_parse_rejects_unknown_key() -> None:
 
 def test_parse_rejects_missing_key() -> None:
     canonical = canonical_calibration_set(_set())
-    tampered = _mutate(canonical, lambda doc: doc.pop("cohort_id"))
+
+    def remove_cohort(doc: dict[str, object]) -> None:
+        doc.pop("cohort_id")
+
+    tampered = _mutate(canonical, remove_cohort)
     with pytest.raises(ForecastCalibrationSetValidationError):
         parse_calibration_set(tampered)
 
@@ -176,8 +289,39 @@ def test_parse_rejects_tampered_rank() -> None:
         parse_calibration_set(_mutate(canonical, bump_rank))
 
 
+def test_parse_rejects_tampered_interval_policy_version() -> None:
+    canonical = canonical_calibration_set(_set())
+    tampered = _mutate(
+        canonical,
+        lambda doc: doc.__setitem__("interval_policy_version", "one-sided-v1"),
+    )
+    with pytest.raises(ForecastCalibrationSetValidationError):
+        parse_calibration_set(tampered)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("quantile_selection_policy_version", "interpolated-v1"),
+        ("correction_policy_version", "unsigned-residual-v1"),
+    ],
+)
+def test_parse_rejects_tampered_bucket_policy_version(key: str, value: str) -> None:
+    canonical = canonical_calibration_set(_set())
+
+    def tamper_policy(doc: dict[str, object]) -> None:
+        buckets = doc["buckets"]
+        assert isinstance(buckets, list)
+        bucket = buckets[0]
+        assert isinstance(bucket, dict)
+        bucket[key] = value
+
+    with pytest.raises(ForecastCalibrationSetValidationError):
+        parse_calibration_set(_mutate(canonical, tamper_policy))
+
+
 def test_parse_rejects_duplicate_json_key() -> None:
-    raw = b'{"format":"forecast-calibration-set-v1","format":"forecast-calibration-set-v1"}'
+    raw = b'{"format":"forecast-calibration-set-v2","format":"forecast-calibration-set-v2"}'
     with pytest.raises(ForecastCalibrationSetValidationError):
         parse_calibration_set(raw)
 

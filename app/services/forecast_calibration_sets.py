@@ -31,16 +31,24 @@ from datetime import date, datetime
 from typing import Literal
 
 from ml.calibration.conformal import (
+    ABSOLUTE_RESIDUAL_POLICY_VERSION,
+    CQR_POLICY_VERSION,
+    FINITE_SAMPLE_POLICY_VERSION,
     AbsoluteResidualCalibration,
     ConformalValidationError,
     CQRCalibration,
     QuantileSelection,
 )
 
-CALIBRATION_SET_SCHEMA_VERSION = 1
-CALIBRATION_SET_FORMAT = "forecast-calibration-set-v1"
+CALIBRATION_SET_SCHEMA_VERSION = 2
+CALIBRATION_SET_FORMAT = "forecast-calibration-set-v2"
+INTERVAL_POLICY_VERSION = "central-equal-tailed-v1"
+WINDOW_DATE_POLICY_VERSION = "utc-target-date-v1"
 MAX_CALIBRATION_BUCKETS = 10_000
 MODEL_VERSION_MAX_LENGTH = 128
+SYMBOL_MAX_LENGTH = 32
+SEMANTIC_VALUE_MAX_LENGTH = 32
+CURRENCY_MAX_LENGTH = 16
 MAX_CANONICAL_BYTES = 4 * 1024 * 1024
 
 type CalibrationMethod = Literal["empirical_residual", "conformal_quantile_regression"]
@@ -50,8 +58,13 @@ _METHOD_TYPES: dict[str, type[_FittedCorrection]] = {
     "empirical_residual": AbsoluteResidualCalibration,
     "conformal_quantile_regression": CQRCalibration,
 }
+_CORRECTION_POLICY_VERSIONS: dict[CalibrationMethod, str] = {
+    "empirical_residual": ABSOLUTE_RESIDUAL_POLICY_VERSION,
+    "conformal_quantile_regression": CQR_POLICY_VERSION,
+}
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.\-_:]{0,31}$")
 
 
 class ForecastCalibrationSetValidationError(ValueError):
@@ -71,6 +84,16 @@ class FittedCalibrationSet:
     """Content-addressable fitted calibration for one model, over one cohort."""
 
     model_version: str
+    symbol: str
+    target: str
+    series_basis: str
+    horizon_unit: str
+    currency: str
+    source_calibration_set_version: str
+    source_calibration_method: str
+    forecast_resolution_policy_hash: str
+    forecast_availability_rule_set_hash: str
+    fit_evidence_digest: str
     method: CalibrationMethod
     window_start: date
     window_end: date
@@ -78,8 +101,10 @@ class FittedCalibrationSet:
     cohort_id: str
     selection_policy_hash: str
     outcome_resolution_policy_hash: str
-    availability_rule_set_hash: str
+    outcome_availability_rule_set_hash: str
     buckets: tuple[FittedCalibrationBucket, ...]
+    interval_policy_version: str = INTERVAL_POLICY_VERSION
+    window_date_policy_version: str = WINDOW_DATE_POLICY_VERSION
     schema_version: int = CALIBRATION_SET_SCHEMA_VERSION
 
 
@@ -88,26 +113,40 @@ def canonical_calibration_set(calibration_set: FittedCalibrationSet) -> bytes:
 
     normalized = _normalized_set(calibration_set)
     document = {
-        "availability_rule_set_hash": normalized.availability_rule_set_hash,
+        "fit_evidence_digest": normalized.fit_evidence_digest,
         "buckets": [
             {
                 "coverage_millis": _coverage_millis(bucket.calibration.selection.coverage),
+                "correction_policy_version": bucket.calibration.policy_version,
                 "fit_sample_count": bucket.calibration.selection.sample_count,
                 "horizon": bucket.horizon,
+                "quantile_selection_policy_version": (bucket.calibration.selection.policy_version),
                 "rank": bucket.calibration.selection.rank,
                 "value": _canonical_float(bucket.calibration.selection.value, "bucket value"),
             }
             for bucket in normalized.buckets
         ],
         "cohort_id": normalized.cohort_id,
+        "currency": normalized.currency,
+        "forecast_availability_rule_set_hash": (normalized.forecast_availability_rule_set_hash),
+        "forecast_resolution_policy_hash": normalized.forecast_resolution_policy_hash,
         "format": CALIBRATION_SET_FORMAT,
+        "horizon_unit": normalized.horizon_unit,
+        "interval_policy_version": normalized.interval_policy_version,
         "method": normalized.method,
         "model_version": normalized.model_version,
         "outcome_resolution_policy_hash": normalized.outcome_resolution_policy_hash,
+        "outcome_availability_rule_set_hash": (normalized.outcome_availability_rule_set_hash),
         "sample_count": normalized.sample_count,
         "schema_version": normalized.schema_version,
         "selection_policy_hash": normalized.selection_policy_hash,
+        "series_basis": normalized.series_basis,
+        "source_calibration_method": normalized.source_calibration_method,
+        "source_calibration_set_version": normalized.source_calibration_set_version,
+        "symbol": normalized.symbol,
+        "target": normalized.target,
         "window_end": normalized.window_end.isoformat(),
+        "window_date_policy_version": normalized.window_date_policy_version,
         "window_start": normalized.window_start.isoformat(),
     }
     try:
@@ -148,17 +187,29 @@ def parse_calibration_set(canonical_set: bytes) -> FittedCalibrationSet:
     if not isinstance(document, dict):
         raise ForecastCalibrationSetValidationError("fitted calibration set must be a JSON object")
     expected_keys = {
-        "availability_rule_set_hash",
         "buckets",
         "cohort_id",
+        "currency",
+        "fit_evidence_digest",
+        "forecast_availability_rule_set_hash",
+        "forecast_resolution_policy_hash",
         "format",
+        "horizon_unit",
+        "interval_policy_version",
         "method",
         "model_version",
+        "outcome_availability_rule_set_hash",
         "outcome_resolution_policy_hash",
         "sample_count",
         "schema_version",
         "selection_policy_hash",
+        "series_basis",
+        "source_calibration_method",
+        "source_calibration_set_version",
+        "symbol",
+        "target",
         "window_end",
+        "window_date_policy_version",
         "window_start",
     }
     if set(document) != expected_keys:
@@ -173,7 +224,15 @@ def parse_calibration_set(canonical_set: bytes) -> FittedCalibrationSet:
     raw_buckets = document["buckets"]
     if not isinstance(raw_buckets, list):
         raise ForecastCalibrationSetValidationError("calibration buckets must be a JSON array")
-    bucket_keys = {"coverage_millis", "fit_sample_count", "horizon", "rank", "value"}
+    bucket_keys = {
+        "correction_policy_version",
+        "coverage_millis",
+        "fit_sample_count",
+        "horizon",
+        "quantile_selection_policy_version",
+        "rank",
+        "value",
+    }
     buckets: list[FittedCalibrationBucket] = []
     for index, raw in enumerate(raw_buckets):
         if not isinstance(raw, dict) or set(raw) != bucket_keys:
@@ -187,6 +246,8 @@ def parse_calibration_set(canonical_set: bytes) -> FittedCalibrationSet:
                 fit_sample_count=raw["fit_sample_count"],
                 rank=raw["rank"],
                 value=raw["value"],
+                quantile_selection_policy_version=raw["quantile_selection_policy_version"],
+                correction_policy_version=raw["correction_policy_version"],
                 method=method,
                 label=f"buckets[{index}]",
             )
@@ -194,6 +255,36 @@ def parse_calibration_set(canonical_set: bytes) -> FittedCalibrationSet:
     calibration_set = FittedCalibrationSet(
         schema_version=_integer(document["schema_version"], "schema_version"),
         model_version=_model_version(document["model_version"]),
+        symbol=_symbol(document["symbol"]),
+        target=_semantic_text(document["target"], "target"),
+        series_basis=_semantic_text(document["series_basis"], "series_basis"),
+        horizon_unit=_semantic_text(document["horizon_unit"], "horizon_unit"),
+        currency=_semantic_text(
+            document["currency"],
+            "currency",
+            max_length=CURRENCY_MAX_LENGTH,
+        ),
+        source_calibration_set_version=_semantic_text(
+            document["source_calibration_set_version"],
+            "source_calibration_set_version",
+            max_length=MODEL_VERSION_MAX_LENGTH,
+        ),
+        source_calibration_method=_semantic_text(
+            document["source_calibration_method"],
+            "source_calibration_method",
+        ),
+        forecast_resolution_policy_hash=_sha256(
+            document["forecast_resolution_policy_hash"],
+            "forecast_resolution_policy_hash",
+        ),
+        forecast_availability_rule_set_hash=_sha256(
+            document["forecast_availability_rule_set_hash"],
+            "forecast_availability_rule_set_hash",
+        ),
+        fit_evidence_digest=_sha256(
+            document["fit_evidence_digest"],
+            "fit_evidence_digest",
+        ),
         method=method,
         window_start=_parse_date(document["window_start"], "window_start"),
         window_end=_parse_date(document["window_end"], "window_end"),
@@ -204,11 +295,21 @@ def parse_calibration_set(canonical_set: bytes) -> FittedCalibrationSet:
             document["outcome_resolution_policy_hash"],
             "outcome_resolution_policy_hash",
         ),
-        availability_rule_set_hash=_sha256(
-            document["availability_rule_set_hash"],
-            "availability_rule_set_hash",
+        outcome_availability_rule_set_hash=_sha256(
+            document["outcome_availability_rule_set_hash"],
+            "outcome_availability_rule_set_hash",
         ),
         buckets=tuple(buckets),
+        interval_policy_version=_policy_version(
+            document["interval_policy_version"],
+            INTERVAL_POLICY_VERSION,
+            "interval_policy_version",
+        ),
+        window_date_policy_version=_policy_version(
+            document["window_date_policy_version"],
+            WINDOW_DATE_POLICY_VERSION,
+            "window_date_policy_version",
+        ),
     )
     normalized = _normalized_set(calibration_set)
     if canonical_calibration_set(normalized) != canonical_set:
@@ -240,6 +341,53 @@ def _normalized_set(calibration_set: FittedCalibrationSet) -> FittedCalibrationS
         )
     method = _method(calibration_set.method)
     model_version = _model_version(calibration_set.model_version)
+    symbol = _symbol(calibration_set.symbol)
+    target = _semantic_text(calibration_set.target, "target")
+    series_basis = _semantic_text(calibration_set.series_basis, "series_basis")
+    horizon_unit = _semantic_text(calibration_set.horizon_unit, "horizon_unit")
+    currency = _semantic_text(
+        calibration_set.currency,
+        "currency",
+        max_length=CURRENCY_MAX_LENGTH,
+    )
+    source_calibration_set_version = _semantic_text(
+        calibration_set.source_calibration_set_version,
+        "source_calibration_set_version",
+        max_length=MODEL_VERSION_MAX_LENGTH,
+    )
+    source_calibration_method = _semantic_text(
+        calibration_set.source_calibration_method,
+        "source_calibration_method",
+    )
+    forecast_resolution_policy_hash = _sha256(
+        calibration_set.forecast_resolution_policy_hash,
+        "forecast_resolution_policy_hash",
+    )
+    forecast_availability_rule_set_hash = _sha256(
+        calibration_set.forecast_availability_rule_set_hash,
+        "forecast_availability_rule_set_hash",
+    )
+    fit_evidence_digest = _sha256(
+        calibration_set.fit_evidence_digest,
+        "fit_evidence_digest",
+    )
+    if (
+        source_calibration_method != "none"
+        or source_calibration_set_version != f"uncalibrated:{model_version}"
+    ):
+        raise ForecastCalibrationSetValidationError(
+            "this calibration-set format requires uncalibrated source forecasts"
+        )
+    interval_policy_version = _policy_version(
+        calibration_set.interval_policy_version,
+        INTERVAL_POLICY_VERSION,
+        "interval_policy_version",
+    )
+    window_date_policy_version = _policy_version(
+        calibration_set.window_date_policy_version,
+        WINDOW_DATE_POLICY_VERSION,
+        "window_date_policy_version",
+    )
     window_start = _date(calibration_set.window_start, "window_start")
     window_end = _date(calibration_set.window_end, "window_end")
     if window_end < window_start:
@@ -275,6 +423,16 @@ def _normalized_set(calibration_set: FittedCalibrationSet) -> FittedCalibrationS
     return FittedCalibrationSet(
         schema_version=calibration_set.schema_version,
         model_version=model_version,
+        symbol=symbol,
+        target=target,
+        series_basis=series_basis,
+        horizon_unit=horizon_unit,
+        currency=currency,
+        source_calibration_set_version=source_calibration_set_version,
+        source_calibration_method=source_calibration_method,
+        forecast_resolution_policy_hash=forecast_resolution_policy_hash,
+        forecast_availability_rule_set_hash=forecast_availability_rule_set_hash,
+        fit_evidence_digest=fit_evidence_digest,
         method=method,
         window_start=window_start,
         window_end=window_end,
@@ -288,11 +446,13 @@ def _normalized_set(calibration_set: FittedCalibrationSet) -> FittedCalibrationS
             calibration_set.outcome_resolution_policy_hash,
             "outcome_resolution_policy_hash",
         ),
-        availability_rule_set_hash=_sha256(
-            calibration_set.availability_rule_set_hash,
-            "availability_rule_set_hash",
+        outcome_availability_rule_set_hash=_sha256(
+            calibration_set.outcome_availability_rule_set_hash,
+            "outcome_availability_rule_set_hash",
         ),
         buckets=ordered,
+        interval_policy_version=interval_policy_version,
+        window_date_policy_version=window_date_policy_version,
     )
 
 
@@ -317,11 +477,43 @@ def _normalized_bucket(
     selection = bucket.calibration.selection
     if not isinstance(selection, QuantileSelection):
         raise ForecastCalibrationSetValidationError("calibration bucket has no fitted selection")
-    if not 1 <= selection.sample_count <= sample_count:
+    quantile_policy_version = _policy_version(
+        selection.policy_version,
+        FINITE_SAMPLE_POLICY_VERSION,
+        "calibration bucket quantile selection policy_version",
+    )
+    correction_policy_version = _policy_version(
+        bucket.calibration.policy_version,
+        _CORRECTION_POLICY_VERSIONS[method],
+        "calibration bucket correction policy_version",
+    )
+    try:
+        normalized_selection = QuantileSelection(
+            coverage=selection.coverage,
+            sample_count=selection.sample_count,
+            rank=selection.rank,
+            value=selection.value,
+            policy_version=quantile_policy_version,
+        )
+        if method == "empirical_residual":
+            normalized_correction: _FittedCorrection = AbsoluteResidualCalibration(
+                selection=normalized_selection,
+                policy_version=correction_policy_version,
+            )
+        else:
+            normalized_correction = CQRCalibration(
+                selection=normalized_selection,
+                policy_version=correction_policy_version,
+            )
+    except (ConformalValidationError, TypeError, ValueError) as exc:
+        raise ForecastCalibrationSetValidationError(
+            "calibration bucket is not a valid fitted conformal correction"
+        ) from exc
+    if not 1 <= normalized_selection.sample_count <= sample_count:
         raise ForecastCalibrationSetValidationError(
             "calibration bucket fit sample count is outside the set sample count"
         )
-    return FittedCalibrationBucket(horizon=horizon, calibration=bucket.calibration)
+    return FittedCalibrationBucket(horizon=horizon, calibration=normalized_correction)
 
 
 def _bucket(
@@ -331,6 +523,8 @@ def _bucket(
     fit_sample_count: object,
     rank: object,
     value: object,
+    quantile_selection_policy_version: object,
+    correction_policy_version: object,
     method: CalibrationMethod,
     label: str,
 ) -> FittedCalibrationBucket:
@@ -340,14 +534,28 @@ def _bucket(
             f"{label}.coverage_millis must be within 1..999"
         )
     correction_type = _METHOD_TYPES[method]
+    quantile_policy = _policy_version(
+        quantile_selection_policy_version,
+        FINITE_SAMPLE_POLICY_VERSION,
+        f"{label}.quantile_selection_policy_version",
+    )
+    correction_policy = _policy_version(
+        correction_policy_version,
+        _CORRECTION_POLICY_VERSIONS[method],
+        f"{label}.correction_policy_version",
+    )
     try:
         selection = QuantileSelection(
             coverage=millis / 1000,
             sample_count=_positive_integer(fit_sample_count, f"{label}.fit_sample_count"),
             rank=_positive_integer(rank, f"{label}.rank"),
             value=_number(value, f"{label}.value"),
+            policy_version=quantile_policy,
         )
-        correction = correction_type(selection=selection)
+        correction = correction_type(
+            selection=selection,
+            policy_version=correction_policy,
+        )
     except (ConformalValidationError, TypeError, ValueError) as exc:
         raise ForecastCalibrationSetValidationError(
             f"{label} is not a valid fitted conformal correction"
@@ -375,6 +583,40 @@ def _model_version(value: object) -> str:
     ):
         raise ForecastCalibrationSetValidationError("model_version is empty, too long, or invalid")
     return normalized
+
+
+def _symbol(value: object) -> str:
+    symbol = _semantic_text(value, "symbol", max_length=SYMBOL_MAX_LENGTH)
+    if symbol != symbol.upper() or _SYMBOL_PATTERN.fullmatch(symbol) is None:
+        raise ForecastCalibrationSetValidationError("symbol must be uppercase and canonical")
+    return symbol
+
+
+def _semantic_text(
+    value: object,
+    label: str,
+    *,
+    max_length: int = SEMANTIC_VALUE_MAX_LENGTH,
+) -> str:
+    if not isinstance(value, str):
+        raise ForecastCalibrationSetValidationError(f"{label} must be a string")
+    normalized = unicodedata.normalize("NFC", value)
+    if (
+        not normalized
+        or len(normalized) > max_length
+        or normalized != normalized.strip()
+        or any(unicodedata.category(character).startswith("C") for character in normalized)
+    ):
+        raise ForecastCalibrationSetValidationError(
+            f"{label} is empty, too long, or not canonical text"
+        )
+    return normalized
+
+
+def _policy_version(value: object, expected: str, label: str) -> str:
+    if not isinstance(value, str) or value != expected:
+        raise ForecastCalibrationSetValidationError(f"{label} is not supported")
+    return value
 
 
 def _sha256(value: object, label: str) -> str:
@@ -461,6 +703,8 @@ def _reject_json_constant(value: str) -> object:
 __all__ = [
     "CALIBRATION_SET_FORMAT",
     "CALIBRATION_SET_SCHEMA_VERSION",
+    "INTERVAL_POLICY_VERSION",
+    "WINDOW_DATE_POLICY_VERSION",
     "CalibrationMethod",
     "FittedCalibrationBucket",
     "FittedCalibrationSet",
