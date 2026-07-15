@@ -10,6 +10,10 @@ throwaway evidence and cleans it before returning. The diagrams below describe
 enforced code and persistence boundaries, not populated production evidence or
 validated calibration.
 
+The owner-controlled local PostgreSQL 17/TimescaleDB gate passed all 31 tests
+through `0015` on 2026-07-15 and restored an empty migrated schema afterward.
+Remote CI has not yet exercised this local commit.
+
 Calibration evidence is reconstructed from one repeatable-read, read-only
 snapshot of a sealed cohort, its scheduled forecast archive rows, and the exact
 authorized outcome publications. A database-side aggregate rejects snapshots

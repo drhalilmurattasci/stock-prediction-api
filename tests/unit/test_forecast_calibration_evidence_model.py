@@ -151,6 +151,8 @@ def test_migration_uses_definer_publishers_exact_acls_and_second_transaction_rec
     assert "document->>'heldout_window_start' !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'" in upgrade
     assert "fitted calibration buckets are not strictly ordered" in upgrade
     assert "held-out coverage buckets are not strictly ordered" in upgrade
+    assert upgrade.count("bucket_document jsonb;") == 2
+    assert "\n            bucket jsonb;" not in upgrade
     assert "value_f64_be" in upgrade
     assert "held-out release bucket projection differs from bytes" in upgrade
     assert "uq_fitted_calibration_sets_cohort_method" in upgrade
@@ -165,6 +167,10 @@ def test_migration_uses_definer_publishers_exact_acls_and_second_transaction_rec
     assert "release_id text" in upgrade
     assert "SECURITY DEFINER" in upgrade
     assert "held-out release availability requires a later transaction" in upgrade
+    assert (
+        "ON CONFLICT ON CONSTRAINT\n"
+        "                pk_forecast_heldout_coverage_release_availability DO NOTHING"
+    ) in upgrade
     assert "BEFORE UPDATE OR DELETE" in upgrade
     assert "BEFORE TRUNCATE" in upgrade
     assert "GRANT SELECT ON TABLE" in upgrade

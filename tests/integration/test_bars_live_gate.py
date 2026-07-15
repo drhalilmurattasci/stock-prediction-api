@@ -3978,7 +3978,7 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
         "UPDATE forecast_outcome_cohort_availability SET cohort_id = cohort_id "
         "WHERE cohort_id = :cohort_id",
         "DELETE FROM forecast_outcome_cohort_availability WHERE cohort_id = :cohort_id",
-        "TRUNCATE forecast_outcome_cohort_availability",
+        "TRUNCATE forecast_outcome_cohort_availability CASCADE",
     ):
         async with owner_engine.connect() as conn:
             transaction = await conn.begin()
@@ -5508,7 +5508,11 @@ async def _archive_live_calibration_cohort(
             final_value=95.0 + index,
             policy_hash=forecast_resolution_policy_hash,
             symbol=symbol,
-            as_of=target_time - timedelta(minutes=10, seconds=index),
+            # Neighboring cohort targets are one second apart. Keep each
+            # snapshot's semantic key disjoint across cohorts as well as within
+            # one cohort; a one-second decrement would alias the next target's
+            # following member.
+            as_of=target_time - timedelta(minutes=10, seconds=index * 10),
             target_times=(target_time,),
             horizon_unit="trading_day",
         )

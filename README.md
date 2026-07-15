@@ -82,10 +82,12 @@ newest stored row is the latest completed session. At the dated acceptance
 checkpoint above the database was empty; this API surface alone is not evidence
 of a real-data forecast.
 
-Unit/static gates cover the evidence substrate. The destructive TimescaleDB
-integration gate is wired through migration `0015_calibration_evidence`;
-the last remote execution proved `0014`, while the new `0015` publisher and ACL
-boundary still require the separately controlled live-gate run. The dedicated
+Unit/static gates cover the evidence substrate. On 2026-07-15 the separately
+controlled local TimescaleDB gate passed all 31 tests through migration
+`0015_calibration_evidence`, including the fitted/release publishers, later-
+transaction receipt, replay, scope rejection, ACLs, append-only triggers, and
+nonempty downgrade refusal. The last remote CI execution still proves `0014`;
+remote validation of `0015` requires an explicit later push. The dedicated
 `live-postgres` GitHub Actions job provisions a
 fresh digest-pinned TimescaleDB for every push and pull request, initializes the
 fixed runtime roles from the repository bootstrap, and runs only the destructive

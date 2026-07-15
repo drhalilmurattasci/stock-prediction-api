@@ -490,7 +490,7 @@ def _create_functions_triggers_and_acls() -> None:
         AS $$
         DECLARE
             document jsonb;
-            bucket jsonb;
+            bucket_document jsonb;
             candidate_version varchar(71);
             stored_bytes bytea;
             cohort_member_count integer;
@@ -617,37 +617,38 @@ def _create_functions_triggers_and_acls() -> None:
                     USING ERRCODE = '22023';
             END IF;
             BEGIN
-                FOR bucket IN SELECT value FROM jsonb_array_elements(document->'buckets')
+                FOR bucket_document IN
+                    SELECT value FROM jsonb_array_elements(document->'buckets')
                 LOOP
-                    IF bucket->>'value_f64_be' !~ '^[0-9a-f]{16}$'
-                       OR bucket->>'value_f64_be' ~ '^(7ff|fff)'
-                       OR bucket->>'value_f64_be' = '8000000000000000'
+                    IF bucket_document->>'value_f64_be' !~ '^[0-9a-f]{16}$'
+                       OR bucket_document->>'value_f64_be' ~ '^(7ff|fff)'
+                       OR bucket_document->>'value_f64_be' = '8000000000000000'
                        OR (
                            document->>'method' = 'empirical_residual'
-                           AND bucket->>'value_f64_be' !~ '^[0-7]'
+                           AND bucket_document->>'value_f64_be' !~ '^[0-7]'
                        )
-                       OR (bucket->>'horizon')::integer NOT BETWEEN 1 AND 252
-                       OR (bucket->>'coverage_millis')::integer NOT BETWEEN 1 AND 999
-                       OR (bucket->>'fit_sample_count')::integer NOT BETWEEN 1
+                       OR (bucket_document->>'horizon')::integer NOT BETWEEN 1 AND 252
+                       OR (bucket_document->>'coverage_millis')::integer NOT BETWEEN 1 AND 999
+                       OR (bucket_document->>'fit_sample_count')::integer NOT BETWEEN 1
                           AND (document->>'sample_count')::integer
-                       OR (bucket->>'rank')::integer NOT BETWEEN 1
-                          AND (bucket->>'fit_sample_count')::integer
-                       OR (bucket->>'rank')::integer IS DISTINCT FROM ceil(
+                       OR (bucket_document->>'rank')::integer NOT BETWEEN 1
+                          AND (bucket_document->>'fit_sample_count')::integer
+                       OR (bucket_document->>'rank')::integer IS DISTINCT FROM ceil(
                            (
-                               ((bucket->>'fit_sample_count')::integer + 1)
-                               * (bucket->>'coverage_millis')::integer
+                               ((bucket_document->>'fit_sample_count')::integer + 1)
+                               * (bucket_document->>'coverage_millis')::integer
                            )::numeric / 1000
                        )::integer
-                       OR bucket->>'quantile_selection_policy_version'
+                       OR bucket_document->>'quantile_selection_policy_version'
                           IS DISTINCT FROM 'finite-sample-nearest-rank-v1'
                        OR (
                            document->>'method' = 'empirical_residual'
-                           AND bucket->>'correction_policy_version'
+                           AND bucket_document->>'correction_policy_version'
                                IS DISTINCT FROM 'absolute-residual-v1'
                        )
                        OR (
                            document->>'method' = 'conformal_quantile_regression'
-                           AND bucket->>'correction_policy_version'
+                           AND bucket_document->>'correction_policy_version'
                                IS DISTINCT FROM 'signed-cqr-v1'
                        ) THEN
                         RAISE EXCEPTION 'fitted calibration bucket is invalid'
@@ -752,14 +753,15 @@ def _create_functions_triggers_and_acls() -> None:
                 RAISE EXCEPTION 'fitted bucket horizons differ from cohort horizons'
                     USING ERRCODE = '23000';
             END IF;
-            FOR bucket IN SELECT value FROM jsonb_array_elements(document->'buckets')
+            FOR bucket_document IN
+                SELECT value FROM jsonb_array_elements(document->'buckets')
             LOOP
                 SELECT count(*) INTO expected_bucket_sample_count
                 FROM public.forecast_outcome_cohort_members AS member
                 WHERE member.cohort_id = document->>'cohort_id'
-                  AND member.step = (bucket->>'horizon')::smallint;
+                  AND member.step = (bucket_document->>'horizon')::smallint;
                 IF expected_bucket_sample_count IS DISTINCT FROM
-                   (bucket->>'fit_sample_count')::integer THEN
+                   (bucket_document->>'fit_sample_count')::integer THEN
                     RAISE EXCEPTION 'fitted bucket sample count differs from cohort'
                         USING ERRCODE = '23000';
                 END IF;
@@ -848,7 +850,7 @@ def _create_functions_triggers_and_acls() -> None:
         AS $$
         DECLARE
             document jsonb;
-            bucket jsonb;
+            bucket_document jsonb;
             fitted_document jsonb;
             candidate_id varchar(71);
             stored_bytes bytea;
@@ -992,26 +994,27 @@ def _create_functions_triggers_and_acls() -> None:
                     USING ERRCODE = '22023';
             END IF;
             BEGIN
-                FOR bucket IN SELECT value FROM jsonb_array_elements(document->'buckets')
+                FOR bucket_document IN
+                    SELECT value FROM jsonb_array_elements(document->'buckets')
                 LOOP
-                    IF bucket->>'empirical_coverage_f64_be' !~ '^[0-9a-f]{16}$'
-                       OR bucket->>'confidence_low_f64_be' !~ '^[0-9a-f]{16}$'
-                       OR bucket->>'confidence_high_f64_be' !~ '^[0-9a-f]{16}$'
-                       OR (bucket->>'empirical_coverage_f64_be') COLLATE "C"
+                    IF bucket_document->>'empirical_coverage_f64_be' !~ '^[0-9a-f]{16}$'
+                       OR bucket_document->>'confidence_low_f64_be' !~ '^[0-9a-f]{16}$'
+                       OR bucket_document->>'confidence_high_f64_be' !~ '^[0-9a-f]{16}$'
+                       OR (bucket_document->>'empirical_coverage_f64_be') COLLATE "C"
                           > '3ff0000000000000'
-                       OR (bucket->>'confidence_low_f64_be') COLLATE "C"
+                       OR (bucket_document->>'confidence_low_f64_be') COLLATE "C"
                           > '3ff0000000000000'
-                       OR (bucket->>'confidence_high_f64_be') COLLATE "C"
+                       OR (bucket_document->>'confidence_high_f64_be') COLLATE "C"
                           > '3ff0000000000000'
-                       OR (bucket->>'confidence_low_f64_be') COLLATE "C" >
-                          (bucket->>'empirical_coverage_f64_be') COLLATE "C"
-                       OR (bucket->>'empirical_coverage_f64_be') COLLATE "C" >
-                          (bucket->>'confidence_high_f64_be') COLLATE "C"
-                       OR (bucket->>'horizon')::integer NOT BETWEEN 1 AND 252
-                       OR (bucket->>'coverage_millis')::integer NOT BETWEEN 1 AND 999
-                       OR (bucket->>'sample_count')::integer NOT BETWEEN 1 AND 10000
-                       OR (bucket->>'covered_count')::integer NOT BETWEEN 0
-                          AND (bucket->>'sample_count')::integer THEN
+                       OR (bucket_document->>'confidence_low_f64_be') COLLATE "C" >
+                          (bucket_document->>'empirical_coverage_f64_be') COLLATE "C"
+                       OR (bucket_document->>'empirical_coverage_f64_be') COLLATE "C" >
+                          (bucket_document->>'confidence_high_f64_be') COLLATE "C"
+                       OR (bucket_document->>'horizon')::integer NOT BETWEEN 1 AND 252
+                       OR (bucket_document->>'coverage_millis')::integer NOT BETWEEN 1 AND 999
+                       OR (bucket_document->>'sample_count')::integer NOT BETWEEN 1 AND 10000
+                       OR (bucket_document->>'covered_count')::integer NOT BETWEEN 0
+                          AND (bucket_document->>'sample_count')::integer THEN
                         RAISE EXCEPTION 'held-out coverage bucket is invalid'
                             USING ERRCODE = '22023';
                     END IF;
@@ -1177,14 +1180,15 @@ def _create_functions_triggers_and_acls() -> None:
                 RAISE EXCEPTION 'held-out bucket horizons differ from cohort horizons'
                     USING ERRCODE = '23000';
             END IF;
-            FOR bucket IN SELECT value FROM jsonb_array_elements(document->'buckets')
+            FOR bucket_document IN
+                SELECT value FROM jsonb_array_elements(document->'buckets')
             LOOP
                 SELECT count(*) INTO expected_bucket_sample_count
                 FROM public.forecast_outcome_cohort_members AS member
                 WHERE member.cohort_id = document->>'heldout_cohort_id'
-                  AND member.step = (bucket->>'horizon')::smallint;
+                  AND member.step = (bucket_document->>'horizon')::smallint;
                 IF expected_bucket_sample_count IS DISTINCT FROM
-                   (bucket->>'sample_count')::integer THEN
+                   (bucket_document->>'sample_count')::integer THEN
                     RAISE EXCEPTION 'held-out bucket sample count differs from cohort'
                         USING ERRCODE = '23000';
                 END IF;
@@ -1291,12 +1295,13 @@ def _create_functions_triggers_and_acls() -> None:
             END IF;
 
             IF inserted_new THEN
-                FOR bucket IN SELECT value FROM jsonb_array_elements(document->'buckets')
+                FOR bucket_document IN
+                    SELECT value FROM jsonb_array_elements(document->'buckets')
                 LOOP
-                    IF jsonb_typeof(bucket) IS DISTINCT FROM 'object'
-                       OR bucket->>'empirical_coverage_f64_be' !~ '^[0-9a-f]{16}$'
-                       OR bucket->>'confidence_low_f64_be' !~ '^[0-9a-f]{16}$'
-                       OR bucket->>'confidence_high_f64_be' !~ '^[0-9a-f]{16}$' THEN
+                    IF jsonb_typeof(bucket_document) IS DISTINCT FROM 'object'
+                       OR bucket_document->>'empirical_coverage_f64_be' !~ '^[0-9a-f]{16}$'
+                       OR bucket_document->>'confidence_low_f64_be' !~ '^[0-9a-f]{16}$'
+                       OR bucket_document->>'confidence_high_f64_be' !~ '^[0-9a-f]{16}$' THEN
                         RAISE EXCEPTION 'held-out coverage bucket is malformed'
                             USING ERRCODE = '22023';
                     END IF;
@@ -1306,13 +1311,13 @@ def _create_functions_triggers_and_acls() -> None:
                             sample_count, empirical_coverage_f64_be,
                             confidence_low_f64_be, confidence_high_f64_be
                         ) VALUES (
-                            candidate_id, (bucket->>'horizon')::smallint,
-                            (bucket->>'coverage_millis')::smallint,
-                            (bucket->>'covered_count')::integer,
-                            (bucket->>'sample_count')::integer,
-                            decode(bucket->>'empirical_coverage_f64_be', 'hex'),
-                            decode(bucket->>'confidence_low_f64_be', 'hex'),
-                            decode(bucket->>'confidence_high_f64_be', 'hex')
+                            candidate_id, (bucket_document->>'horizon')::smallint,
+                            (bucket_document->>'coverage_millis')::smallint,
+                            (bucket_document->>'covered_count')::integer,
+                            (bucket_document->>'sample_count')::integer,
+                            decode(bucket_document->>'empirical_coverage_f64_be', 'hex'),
+                            decode(bucket_document->>'confidence_low_f64_be', 'hex'),
+                            decode(bucket_document->>'confidence_high_f64_be', 'hex')
                         );
                     EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
                         RAISE EXCEPTION 'held-out coverage bucket scalars are invalid'
@@ -1328,22 +1333,25 @@ def _create_functions_triggers_and_acls() -> None:
                         USING ERRCODE = '23000';
                 END IF;
             END IF;
-            FOR bucket IN SELECT value FROM jsonb_array_elements(document->'buckets')
+            FOR bucket_document IN
+                SELECT value FROM jsonb_array_elements(document->'buckets')
             LOOP
                 PERFORM 1
                 FROM public.forecast_heldout_coverage_release_buckets AS stored_bucket
                 WHERE stored_bucket.release_id = candidate_id
-                  AND stored_bucket.horizon = (bucket->>'horizon')::smallint
+                  AND stored_bucket.horizon = (bucket_document->>'horizon')::smallint
                   AND stored_bucket.coverage_millis =
-                      (bucket->>'coverage_millis')::smallint
-                  AND stored_bucket.covered_count = (bucket->>'covered_count')::integer
-                  AND stored_bucket.sample_count = (bucket->>'sample_count')::integer
+                      (bucket_document->>'coverage_millis')::smallint
+                  AND stored_bucket.covered_count =
+                      (bucket_document->>'covered_count')::integer
+                  AND stored_bucket.sample_count =
+                      (bucket_document->>'sample_count')::integer
                   AND stored_bucket.empirical_coverage_f64_be =
-                      decode(bucket->>'empirical_coverage_f64_be', 'hex')
+                      decode(bucket_document->>'empirical_coverage_f64_be', 'hex')
                   AND stored_bucket.confidence_low_f64_be =
-                      decode(bucket->>'confidence_low_f64_be', 'hex')
+                      decode(bucket_document->>'confidence_low_f64_be', 'hex')
                   AND stored_bucket.confidence_high_f64_be =
-                      decode(bucket->>'confidence_high_f64_be', 'hex');
+                      decode(bucket_document->>'confidence_high_f64_be', 'hex');
                 IF NOT FOUND THEN
                     RAISE EXCEPTION 'held-out release bucket projection differs from bytes'
                         USING ERRCODE = '23000';
@@ -1411,7 +1419,8 @@ def _create_functions_triggers_and_acls() -> None:
             INSERT INTO public.forecast_heldout_coverage_release_availability(
                 release_id
             ) VALUES (p_release_id)
-            ON CONFLICT (release_id) DO NOTHING
+            ON CONFLICT ON CONSTRAINT
+                pk_forecast_heldout_coverage_release_availability DO NOTHING
             ;
             RETURN QUERY
             SELECT receipt.release_id::text, receipt.release_recorded_at,
