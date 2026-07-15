@@ -424,6 +424,7 @@ async def test_one_shot_builder_runs_the_attested_immutable_image_without_pull(
         )
 
     monkeypatch.setattr(demo, "_run_docker", run_docker)
+    monkeypatch.setattr(demo, "_compose_command", lambda: ("compose",))
     monkeypatch.setattr(demo, "_validate_local_docker", lambda environment: None)
     monkeypatch.setattr(demo, "_image_revision", lambda image_id, environment: REVISION)
     monkeypatch.setattr(demo, "_cleanup_one_shot_container", lambda *args: None)

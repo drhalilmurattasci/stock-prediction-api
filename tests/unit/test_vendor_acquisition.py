@@ -1033,8 +1033,13 @@ def test_wrapper_defaults_to_plan_and_old_wrapper_rejects_expanded_sentinel() ->
 def test_main_never_renders_secret_bearing_failure(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     secret = "FAKE_ACQUISITION_KEY_MUST_NOT_RENDER"
+    data_directory = tmp_path / "data"
+    data_directory.mkdir()
+    ledger_path = data_directory / acquisition.DEFAULT_LEDGER_PATH.name
+    legacy_ledger_path = data_directory / acquisition.LEGACY_LEDGER_PATH.name
 
     async def fail(**kwargs: object) -> dict[str, object]:
         del kwargs
@@ -1064,6 +1069,10 @@ def test_main_never_renders_secret_bearing_failure(
             AUTHORIZATION_SENTINEL,
             "--authorization-id",
             "msft-20260713-secret",
+            "--ledger-path",
+            str(ledger_path),
+            "--legacy-ledger-path",
+            str(legacy_ledger_path),
         ]
     )
     captured = capsys.readouterr()
