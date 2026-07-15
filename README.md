@@ -94,12 +94,21 @@ That gate has a one-attempt, fail-closed operator command documented in
 history step is now a typed combined acquisition lane, not an unscoped
 backfill. Its read-only plan covers the exact final 258 XNYS sessions plus one
 complete split page and one complete dividend page over the same window. From
-the empty state after a successful one-bar smoke, the expected authorization is
-exactly **259 outbound attempts: 1 split + 1 dividend + 257 open-close**. The
-executor sends actions first, disables HTTP retries, checkpoints every exact
-receipt, enforces one global 5/60 budget, and records typed reservations and
-outcomes in an ignored append-only ledger. A code revision, session rollover,
-database receipt, or unresolved prior attempt invalidates or blocks the plan.
+the empty state after a successful one-bar smoke, the initial campaign
+authorization is exactly **259 outbound attempts: 1 split + 1 dividend + 257
+open-close**. The executor sends actions first, disables HTTP retries,
+checkpoints every exact receipt, enforces one shared 5/60 pacer, and durably
+debits every reservation across fresh authorization IDs in an ignored
+append-only campaign journal. Every journal record is also chained to an
+immutable global Postgres high-water checkpoint; planning and execution require
+the full-file count and digest to match, including across campaign/date changes.
+The initial grant carries no retry headroom. A
+later retry requires a new content-addressed plan and an explicit recovery
+budget delta; recovery is hard-limited to five additional calls for the entire
+campaign. Corporate-action responses are one page only and fail closed instead
+of following `next_url`. A code revision, session rollover, database receipt,
+campaign-ledger change, or unresolved prior attempt invalidates or blocks the
+plan.
 All controlled Polygon vendor-ingestion operator paths share one vendor-wide
 PostgreSQL operation lock.
 

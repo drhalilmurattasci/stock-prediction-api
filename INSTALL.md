@@ -476,7 +476,7 @@ Fresh databases create the fixed, non-owner `stockapi_app` and
 `stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
 Existing initialized database directories do not rerun Docker init scripts;
 bootstrap both roles once before applying migrations `0007` through the current
-head, `0013_adjustment_factors`:
+head, `0014_vendor_campaign_anchor`:
 
 ```powershell
 docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh
@@ -563,7 +563,7 @@ processes could race it. All mutating operator wrappers share one machine-wide
 mutex, and the fixture holds the same PostgreSQL vendor-operation advisory lock
 used by direct smoke/acquisition/backfill/demo lanes across reset and teardown. The module
 fixture then drops its seeded test data and reapplies
-migrations, leaving an empty schema at migration head `0013` so the later vendor smoke
+migrations, leaving an empty schema at migration head `0014_vendor_campaign_anchor` so the later vendor smoke
 still proves absence. It never makes a vendor call.
 
 ✅ When all rows pass, the database migration, privilege, revision, immutable
@@ -614,7 +614,7 @@ below.
 ### Separately authorized typed corporate-action + price acquisition
 
 The one-request smoke authorizes only that one bar. The adjusted-data history
-lane has a separate read-only planner and a typed global budget covering both
+lane has a separate read-only planner and a typed campaign budget covering both
 corporate actions and missing open-close sessions. Planning needs no vendor key
 and cannot make a vendor request:
 
@@ -623,7 +623,8 @@ and cannot make a vendor request:
 ```
 
 `-End` must be the latest completed XNYS session and must be named again in any
-later authorization. The plan binds the clean local Git commit, exact 258-session
+later authorization. Every wrapper mode requires the clean local `main` branch.
+The plan binds that commit, exact 258-session
 MSFT price window, both exact corporate-action query scopes and query-policy
 hash, current price/action receipts, both attempt ledgers, ordered typed calls,
 and the hard 5-calls-per-60-seconds pace into `plan_id` and `calls_sha256`. It
@@ -649,13 +650,17 @@ the expected acquisition allocation is exactly **259 outbound attempts**:
 | `split_page` | 1 | one complete, bounded MSFT split collection |
 | `dividend_page` | 1 | one complete, bounded MSFT dividend collection |
 | `open_close` | 257 | the remaining sessions in the 258-session window |
-| **global** | **259** | one non-renewing authorization budget |
+| **initial campaign** | **259** | exact base; zero implicit retry headroom |
 
 At 5 calls per 60 seconds this is roughly 52 minutes plus network/database time.
 The owner grant must name MSFT, `window_start`, `window_end`, `tool_revision`,
-`plan_id`, `calls_sha256`, the exact three-part allocation, the global 259-call
-ceiling, the 5/60 pace, and a fresh lowercase `authorization_id`. The fixed
-sentinel below is only a mechanical check; it cannot substitute for that grant.
+`plan_id`, `campaign_id`, the campaign-journal digest/count, the global
+Postgres-anchored journal digest/count, and cumulative counters,
+`calls_sha256`, the exact three-part allocation, the required campaign budget
+delta, the current-run ceiling, the 5/60 pace, and a fresh lowercase
+`authorization_id`. The first full plan's delta and current-run ceiling are both
+259. The fixed sentinel below is only a mechanical check; it cannot substitute
+for that grant.
 
 With those exact freshly reviewed values, execution is:
 
@@ -664,6 +669,8 @@ With those exact freshly reviewed values, execution is:
   -Mode execute `
   -End YYYY-MM-DD `
   -PlanId sha256:<64-hex-plan-id> `
+  -CampaignId sha256:<64-hex-campaign-id> `
+  -CampaignBudgetDelta 259 `
   -MaxCalls 259 `
   -SplitCalls 1 `
   -DividendCalls 1 `
@@ -672,12 +679,22 @@ With those exact freshly reviewed values, execution is:
   -AuthorizationId msft-acquisition-YYYYMMDD-a
 ```
 
-The wrapper reads the key only from ignored `.env`, pins the local Docker
-Desktop daemon/project, and refuses worker/Beat or another mutating operator.
+The wrapper scrubs ambient vendor credentials so the key can come only from
+ignored `.env`, disables ambient HTTP proxy inheritance, pins and health-checks
+the local Docker Desktop database at migration head `0014_vendor_campaign_anchor`, and refuses the API,
+worker, Beat, snapshot-builder, native Celery/uvicorn, or another mutating
+operator. Execute revalidates
+the exact one-line plan and runs the reviewed code from a detached Git worktree;
+the canonical ignored ledger remains in the primary workspace.
 The Python lane holds the vendor-wide PostgreSQL lock, independently re-plans,
-requires the exact typed ceilings to equal the current call set, and reserves
-each call in `data/vendor_acquisition_attempts.jsonl` before HTTP. Split and
-dividend pages run first; each page must be complete and pagination-exhausted.
+requires the exact campaign delta and typed ceilings to equal the current plan,
+and reserves each call in `data/vendor_acquisition_attempts.jsonl` before HTTP.
+Every authorization, reservation, and outcome is fsynced locally and then
+advanced through an immutable Postgres high-water function before execution can
+continue. Any file/DB count or digest mismatch, including a valid suffix
+rollback from an older campaign, is a forensic stop.
+Split and dividend pages run first; each page must be complete and rejects any
+`next_url` rather than issuing a follow-up request.
 Missing open-close sessions follow in ascending order. HTTP retries are disabled,
 session currency is rechecked after pacing, and exact content plus its later
 database receipt is verified before the next call.
@@ -695,8 +712,11 @@ from the older `data/vendor_backfill_attempts.jsonl`. Recovery is fail-closed:
   ```
 
   This performs database receipt writes but makes zero vendor calls.
-- A caught failed attempt has a terminal outcome. Re-plan and obtain a new grant
-  and authorization ID for only the remaining typed call set.
+- A caught failed attempt remains a cumulative campaign debit. Re-plan; if the
+  new plan reports a positive `campaign_required_budget_delta`, obtain a new
+  grant naming that exact delta and a fresh authorization ID. No recovery call
+  is implicit, and the entire campaign is hard-limited to five explicitly
+  granted recovery calls beyond its base.
 - An unresolved reservation overlapping a required call is an unknown
   request/checkpoint outcome. Stop for independent vendor/database forensics;
   there is no automatic or destructive clear switch.
@@ -814,6 +834,7 @@ is shown here for review, **not as a direct host runbook**:
 python -m ingestion.tasks.seal_adjusted_forecast_snapshot \
   --end YYYY-MM-DD \
   --factor-cutoff <aware-ISO-8601-plan-cutoff> \
+  --expected-factor-set-id sha256:<64-hex-plan-identity> \
   --tool-revision <40-hex-reviewed-commit> \
   --authorization stockapi-msft-adjusted-seal-only
 ```
@@ -831,17 +852,18 @@ snapshot lineage is reread and verified before success. Its sanitized JSON
 names the factor/snapshot IDs, cutoff and receipt times, counts, and policy
 hashes.
 
-There is **not yet** a complete adjusted-seal host controller: no read-only plan
-currently derives and binds `--factor-cutoff`, and no PowerShell wrapper builds
-the exact detached revision, pins the immutable image, excludes competing
-actors, revalidates the plan, and surfaces the resulting adjusted forecast over
-HTTP. Do not improvise a direct invocation. The fixed sentinel is only a
-low-level refusal check; neither it nor the vendor acquisition grant supplies
-authority for the local factor/snapshot writes. `run-forecast-demo.ps1` remains
-the only complete end-to-end local host proof, and it is raw-close-only.
+The complete adjusted host lane is the `adjusted_close` target of
+`run-forecast-demo.ps1`. Its read-only plan derives and binds the factor cutoff
+and expected factor-set identity; execute builds the detached reviewed revision,
+pins the immutable image, excludes competing actors, revalidates the plan, and
+surfaces the adjusted forecast over authenticated HTTP. Use
+`-Target adjusted_close` with the distinct
+`stockapi-msft-adjusted-seal-serve-only` authorization. The low-level sentinel
+above is only a refusal check, and neither it nor vendor-acquisition authority
+authorizes the factor/snapshot writes.
 
-Once a reviewed controller has published an exact factor ID, the adjusted-price
-read shape is:
+Once that reviewed controller has published an exact factor ID, the
+adjusted-price read shape is:
 
 ```text
 GET /v1/prices/MSFT/adjusted?factor_set_id=sha256:<64-hex-id>&limit=100

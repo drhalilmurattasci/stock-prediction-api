@@ -36,6 +36,38 @@ def _provider(handler, **kwargs) -> PolygonProvider:
     return PolygonProvider("test-key", client=client, **kwargs)
 
 
+async def test_provider_owned_client_ignores_ambient_proxy_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:18080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:18443")
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:19050")
+
+    provider = PolygonProvider("test-key")
+    try:
+        assert provider._client._trust_env is False  # noqa: SLF001
+    finally:
+        await provider.aclose()
+
+
+async def test_injected_client_preserves_its_proxy_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:18443")
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+        trust_env=True,
+    )
+    provider = PolygonProvider("test-key", client=client)
+    try:
+        assert provider._client is client  # noqa: SLF001
+        assert provider._client._trust_env is True  # noqa: SLF001
+        await provider.aclose()
+        assert client.is_closed is False
+    finally:
+        await client.aclose()
+
+
 ACTION_START = date(2025, 7, 2)
 ACTION_END = date(2026, 7, 13)
 
@@ -396,7 +428,7 @@ async def test_corporate_action_decimal_lexemes_are_preserved_exactly():
 
 @pytest.mark.parametrize(
     "next_url",
-    [None, "https://api.massive.com/stocks/v1/splits?cursor=next"],
+    [None, "", "https://api.massive.com/stocks/v1/splits?cursor=next"],
 )
 async def test_corporate_actions_reject_any_present_next_url_without_following_it(
     next_url: str | None,

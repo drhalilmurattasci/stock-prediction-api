@@ -24,6 +24,11 @@ from app.services.corporate_actions import (
     SPLITS_ENDPOINT,
     CorporateActionCollectionRecord,
 )
+from app.services.vendor_acquisition_campaign_store import (
+    VendorAcquisitionCampaignHighWater,
+    VendorAcquisitionCampaignStoreConflict,
+    VendorAcquisitionCampaignStoreOutcomeUnknown,
+)
 from data_sources.base import CostBudgetExceeded, DividendPage, OHLCVBar, SplitPage
 from data_sources.polygon_open_close import open_close_endpoint_identity
 from scripts.vendor_acquisition import (
@@ -128,6 +133,9 @@ class FakeStore:
         self.persisted_prices: list[date] = []
         self.persisted_actions: list[str] = []
         self.repaired: list[str] = []
+        self.high_water: VendorAcquisitionCampaignHighWater | None = None
+        self.high_water_publications: list[int] = []
+        self.fail_high_water_publications: set[int] = set()
 
     async def price_coverage(self, dates: tuple[date, ...]) -> ExistingCoverage:
         return _price_coverage(
@@ -215,6 +223,29 @@ class FakeStore:
             available_at=available_at,
             event_count=record.event_count,
         )
+
+    async def campaign_high_water(
+        self,
+    ) -> VendorAcquisitionCampaignHighWater | None:
+        return self.high_water
+
+    async def publish_campaign_high_water(
+        self,
+        requested: VendorAcquisitionCampaignHighWater,
+    ) -> VendorAcquisitionCampaignHighWater:
+        self.high_water_publications.append(requested.checkpoint_number)
+        if requested.checkpoint_number in self.fail_high_water_publications:
+            raise VendorAcquisitionCampaignStoreOutcomeUnknown("synthetic unknown outcome")
+        if self.high_water is None:
+            valid = requested.checkpoint_number == 1
+        elif requested.same_state(self.high_water):
+            return self.high_water
+        else:
+            valid = requested.checkpoint_number == self.high_water.checkpoint_number + 1
+        if not valid:
+            raise VendorAcquisitionCampaignStoreConflict("synthetic high-water conflict")
+        self.high_water = requested
+        return requested
 
 
 def _store_factory(store: FakeStore):
@@ -345,7 +376,7 @@ async def _plan(
         end_session=END,
         settings=_settings(polygon_api_key=None),
         clock=lambda: NOW,
-        store_factory=_store_factory(store),  # type: ignore[arg-type]
+        store_factory=_store_factory(store),
         sessions_fn=lambda _end: sessions,
         revision_fn=_revision,
         ledger_path=tmp_path / "acquisition.jsonl",
@@ -361,11 +392,18 @@ async def _execute(
     *,
     authorization_id: str,
     fail_kind: str | None = None,
+    campaign_budget_delta: int | None = None,
 ):
     allocation = plan.allocation
     return await execute_acquisition(
         end_session=END,
         plan_id=plan.plan_id,
+        campaign_id=plan.campaign.campaign_id,
+        campaign_budget_delta=(
+            plan.campaign_required_budget_delta
+            if campaign_budget_delta is None
+            else campaign_budget_delta
+        ),
         max_calls=plan.required_outbound_attempts,
         split_calls=allocation["split_page"],
         dividend_calls=allocation["dividend_page"],
@@ -374,13 +412,26 @@ async def _execute(
         authorization_id=authorization_id,
         settings=_settings(),
         clock=lambda: NOW,
-        store_factory=_store_factory(store),  # type: ignore[arg-type]
+        store_factory=_store_factory(store),
         provider_factory=_provider_factory(calls, fail_kind=fail_kind),
         lock_fn=_no_lock,
         sessions_fn=lambda _end: SMALL_WINDOW,
         revision_fn=_revision,
         ledger_path=tmp_path / "acquisition.jsonl",
         legacy_ledger_path=tmp_path / "legacy.jsonl",
+    )
+
+
+async def _anchor_ledger(
+    store: FakeStore,
+    ledger: AcquisitionLedger,
+    plan: acquisition.AcquisitionPlan,
+) -> None:
+    await acquisition._publish_database_high_water(
+        store,
+        ledger,
+        campaign_id=plan.campaign.campaign_id,
+        campaign_scope=plan.campaign.campaign_scope,
     )
 
 
@@ -397,6 +448,10 @@ async def test_full_plan_after_smoke_is_two_actions_plus_257_prices(tmp_path: Pa
     assert [value.kind for value in plan.calls[:2]] == ["split_page", "dividend_page"]
     assert all(value.kind == "open_close" for value in plan.calls[2:])
     assert plan.public_result()["status"] == "ready"
+    assert plan.public_result()["campaign_base_calls"] is None
+    assert plan.public_result()["campaign_required_budget_delta"] == 259
+    assert plan.public_result()["campaign_hard_max_authorized_calls"] == 264
+    assert plan.public_result()["campaign_attempts_reserved"] == 0
 
 
 async def test_outer_plan_binds_action_receipts_policy_tool_and_call_digest(tmp_path: Path) -> None:
@@ -409,11 +464,24 @@ async def test_outer_plan_binds_action_receipts_policy_tool_and_call_digest(tmp_
     second = await _plan(second_store, tmp_path)
 
     assert first.plan_id != second.plan_id
+    assert first.campaign.campaign_id == second.campaign.campaign_id
     assert first.calls_sha256 != second.calls_sha256
     assert second.allocation["split_page"] == 0
     assert second.public_result()["corporate_action_query_policy_hash"] == (
         CORPORATE_ACTION_QUERY_POLICY_HASH
     )
+    other_revision = await plan_acquisition(
+        end_session=END,
+        settings=_settings(polygon_api_key=None),
+        clock=lambda: NOW,
+        store_factory=_store_factory(first_store),
+        sessions_fn=lambda _end: SMALL_WINDOW,
+        revision_fn=lambda: "b" * 40,
+        ledger_path=tmp_path / "acquisition.jsonl",
+        legacy_ledger_path=tmp_path / "legacy.jsonl",
+    )
+    assert other_revision.campaign.campaign_id == first.campaign.campaign_id
+    assert other_revision.plan_id != first.plan_id
 
 
 async def test_global_guard_has_one_budget_across_provider_names() -> None:
@@ -480,6 +548,12 @@ async def test_success_runs_actions_first_and_checkpoints_every_receipt(tmp_path
         "dividend_page": 1,
         "open_close": 2,
     }
+    assert store.high_water_publications == list(range(1, 10))
+    assert store.high_water is not None and store.high_water.checkpoint_number == 9
+    assert result["campaign_ledger_record_count"] == 9
+    assert result["global_ledger_record_count"] == 9
+    assert result["campaign_ledger_sha256"] == store.high_water.campaign_ledger_sha256
+    assert result["global_ledger_sha256"] == store.high_water.ledger_sha256
 
 
 async def test_action_failure_stops_before_prices_and_fresh_plan_skips_checkpoint(
@@ -500,19 +574,123 @@ async def test_action_failure_stops_before_prices_and_fresh_plan_skips_checkpoin
 
     assert failed_calls == ["split_page", "dividend_page"]
     assert failed.value.result["attempts_spent"] == 2
+    assert failed.value.result["campaign_attempts_reserved"] == 2
+    assert failed.value.result["campaign_failed_after_admission_attempts"] == 1
+    ledger_records = [
+        json.loads(line)
+        for line in (tmp_path / "acquisition.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert ledger_records[-1]["status"] == "failed_after_admission"
     second_plan = await _plan(store, tmp_path)
+    assert second_plan.plan_id != first_plan.plan_id
     assert second_plan.allocation == {"split_page": 0, "dividend_page": 1, "open_close": 2}
+    assert second_plan.campaign_required_budget_delta == 1
+    assert second_plan.public_result()["campaign_attempts_reserved"] == 2
+    assert second_plan.public_result()["campaign_failed_after_admission_attempts"] == 1
     resumed_calls: list[str] = []
+    with pytest.raises(AcquisitionRefused, match="exact cumulative campaign deficit"):
+        await _execute(
+            second_plan,
+            store,
+            tmp_path,
+            resumed_calls,
+            authorization_id="msft-20260713-zero-delta",
+            campaign_budget_delta=0,
+        )
+    assert resumed_calls == []
     result = await _execute(
         second_plan,
         store,
         tmp_path,
         resumed_calls,
         authorization_id="msft-20260713-second",
+        campaign_budget_delta=1,
     )
     assert resumed_calls[0] == "dividend_page"
     assert "split_page" not in resumed_calls
     assert result["attempts_spent"] == 3
+    assert result["campaign_attempts_reserved"] == 5
+    assert result["campaign_authorized_calls"] == 5
+    assert result["campaign_budget_delta"] == 1
+
+
+async def test_campaign_budget_survives_restart_and_bounds_five_recovery_calls(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore(complete_prices=(END,))
+    initial = await _plan(store, tmp_path)
+    assert initial.campaign.base_calls is None
+    assert initial.campaign_required_budget_delta == 4
+    assert initial.campaign_hard_max_authorized_calls == 9
+
+    with pytest.raises(AcquisitionExecutionFailed):
+        await _execute(
+            initial,
+            store,
+            tmp_path,
+            [],
+            authorization_id="msft-campaign-initial",
+            fail_kind="split_page",
+        )
+
+    restarted = await _plan(store, tmp_path)
+    assert restarted.campaign.base_calls == 4
+    assert restarted.campaign.authorized_calls == 4
+    assert restarted.campaign.reserved_calls == 1
+    assert restarted.campaign_required_budget_delta == 1
+    assert restarted.plan_id != initial.plan_id
+
+    same_id_calls: list[str] = []
+    with pytest.raises(AcquisitionRefused, match="authorization_id is already consumed"):
+        await _execute(
+            restarted,
+            store,
+            tmp_path,
+            same_id_calls,
+            authorization_id="msft-campaign-initial",
+            fail_kind="split_page",
+            campaign_budget_delta=1,
+        )
+    assert same_id_calls == []
+
+    for number in range(1, 6):
+        recovery = await _plan(store, tmp_path)
+        assert recovery.campaign_required_budget_delta == 1
+        with pytest.raises(AcquisitionExecutionFailed):
+            await _execute(
+                recovery,
+                store,
+                tmp_path,
+                [],
+                authorization_id=f"msft-campaign-recovery-{number}",
+                fail_kind="split_page",
+                campaign_budget_delta=1,
+            )
+
+    exhausted = await _plan(store, tmp_path)
+    public = exhausted.public_result()
+    assert public["status"] == "blocked"
+    assert public["campaign_base_calls"] == 4
+    assert public["campaign_authorized_calls"] == 9
+    assert public["campaign_attempts_reserved"] == 6
+    assert public["campaign_required_budget_delta"] == 1
+    assert public["campaign_recovery_calls_authorized"] == 5
+    assert public["campaign_recovery_calls_remaining"] == 0
+    assert public["campaign_hard_max_authorized_calls"] == 9
+    assert public["campaign_failed_after_admission_attempts"] == 6
+
+    blocked_calls: list[str] = []
+    with pytest.raises(AcquisitionRefused, match="recovery call allowance is exhausted"):
+        await _execute(
+            exhausted,
+            store,
+            tmp_path,
+            blocked_calls,
+            authorization_id="msft-campaign-recovery-6",
+            fail_kind="split_page",
+            campaign_budget_delta=1,
+        )
+    assert blocked_calls == []
 
 
 async def test_empty_action_page_is_durable_complete_evidence(tmp_path: Path) -> None:
@@ -547,7 +725,7 @@ async def test_action_content_without_receipt_repairs_with_zero_calls(tmp_path: 
         plan_id=plan.plan_id,
         settings=_settings(polygon_api_key=None),
         clock=lambda: NOW,
-        store_factory=_store_factory(store),  # type: ignore[arg-type]
+        store_factory=_store_factory(store),
         lock_fn=_no_lock,
         sessions_fn=lambda _end: SMALL_WINDOW,
         revision_fn=_revision,
@@ -567,12 +745,15 @@ async def test_unresolved_typed_reservation_blocks_duplicate_call(tmp_path: Path
         authorization_id="msft-20260713-crashed",
         plan=original,
         max_calls=original.required_outbound_attempts,
+        campaign_budget_delta=original.campaign_required_budget_delta,
     )
+    await _anchor_ledger(store, ledger, original)
     ledger.reserve_call(
         authorization_id="msft-20260713-crashed",
         plan_id=original.plan_id,
         call=original.calls[0],
     )
+    await _anchor_ledger(store, ledger, original)
 
     blocked = await _plan(store, tmp_path)
     assert blocked.ambiguous_call_ids == (original.calls[0].call_id,)
@@ -587,6 +768,132 @@ async def test_unresolved_typed_reservation_blocks_duplicate_call(tmp_path: Path
         )
 
 
+async def test_local_ledger_ahead_of_database_refuses_without_auto_publishing(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore(complete_prices=(END,))
+    original = await _plan(store, tmp_path)
+    ledger = AcquisitionLedger(tmp_path / "acquisition.jsonl", clock=lambda: NOW)
+    ledger.begin_authorization(
+        authorization_id="msft-local-ahead",
+        plan=original,
+        max_calls=original.required_outbound_attempts,
+        campaign_budget_delta=original.campaign_required_budget_delta,
+    )
+
+    with pytest.raises(AcquisitionRefused, match="does not match the database"):
+        await _plan(store, tmp_path)
+    assert store.high_water is None
+    assert store.high_water_publications == []
+
+
+async def test_database_ahead_of_local_ledger_refuses_plan(tmp_path: Path) -> None:
+    store = FakeStore(complete_prices=(END,))
+    store.high_water = VendorAcquisitionCampaignHighWater(
+        checkpoint_number=1,
+        ledger_sha256=_hash("global-ahead"),
+        campaign_id=_hash("prior-campaign"),
+        campaign_checkpoint_number=1,
+        campaign_ledger_sha256=_hash("prior-campaign-ledger"),
+        base_calls=4,
+        authorized_calls=4,
+        reserved_calls=0,
+    )
+
+    with pytest.raises(AcquisitionRefused, match="does not match the database"):
+        await _plan(store, tmp_path)
+
+
+async def test_attempt_anchor_failure_prevents_provider_admission(tmp_path: Path) -> None:
+    store = FakeStore(complete_prices=(END,))
+    plan = await _plan(store, tmp_path)
+    store.fail_high_water_publications.add(2)
+    calls: list[str] = []
+
+    with pytest.raises(AcquisitionExecutionFailed) as failed:
+        await _execute(
+            plan,
+            store,
+            tmp_path,
+            calls,
+            authorization_id="msft-attempt-anchor-fails",
+        )
+
+    assert failed.value.result["failure_type"] == "AcquisitionHighWaterOutcomeUnknown"
+    assert calls == []
+    assert failed.value.result["campaign_ledger_record_count"] == 2
+    assert failed.value.result["global_ledger_record_count"] == 2
+    assert (
+        failed.value.result["campaign_ledger_sha256"] == failed.value.result["global_ledger_sha256"]
+    )
+    assert store.high_water is not None and store.high_water.checkpoint_number == 1
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "acquisition.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["record_type"] for record in records] == ["authorization", "attempt"]
+    with pytest.raises(AcquisitionRefused, match="does not match the database"):
+        await _plan(store, tmp_path)
+
+
+async def test_outcome_anchor_failure_prevents_next_vendor_call(tmp_path: Path) -> None:
+    store = FakeStore(complete_prices=(END,))
+    plan = await _plan(store, tmp_path)
+    store.fail_high_water_publications.add(3)
+    calls: list[str] = []
+
+    with pytest.raises(AcquisitionExecutionFailed) as failure:
+        await _execute(
+            plan,
+            store,
+            tmp_path,
+            calls,
+            authorization_id="msft-outcome-anchor-fails",
+        )
+
+    assert failure.value.result["failure_type"] == "AcquisitionHighWaterOutcomeUnknown"
+    assert calls == ["split_page"]
+    assert store.high_water is not None and store.high_water.checkpoint_number == 2
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "acquisition.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["record_type"] for record in records] == [
+        "authorization",
+        "attempt",
+        "outcome",
+    ]
+    with pytest.raises(AcquisitionRefused, match="does not match the database"):
+        await _plan(store, tmp_path)
+
+
+async def test_global_anchor_detects_suffix_rollback_across_campaigns(tmp_path: Path) -> None:
+    store = FakeStore(complete_prices=(END,))
+    first = await _plan(store, tmp_path)
+    ledger_path = tmp_path / "acquisition.jsonl"
+    ledger = AcquisitionLedger(ledger_path, clock=lambda: NOW)
+    ledger.begin_authorization(
+        authorization_id="msft-campaign-a-crashed",
+        plan=first,
+        max_calls=first.required_outbound_attempts,
+        campaign_budget_delta=first.campaign_required_budget_delta,
+    )
+    await _anchor_ledger(store, ledger, first)
+    ledger.reserve_call(
+        authorization_id="msft-campaign-a-crashed",
+        plan_id=first.plan_id,
+        call=first.calls[0],
+    )
+    await _anchor_ledger(store, ledger, first)
+    header = ledger_path.read_text(encoding="utf-8").splitlines(keepends=True)[0]
+    ledger_path.write_text(header, encoding="utf-8")
+    second_window = (SMALL_WINDOW[1], END)
+
+    with pytest.raises(AcquisitionRefused, match="does not match the database"):
+        await _plan(store, tmp_path, sessions=second_window)
+    assert store.high_water is not None and store.high_water.checkpoint_number == 2
+
+
 async def test_wrong_typed_allocation_refuses_before_ledger_or_provider(tmp_path: Path) -> None:
     store = FakeStore(complete_prices=(END,))
     plan = await _plan(store, tmp_path)
@@ -595,6 +902,8 @@ async def test_wrong_typed_allocation_refuses_before_ledger_or_provider(tmp_path
         await execute_acquisition(
             end_session=END,
             plan_id=plan.plan_id,
+            campaign_id=plan.campaign.campaign_id,
+            campaign_budget_delta=plan.campaign_required_budget_delta,
             max_calls=plan.required_outbound_attempts,
             split_calls=0,
             dividend_calls=1,
@@ -603,7 +912,7 @@ async def test_wrong_typed_allocation_refuses_before_ledger_or_provider(tmp_path
             authorization_id="msft-20260713-wrong",
             settings=_settings(),
             clock=lambda: NOW,
-            store_factory=_store_factory(store),  # type: ignore[arg-type]
+            store_factory=_store_factory(store),
             provider_factory=_provider_factory(calls),
             lock_fn=_no_lock,
             sessions_fn=lambda _end: SMALL_WINDOW,
@@ -652,13 +961,72 @@ def test_typed_ledger_tampering_fails_closed(tmp_path: Path) -> None:
         AcquisitionLedger(path).unresolved_call_ids()
 
 
+async def test_v1_campaign_ledger_and_counter_tampering_fail_closed(tmp_path: Path) -> None:
+    store = FakeStore(complete_prices=(END,))
+    plan = await _plan(store, tmp_path)
+    path = tmp_path / "acquisition.jsonl"
+    ledger = AcquisitionLedger(path, clock=lambda: NOW)
+    ledger.begin_authorization(
+        authorization_id="msft-schema-v2",
+        plan=plan,
+        max_calls=plan.required_outbound_attempts,
+        campaign_budget_delta=plan.campaign_required_budget_delta,
+    )
+    original = path.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in original.splitlines()]
+
+    records[0]["schema_version"] = 1
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    with pytest.raises(AcquisitionRefused, match="unreadable; stop for forensics"):
+        ledger.unresolved_call_ids()
+
+    path.write_text(original, encoding="utf-8")
+    records = [json.loads(line) for line in original.splitlines()]
+    records[0]["campaign_authorized_calls"] += 1
+    path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+    with pytest.raises(AcquisitionRefused, match="unreadable; stop for forensics"):
+        ledger.unresolved_call_ids()
+
+
+def test_explicit_ledger_paths_are_absolute_canonical_and_non_reparse(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    ledger = (data / acquisition.DEFAULT_LEDGER_PATH.name).resolve()
+    legacy = (data / acquisition.LEGACY_LEDGER_PATH.name).resolve()
+    assert (
+        acquisition._validated_ledger_path(
+            ledger,
+            expected_name=acquisition.DEFAULT_LEDGER_PATH.name,
+        )
+        == ledger
+    )
+    assert (
+        acquisition._validated_ledger_path(
+            legacy,
+            expected_name=acquisition.LEGACY_LEDGER_PATH.name,
+        )
+        == legacy
+    )
+    with pytest.raises(AcquisitionRefused, match="must be absolute"):
+        acquisition._validated_ledger_path(
+            Path("data") / acquisition.DEFAULT_LEDGER_PATH.name,
+            expected_name=acquisition.DEFAULT_LEDGER_PATH.name,
+        )
+    with pytest.raises(AcquisitionRefused, match="not canonical"):
+        acquisition._validated_ledger_path(
+            data / "wrong.jsonl",
+            expected_name=acquisition.DEFAULT_LEDGER_PATH.name,
+        )
+
+
 def test_wrapper_defaults_to_plan_and_old_wrapper_rejects_expanded_sentinel() -> None:
     wrapper = (acquisition.REPO_ROOT / "run-vendor-acquisition.ps1").read_text(encoding="utf-8")
     old_wrapper = (acquisition.REPO_ROOT / "run-vendor-backfill.ps1").read_text(encoding="utf-8")
     assert '[string]$Mode = "plan"' in wrapper
     assert "stockapi-msft-acquisition-only" in wrapper
     assert "SplitCalls + $DividendCalls + $OpenCloseCalls" in wrapper
-    assert "POLYGON_API_KEY" not in wrapper
+    assert "[string]$PolygonApiKey" not in wrapper
+    assert "--api-key" not in wrapper
     assert "stockapi-msft-acquisition-only" not in old_wrapper
 
 
@@ -680,6 +1048,10 @@ def test_main_never_renders_secret_bearing_failure(
             END.isoformat(),
             "--plan-id",
             _hash("plan"),
+            "--campaign-id",
+            _hash("campaign"),
+            "--campaign-budget-delta",
+            "1",
             "--max-calls",
             "1",
             "--split-calls",
@@ -734,6 +1106,7 @@ def test_ledger_records_typed_calls_without_key(tmp_path: Path) -> None:
         authorization_id="msft-20260713-ledger",
         plan=plan,
         max_calls=plan.required_outbound_attempts,
+        campaign_budget_delta=plan.campaign_required_budget_delta,
     )
     with pytest.raises(AcquisitionRefused, match="action-first order"):
         ledger.reserve_call(

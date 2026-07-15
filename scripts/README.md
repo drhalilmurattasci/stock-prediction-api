@@ -32,7 +32,7 @@ worker/Beat processes and serializes concurrent wrapper invocations. The ignored
   `data/vendor_backfill_attempts.jsonl` ledger before sending, and checkpoints
   one bar plus its post-commit receipt before the next request.
 
-All three modes require a clean Git worktree; the commit is part of the plan.
+All three modes require a clean `main` worktree; the commit is part of the plan.
 Smoke, typed acquisition, the lower-level backfill, ordinary close ingestion,
 and ordinary Polygon price ingestion
 share one PostgreSQL vendor-operation lock, so no controlled Polygon lane can
@@ -43,18 +43,22 @@ failure/recovery runbook.
 typed action-plus-price lane for the adjusted-data milestone. They compose the
 proven price coverage/checkpoint machinery with immutable split and dividend
 collection publication under one content-addressed plan, one advisory lock, one
-5-calls-per-60-seconds pacer, and one non-renewing global call ceiling:
+5-calls-per-60-seconds pacer, and one cumulative campaign budget:
 
 - `plan` is read-only, needs no `POLYGON_API_KEY`, accepts only `-End`, and
-  reports the exact `plan_id`, call-set digest, typed allocation, receipt-only
-  repairs, prior-attempt ambiguity, and whether the one-bar smoke anchor exists.
+  reports the exact `plan_id`, stable `campaign_id`, campaign-ledger digest,
+  campaign and global ledger counts/digests anchored in Postgres, cumulative
+  reservations/authorized calls, exact required budget delta,
+  call-set digest, typed allocation, receipt-only repairs, prior-attempt
+  ambiguity, and whether the one-bar smoke anchor exists.
 - `repair` accepts only that current plan ID. It may publish missing database
   receipts for already committed price/action content but admits zero outbound
   requests.
-- `execute` requires the current plan plus exact global and per-kind ceilings,
-  the `stockapi-msft-acquisition-only` sentinel, and a fresh lowercase
-  authorization ID. The sentinel is only a mechanical check; it never replaces
-  an owner grant naming the reviewed plan and allocation.
+- `execute` requires the current plan and campaign identities, the plan's exact
+  campaign budget delta, exact current-run and per-kind ceilings, the
+  `stockapi-msft-acquisition-only` sentinel, and a fresh lowercase authorization
+  ID. The sentinel is only a mechanical check; it never replaces an owner grant
+  naming the reviewed plan, cumulative state, delta, and allocation.
 
 From a zero-data database, `plan` is correctly `blocked` until the separately
 authorized one-request smoke has established the latest-session receipt. After
@@ -67,6 +71,8 @@ is exactly **259 calls**: `split_page=1`, `dividend_page=1`, and
   -Mode execute `
   -End YYYY-MM-DD `
   -PlanId sha256:<64-hex-plan-id> `
+  -CampaignId sha256:<64-hex-campaign-id> `
+  -CampaignBudgetDelta 259 `
   -MaxCalls 259 `
   -SplitCalls 1 `
   -DividendCalls 1 `
@@ -76,15 +82,27 @@ is exactly **259 calls**: `split_page=1`, `dividend_page=1`, and
 ```
 
 The ordered call set sends the complete split page first, then the complete
-dividend page, then unique missing open-close sessions. Each attempt is reserved
-before HTTP in ignored, append-only
+dividend page, then unique missing open-close sessions. Each corporate-action
+request is a single page and rejects `next_url` rather than following it. Each
+attempt is reserved before HTTP in ignored, append-only
 `data/vendor_acquisition_attempts.jsonl`; HTTP retries are disabled, and the
 exact content plus its later receipt is checkpointed before the next call. The
-lane also reads the older `data/vendor_backfill_attempts.jsonl` ambiguity state,
-so preserve both ledgers. A consumed/ambiguous reservation has no clear switch:
-perform vendor/database forensics, re-plan, and obtain a new authorization for
-only an unambiguous remaining call set. Planning binds a clean local commit but
-does not require or perform a push.
+database stores an immutable high-water row after every authorization,
+reservation, and outcome. The global file count/digest must match that row even
+when a later plan belongs to a different session-window campaign, so truncation
+or rollback cannot manufacture fresh budget. The lane also reads the older
+`data/vendor_backfill_attempts.jsonl` ambiguity state,
+so preserve both ledgers. The first authorization establishes an exact campaign
+base with zero automatic retry allowance. Any later plan that needs another
+attempt reports an exact positive recovery delta; that delta needs a separate
+owner grant and the cumulative campaign can never receive more than five
+recovery calls. A consumed/ambiguous reservation has no clear switch: perform
+vendor/database forensics, re-plan, and obtain a new authorization for only an
+unambiguous remaining call set. The wrapper scrubs ambient vendor credentials
+and proxies, revalidates the plan, and executes from a detached reviewed Git
+revision while keeping the canonical ledger in the primary workspace. It does
+not require or perform a push. Mutating modes additionally refuse a running API,
+worker, Beat, snapshot-builder, native Celery/uvicorn, or another operator.
 
 Factor calculation/publication is deliberately separate from acquisition.
 `AdjustmentFactorBuilder` selects exact cutoff-visible raw versions and action

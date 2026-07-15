@@ -121,7 +121,7 @@ class PolygonProvider:
         self._max_attempts = max_attempts
         self._retry_wait = retry_wait
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=timeout)
+        self._client = client or httpx.AsyncClient(timeout=timeout, trust_env=False)
 
     async def aclose(self) -> None:
         """Close the underlying client if this provider created it."""

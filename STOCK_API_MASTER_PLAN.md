@@ -137,7 +137,7 @@ The service is a Python 3.12 application built on **FastAPI** with full async I/
 
 - **TimescaleDB** (a Postgres extension) is the system of record for all OHLCV and time-series data. Bars live in hypertables partitioned by time (and space-partitioned by symbol where volume warrants), with continuous aggregates materializing 1m -> 5m -> 1h -> 1d rollups, native compression on older chunks, and retention policies. Using a Timescale-flavored Postgres rather than a separate TSDB means time-series and relational data share one engine, one backup story, and one SQL dialect.
 - **Postgres** (the same cluster) holds relational metadata: instruments, symbol mappings, corporate actions, users, API keys, model/run registry pointers, and prediction audit records.
-- **Implemented immutable market evidence (migration head `0013`)** keeps raw daily bars plus append-only restatement history and exact later publication receipts; content-addressed complete split/dividend collections plus later receipts; and Decimal34 adjustment-factor sets binding both action receipts and every exact raw-bar version/receipt. Adjusted prices are derived from published factor bits on read, never written back over raw history.
+- **Implemented immutable market evidence (migration head `0014_vendor_campaign_anchor`)** keeps raw daily bars plus append-only restatement history and exact later publication receipts; content-addressed complete split/dividend collections plus later receipts; Decimal34 adjustment-factor sets binding both action receipts and every exact raw-bar version/receipt; and a global immutable high-water chain for the separately authorized acquisition journal. Adjusted prices are derived from published factor bits on read, never written back over raw history.
 - **Redis is split by durability semantics:** `redis-cache` handles response/feature caching and rate-limit counters with LRU eviction and no persistence; `redis-celery` is dedicated to the Celery broker/result backend with AOF persistence and `noeviction`. Pub/sub remains available for fan-out of fresh-bar events, but cache eviction can never delete queued work.
 
 #### Ingestion / Orchestration
@@ -148,11 +148,16 @@ Unattended automation is separately fenced and default-off. The first MSFT data
 milestone uses reviewed one-shot operators instead: one exact smoke request, then
 a read-only content-addressed acquisition plan whose expected otherwise-empty,
 post-smoke allocation is 1 complete split page + 1 complete dividend page + 257
-missing open-close requests. Execution requires that exact 259-call typed allocation,
-uses one non-renewing global 5/60 budget, disables HTTP retries, persists an
-append-only reservation before each request, and checkpoints exact content and
-its later receipt before continuing. This operator lane is not authority to
-start Celery/Beat or any other vendor workload.
+  missing open-close requests. The initial campaign grant requires that exact
+  259-call typed allocation with no implicit retry headroom. Every reservation is
+  debited cumulatively across fresh authorization IDs; any recovery needs an
+  explicit exact budget-delta grant and the campaign permits at most five such
+  additional calls. Execution uses one shared 5/60 pacer, disables HTTP retries,
+  persists an append-only reservation before each request, and advances an
+  immutable global Postgres high-water count/digest after every journal record.
+  File/DB mismatch across any campaign fails closed. Exact content and its later
+  receipt are checkpointed before continuing. This operator lane is not
+  authority to start Celery/Beat or any other vendor workload.
 
 Derived adjusted evidence remains a separate local-write gate. The implemented
 low-level `ingestion.tasks.seal_adjusted_forecast_snapshot` primitive performs
@@ -160,10 +165,11 @@ no vendor I/O and is not a Celery task; inside an exact revision-attested
 least-privilege builder image it publishes/replays one MSFT factor set at an
 operator-plan-bound cutoff and seals/replays one snapshot at the later factor
 receipt. Its end session, aware factor cutoff, reviewed revision, and two
-adjusted policy identities are enforced independently of the 259-call
-acquisition budget. A read-only adjusted-seal planner and complete PowerShell
-host attestation/HTTP controller have not landed, so this primitive is not yet a
-direct operator runbook. Neither lane requires or performs a push.
+  adjusted policy identities are enforced independently of the acquisition
+  budget. The read-only adjusted-seal planner and the `adjusted_close` target of
+  `run-forecast-demo.ps1` provide the complete revision-attested, one-shot host
+  seal/serve controller. Adjusted outcome/cohort/calibration evidence remains
+  deliberately unsupported. Neither lane requires or performs a push.
 
 #### ML / Modeling
 

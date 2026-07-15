@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -38,6 +39,13 @@ from app.services.corporate_actions import (
     CorporateActionCollectionRecord,
     build_dividend_collection,
     build_split_collection,
+)
+from app.services.vendor_acquisition_campaign_store import (
+    SqlVendorAcquisitionCampaignStore,
+    VendorAcquisitionCampaignHighWater,
+    VendorAcquisitionCampaignStoreConflict,
+    VendorAcquisitionCampaignStoreError,
+    VendorAcquisitionCampaignStoreOutcomeUnknown,
 )
 from data_sources.base import CostRateGuard, DividendPage, OHLCVBar, SplitPage
 from data_sources.guards import AsyncPacingCostRateGuard
@@ -69,8 +77,10 @@ from scripts.vendor_backfill import (
 )
 
 AUTHORIZATION_SENTINEL = "stockapi-msft-acquisition-only"
-ACQUISITION_SCHEMA_VERSION = 1
+ACQUISITION_SCHEMA_VERSION = 2
 MAX_AUTHORIZED_CALLS = REQUIRED_SESSIONS - 1 + 2
+MAX_RECOVERY_CALLS = BACKFILL_MAX_CALLS_PER_WINDOW
+ABSOLUTE_MAX_CAMPAIGN_CALLS = MAX_AUTHORIZED_CALLS + MAX_RECOVERY_CALLS
 GLOBAL_BUDGET_KEY = "polygon_authorized_acquisition"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEDGER_PATH = REPO_ROOT / "data" / "vendor_acquisition_attempts.jsonl"
@@ -98,6 +108,14 @@ class AcquisitionExecutionFailed(RuntimeError):
         self.result = result
 
 
+class AcquisitionHighWaterConflict(AcquisitionRefused):
+    """The file journal conflicts with deterministic database anchor state."""
+
+
+class AcquisitionHighWaterOutcomeUnknown(AcquisitionRefused):
+    """Database visibility for an anchor operation could not be determined."""
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -120,6 +138,33 @@ def _aware_iso(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise AcquisitionRefused("ledger clock must be timezone-aware")
     return value.astimezone(UTC).isoformat()
+
+
+def _validated_ledger_path(value: Path, *, expected_name: str) -> Path:
+    if not value.is_absolute():
+        raise AcquisitionRefused("operator ledger paths must be absolute")
+    try:
+        resolved = value.resolve(strict=False)
+    except OSError as exc:
+        raise AcquisitionRefused("operator ledger path cannot be resolved") from exc
+    if value != resolved or resolved.name != expected_name or resolved.parent.name != "data":
+        raise AcquisitionRefused("operator ledger path is not canonical")
+    parent = resolved.parent
+    if not parent.is_dir() or _is_reparse_point(parent):
+        raise AcquisitionRefused("operator ledger parent must be a real data directory")
+    if resolved.exists() and (not resolved.is_file() or _is_reparse_point(resolved)):
+        raise AcquisitionRefused("operator ledger must be a regular non-reparse file")
+    return resolved
+
+
+def _is_reparse_point(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +346,136 @@ class ActionScopeState:
         }
 
 
+def _campaign_scope(expected_dates: tuple[date, ...]) -> dict[str, object]:
+    if not expected_dates or tuple(sorted(set(expected_dates))) != expected_dates:
+        raise AcquisitionRefused("campaign sessions must be non-empty, unique, and ordered")
+    return {
+        "format": "stockapi-vendor-acquisition-campaign-v1",
+        "symbol": BACKFILL_SYMBOL,
+        "source": BACKFILL_SOURCE,
+        "window_start": expected_dates[0].isoformat(),
+        "window_end": expected_dates[-1].isoformat(),
+        "expected_sessions": [value.isoformat() for value in expected_dates],
+        "open_close_endpoint_format": "/v1/open-close/{symbol}/{session}?adjusted=false",
+        "split_endpoint": SPLITS_ENDPOINT,
+        "dividend_endpoint": DIVIDENDS_ENDPOINT,
+        "corporate_action_query_policy_hash": CORPORATE_ACTION_QUERY_POLICY_HASH,
+        "initial_hard_max_calls": MAX_AUTHORIZED_CALLS,
+        "max_recovery_calls": MAX_RECOVERY_CALLS,
+    }
+
+
+def _validate_campaign_scope(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "format",
+        "symbol",
+        "source",
+        "window_start",
+        "window_end",
+        "expected_sessions",
+        "open_close_endpoint_format",
+        "split_endpoint",
+        "dividend_endpoint",
+        "corporate_action_query_policy_hash",
+        "initial_hard_max_calls",
+        "max_recovery_calls",
+    }:
+        raise ValueError("campaign scope schema mismatch")
+    sessions_value = value["expected_sessions"]
+    if not isinstance(sessions_value, list) or not sessions_value:
+        raise ValueError("campaign sessions must be a non-empty array")
+    try:
+        sessions = tuple(date.fromisoformat(cast(str, item)) for item in sessions_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("campaign sessions are invalid") from exc
+    expected = _campaign_scope(sessions)
+    if value != expected:
+        raise ValueError("campaign scope is not canonical")
+    return expected
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignLedgerState:
+    """Cumulative authorization and reservation state for one stable scope."""
+
+    campaign_id: str
+    campaign_scope: dict[str, object]
+    ledger_sha256: str
+    record_count: int = 0
+    global_ledger_sha256: str = _content_id([])
+    global_record_count: int = 0
+    base_calls: int | None = None
+    authorized_calls: int = 0
+    reserved_calls: int = 0
+    failed_after_admission_call_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.campaign_id != _content_id(self.campaign_scope):
+            raise AcquisitionRefused("campaign identity does not match its stable scope")
+        if _HASH_PATTERN.fullmatch(self.ledger_sha256) is None:
+            raise AcquisitionRefused("campaign ledger digest is invalid")
+        if _HASH_PATTERN.fullmatch(self.global_ledger_sha256) is None:
+            raise AcquisitionRefused("global acquisition ledger digest is invalid")
+        if (
+            isinstance(self.record_count, bool)
+            or not isinstance(self.record_count, int)
+            or self.record_count < 0
+            or isinstance(self.global_record_count, bool)
+            or not isinstance(self.global_record_count, int)
+            or self.global_record_count < self.record_count
+        ):
+            raise AcquisitionRefused("acquisition ledger record counts are invalid")
+        if any(
+            _HASH_PATTERN.fullmatch(value) is None for value in self.failed_after_admission_call_ids
+        ):
+            raise AcquisitionRefused("campaign admitted-failure identity is invalid")
+        if self.base_calls is None:
+            if self.record_count or self.authorized_calls or self.reserved_calls:
+                raise AcquisitionRefused("uninitialized campaign has cumulative activity")
+            return
+        if (
+            not 1 <= self.base_calls <= MAX_AUTHORIZED_CALLS
+            or self.record_count < 1
+            or not self.base_calls <= self.authorized_calls <= self.hard_max_authorized_calls
+            or not 0 <= self.reserved_calls <= self.authorized_calls
+        ):
+            raise AcquisitionRefused("campaign cumulative budget state is invalid")
+
+    @property
+    def remaining_authorized_calls(self) -> int:
+        return self.authorized_calls - self.reserved_calls
+
+    @property
+    def recovery_calls_authorized(self) -> int:
+        if self.base_calls is None:
+            return 0
+        return self.authorized_calls - self.base_calls
+
+    @property
+    def recovery_calls_remaining(self) -> int:
+        return MAX_RECOVERY_CALLS - self.recovery_calls_authorized
+
+    @property
+    def hard_max_authorized_calls(self) -> int:
+        if self.base_calls is None:
+            return ABSOLUTE_MAX_CAMPAIGN_CALLS
+        return min(self.base_calls + MAX_RECOVERY_CALLS, ABSOLUTE_MAX_CAMPAIGN_CALLS)
+
+    def required_budget_delta(self, required_calls: int) -> int:
+        if required_calls < 0:
+            raise AcquisitionRefused("campaign required calls cannot be negative")
+        return max(0, self.reserved_calls + required_calls - self.authorized_calls)
+
+    def budget_blocked(self, required_calls: int) -> bool:
+        delta = self.required_budget_delta(required_calls)
+        if self.base_calls is None:
+            return required_calls > MAX_AUTHORIZED_CALLS
+        return (
+            delta > self.recovery_calls_remaining
+            or self.authorized_calls + delta > self.hard_max_authorized_calls
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class AcquisitionPlan:
     """Content-addressed authorization scope around the stable price plan."""
@@ -311,6 +486,7 @@ class AcquisitionPlan:
     calls: tuple[AcquisitionCall, ...]
     calls_sha256: str
     ambiguous_call_ids: tuple[str, ...]
+    campaign: CampaignLedgerState
     plan_id: str
 
     @property
@@ -353,7 +529,17 @@ class AcquisitionPlan:
             or self.dividend_state.ambiguous
             or bool(self.ambiguous_call_ids)
             or self.required_outbound_attempts > MAX_AUTHORIZED_CALLS
+            or self.campaign.budget_blocked(self.required_outbound_attempts)
         )
+
+    @property
+    def campaign_required_budget_delta(self) -> int:
+        return self.campaign.required_budget_delta(self.required_outbound_attempts)
+
+    @property
+    def campaign_hard_max_authorized_calls(self) -> int:
+        base = self.campaign.base_calls or self.required_outbound_attempts
+        return min(base + MAX_RECOVERY_CALLS, ABSOLUTE_MAX_CAMPAIGN_CALLS)
 
     def public_result(self) -> dict[str, object]:
         if self.blocked:
@@ -380,6 +566,26 @@ class AcquisitionPlan:
             "max_calls_per_window": BACKFILL_MAX_CALLS_PER_WINDOW,
             "rate_window_seconds": BACKFILL_RATE_WINDOW_SECONDS,
             "hard_max_authorized_calls": MAX_AUTHORIZED_CALLS,
+            "campaign_id": self.campaign.campaign_id,
+            "campaign_ledger_sha256": self.campaign.ledger_sha256,
+            "campaign_ledger_record_count": self.campaign.record_count,
+            "global_ledger_sha256": self.campaign.global_ledger_sha256,
+            "global_ledger_record_count": self.campaign.global_record_count,
+            "campaign_base_calls": self.campaign.base_calls,
+            "campaign_authorized_calls": self.campaign.authorized_calls,
+            "campaign_attempts_reserved": self.campaign.reserved_calls,
+            "campaign_remaining_authorized_calls": self.campaign.remaining_authorized_calls,
+            "campaign_required_budget_delta": self.campaign_required_budget_delta,
+            "campaign_recovery_calls_authorized": self.campaign.recovery_calls_authorized,
+            "campaign_recovery_calls_remaining": self.campaign.recovery_calls_remaining,
+            "campaign_hard_max_authorized_calls": self.campaign_hard_max_authorized_calls,
+            "campaign_failed_after_admission_attempts": len(
+                self.campaign.failed_after_admission_call_ids
+            ),
+            "campaign_failed_after_admission_call_ids": list(
+                self.campaign.failed_after_admission_call_ids
+            ),
+            "max_recovery_calls": MAX_RECOVERY_CALLS,
         }
 
 
@@ -403,6 +609,7 @@ def _build_acquisition_plan(
     *,
     unresolved_call_ids: tuple[str, ...] = (),
     legacy_unresolved_dates: tuple[date, ...] = (),
+    campaign: CampaignLedgerState | None = None,
 ) -> AcquisitionPlan:
     window_start = price_plan.expected_dates[0]
     window_end = price_plan.end_session
@@ -443,8 +650,17 @@ def _build_acquisition_plan(
     ambiguous = tuple(sorted(call_ids.intersection((*unresolved_call_ids, *legacy_ids))))
     calls_document = [value.ledger_document() for value in ordered]
     calls_sha256 = _content_id(calls_document)
+    scope = _campaign_scope(price_plan.expected_dates)
+    campaign_state = campaign or CampaignLedgerState(
+        campaign_id=_content_id(scope),
+        campaign_scope=scope,
+        ledger_sha256=_content_id([]),
+    )
+    if campaign_state.campaign_id != _content_id(scope):
+        raise AcquisitionRefused("campaign ledger state escaped the acquisition scope")
+    required_budget_delta = campaign_state.required_budget_delta(len(ordered))
     canonical = {
-        "format": "stockapi-vendor-acquisition-plan-v1",
+        "format": "stockapi-vendor-acquisition-plan-v2",
         "schema_version": ACQUISITION_SCHEMA_VERSION,
         "authorization": AUTHORIZATION_SENTINEL,
         "tool_revision": price_plan.tool_revision,
@@ -460,6 +676,24 @@ def _build_acquisition_plan(
         "max_calls_per_window": BACKFILL_MAX_CALLS_PER_WINDOW,
         "rate_window_seconds": BACKFILL_RATE_WINDOW_SECONDS,
         "hard_max_authorized_calls": MAX_AUTHORIZED_CALLS,
+        "campaign_id": campaign_state.campaign_id,
+        "campaign_scope": scope,
+        "campaign_ledger_sha256": campaign_state.ledger_sha256,
+        "campaign_ledger_record_count": campaign_state.record_count,
+        "global_ledger_sha256": campaign_state.global_ledger_sha256,
+        "global_ledger_record_count": campaign_state.global_record_count,
+        "campaign_base_calls": campaign_state.base_calls,
+        "campaign_authorized_calls": campaign_state.authorized_calls,
+        "campaign_attempts_reserved": campaign_state.reserved_calls,
+        "campaign_required_budget_delta": required_budget_delta,
+        "campaign_hard_max_authorized_calls": min(
+            (campaign_state.base_calls or len(ordered)) + MAX_RECOVERY_CALLS,
+            ABSOLUTE_MAX_CAMPAIGN_CALLS,
+        ),
+        "campaign_failed_after_admission_call_ids": list(
+            campaign_state.failed_after_admission_call_ids
+        ),
+        "max_recovery_calls": MAX_RECOVERY_CALLS,
     }
     return AcquisitionPlan(
         price_plan=price_plan,
@@ -468,6 +702,7 @@ def _build_acquisition_plan(
         calls=ordered,
         calls_sha256=calls_sha256,
         ambiguous_call_ids=ambiguous,
+        campaign=campaign_state,
         plan_id=_content_id(canonical),
     )
 
@@ -495,6 +730,13 @@ class AcquisitionStore(Protocol):
         self,
         record: CorporateActionCollectionRecord,
     ) -> PublishedCorporateActionCollection: ...
+
+    async def campaign_high_water(self) -> VendorAcquisitionCampaignHighWater | None: ...
+
+    async def publish_campaign_high_water(
+        self,
+        requested: VendorAcquisitionCampaignHighWater,
+    ) -> VendorAcquisitionCampaignHighWater: ...
 
 
 class AcquisitionProvider(Protocol):
@@ -525,6 +767,7 @@ class SqlAcquisitionStore:
         self._prices = SqlBackfillStore(settings)
         self._action_engine = build_engine(settings)
         self._actions = SqlCorporateActionCollectionStore(self._action_engine)
+        self._campaigns = SqlVendorAcquisitionCampaignStore(self._action_engine)
 
     async def __aenter__(self) -> SqlAcquisitionStore:
         await self._prices.__aenter__()
@@ -573,6 +816,15 @@ class SqlAcquisitionStore:
         record: CorporateActionCollectionRecord,
     ) -> PublishedCorporateActionCollection:
         return await self._actions.publish(record)
+
+    async def campaign_high_water(self) -> VendorAcquisitionCampaignHighWater | None:
+        return await self._campaigns.latest()
+
+    async def publish_campaign_high_water(
+        self,
+        requested: VendorAcquisitionCampaignHighWater,
+    ) -> VendorAcquisitionCampaignHighWater:
+        return await self._campaigns.publish(requested)
 
 
 StoreFactory = Callable[[Settings], AbstractAsyncContextManager[AcquisitionStore]]
@@ -663,7 +915,7 @@ def _default_provider(
 
 
 class AcquisitionLedger:
-    """Strict append-only authorization and typed-attempt ledger."""
+    """Strict append-only campaign, authorization, and typed-attempt ledger."""
 
     def __init__(self, path: Path = DEFAULT_LEDGER_PATH, *, clock: Clock = _utcnow) -> None:
         self.path = path
@@ -675,6 +927,7 @@ class AcquisitionLedger:
         authorization_id: str,
         plan: AcquisitionPlan,
         max_calls: int,
+        campaign_budget_delta: int,
     ) -> None:
         _validate_authorization_id(authorization_id)
         if (
@@ -685,6 +938,35 @@ class AcquisitionLedger:
         records = self._records()
         if any(record.get("authorization_id") == authorization_id for record in records):
             raise AcquisitionRefused("authorization_id is already consumed; obtain a fresh grant")
+        current = self._campaign_state_from_records(
+            records,
+            campaign_id=plan.campaign.campaign_id,
+            campaign_scope=plan.campaign.campaign_scope,
+        )
+        if current != plan.campaign:
+            raise AcquisitionRefused("campaign ledger state no longer matches the authorized plan")
+        required_delta = current.required_budget_delta(max_calls)
+        if (
+            isinstance(campaign_budget_delta, bool)
+            or not isinstance(campaign_budget_delta, int)
+            or campaign_budget_delta != required_delta
+        ):
+            raise AcquisitionRefused(
+                "campaign_budget_delta must equal the exact cumulative campaign deficit"
+            )
+        if current.budget_blocked(max_calls):
+            raise AcquisitionRefused("campaign recovery call allowance is exhausted")
+        campaign_base_calls = current.base_calls or max_calls
+        campaign_authorized_calls = current.authorized_calls + campaign_budget_delta
+        hard_max = min(
+            campaign_base_calls + MAX_RECOVERY_CALLS,
+            ABSOLUTE_MAX_CAMPAIGN_CALLS,
+        )
+        if (
+            campaign_authorized_calls < current.reserved_calls + max_calls
+            or campaign_authorized_calls > hard_max
+        ):
+            raise AcquisitionRefused("campaign cumulative call budget is invalid")
         self._append(
             {
                 "record_type": "authorization",
@@ -692,6 +974,13 @@ class AcquisitionLedger:
                 "authorization": AUTHORIZATION_SENTINEL,
                 "authorization_id": authorization_id,
                 "plan_id": plan.plan_id,
+                "campaign_id": plan.campaign.campaign_id,
+                "campaign_scope": plan.campaign.campaign_scope,
+                "campaign_ledger_sha256_before": current.ledger_sha256,
+                "campaign_base_calls": campaign_base_calls,
+                "campaign_budget_delta": campaign_budget_delta,
+                "campaign_authorized_calls": campaign_authorized_calls,
+                "campaign_reserved_before": current.reserved_calls,
                 "tool_revision": plan.tool_revision,
                 "symbol": BACKFILL_SYMBOL,
                 "window_start": plan.price_plan.expected_dates[0].isoformat(),
@@ -713,6 +1002,7 @@ class AcquisitionLedger:
     ) -> int:
         records = self._records()
         header = _one_header(records, authorization_id, plan_id)
+        campaign_id = cast(str, header["campaign_id"])
         ordered_calls = [
             _call_from_document(value) for value in cast(list[object], header["calls"])
         ]
@@ -738,14 +1028,24 @@ class AcquisitionLedger:
         max_calls = cast(int, header["max_calls"])
         if len(attempts) >= max_calls:
             raise AcquisitionRefused("authorization global call budget is exhausted")
+        campaign = self._campaign_state_from_records(
+            records,
+            campaign_id=campaign_id,
+            campaign_scope=cast(dict[str, object], header["campaign_scope"]),
+        )
+        if campaign.reserved_calls >= campaign.authorized_calls:
+            raise AcquisitionRefused("campaign cumulative call budget is exhausted")
         attempt_number = len(attempts) + 1
+        campaign_attempt_number = campaign.reserved_calls + 1
         self._append(
             {
                 "record_type": "attempt",
                 "schema_version": ACQUISITION_SCHEMA_VERSION,
                 "authorization_id": authorization_id,
                 "plan_id": plan_id,
+                "campaign_id": campaign_id,
                 "attempt_number": attempt_number,
+                "campaign_attempt_number": campaign_attempt_number,
                 "call_id": call.call_id,
                 "call_kind": call.kind,
                 "endpoint": call.endpoint,
@@ -763,7 +1063,11 @@ class AcquisitionLedger:
         authorization_id: str,
         plan_id: str,
         call: AcquisitionCall,
-        status: Literal["checkpointed", "failed"],
+        status: Literal[
+            "checkpointed",
+            "failed_before_admission",
+            "failed_after_admission",
+        ],
         evidence_id: str | None = None,
         failure_type: str | None = None,
     ) -> None:
@@ -775,14 +1079,14 @@ class AcquisitionLedger:
             ):
                 raise AcquisitionRefused("checkpointed outcome evidence is invalid")
         elif (
-            status != "failed"
+            status not in {"failed_before_admission", "failed_after_admission"}
             or evidence_id is not None
             or failure_type is None
             or _FAILURE_TYPE_PATTERN.fullmatch(failure_type) is None
         ):
             raise AcquisitionRefused("failed outcome detail is invalid")
         records = self._records()
-        _one_header(records, authorization_id, plan_id)
+        header = _one_header(records, authorization_id, plan_id)
         attempts = [
             record
             for record in _authorization_attempts(records, authorization_id, plan_id)
@@ -804,6 +1108,7 @@ class AcquisitionLedger:
                 "schema_version": ACQUISITION_SCHEMA_VERSION,
                 "authorization_id": authorization_id,
                 "plan_id": plan_id,
+                "campaign_id": header["campaign_id"],
                 "call_id": call.call_id,
                 "call_kind": call.kind,
                 "status": status,
@@ -818,6 +1123,62 @@ class AcquisitionLedger:
             record.get("record_type") == "attempt"
             and record.get("authorization_id") == authorization_id
             for record in self._records()
+        )
+
+    def campaign_state(
+        self,
+        campaign_id: str,
+        campaign_scope: dict[str, object],
+    ) -> CampaignLedgerState:
+        return self._campaign_state_from_records(
+            self._records(),
+            campaign_id=campaign_id,
+            campaign_scope=campaign_scope,
+        )
+
+    @staticmethod
+    def _campaign_state_from_records(
+        records: list[dict[str, object]],
+        *,
+        campaign_id: str,
+        campaign_scope: dict[str, object],
+    ) -> CampaignLedgerState:
+        if campaign_id != _content_id(campaign_scope):
+            raise AcquisitionRefused("campaign identity does not match its stable scope")
+        campaign_records = [
+            record for record in records if record.get("campaign_id") == campaign_id
+        ]
+        headers = [
+            record for record in campaign_records if record["record_type"] == "authorization"
+        ]
+        attempts = [record for record in campaign_records if record["record_type"] == "attempt"]
+        admitted_failures = tuple(
+            cast(str, record["call_id"])
+            for record in campaign_records
+            if record["record_type"] == "outcome" and record["status"] == "failed_after_admission"
+        )
+        if not headers:
+            return CampaignLedgerState(
+                campaign_id=campaign_id,
+                campaign_scope=campaign_scope,
+                ledger_sha256=_content_id([]),
+                record_count=0,
+                global_ledger_sha256=_content_id(records),
+                global_record_count=len(records),
+            )
+        if any(header["campaign_scope"] != campaign_scope for header in headers):
+            raise AcquisitionRefused("campaign ledger scope is inconsistent")
+        return CampaignLedgerState(
+            campaign_id=campaign_id,
+            campaign_scope=campaign_scope,
+            ledger_sha256=_content_id(campaign_records),
+            record_count=len(campaign_records),
+            global_ledger_sha256=_content_id(records),
+            global_record_count=len(records),
+            base_calls=cast(int, headers[0]["campaign_base_calls"]),
+            authorized_calls=cast(int, headers[-1]["campaign_authorized_calls"]),
+            reserved_calls=len(attempts),
+            failed_after_admission_call_ids=admitted_failures,
         )
 
     def unresolved_call_ids(self) -> tuple[str, ...]:
@@ -863,6 +1224,13 @@ class AcquisitionLedger:
             "authorization",
             "authorization_id",
             "plan_id",
+            "campaign_id",
+            "campaign_scope",
+            "campaign_ledger_sha256_before",
+            "campaign_base_calls",
+            "campaign_budget_delta",
+            "campaign_authorized_calls",
+            "campaign_reserved_before",
             "tool_revision",
             "symbol",
             "window_start",
@@ -878,7 +1246,9 @@ class AcquisitionLedger:
             "schema_version",
             "authorization_id",
             "plan_id",
+            "campaign_id",
             "attempt_number",
+            "campaign_attempt_number",
             "call_id",
             "call_kind",
             "endpoint",
@@ -892,6 +1262,7 @@ class AcquisitionLedger:
             "schema_version",
             "authorization_id",
             "plan_id",
+            "campaign_id",
             "call_id",
             "call_kind",
             "status",
@@ -904,6 +1275,10 @@ class AcquisitionLedger:
         outcomes: set[tuple[str, str]] = set()
         attempt_counts: dict[str, int] = {}
         last_call_positions: dict[str, int] = {}
+        campaign_records: dict[str, list[dict[str, object]]] = {}
+        campaign_base_calls: dict[str, int] = {}
+        campaign_authorized_calls: dict[str, int] = {}
+        campaign_reserved_calls: dict[str, int] = {}
         for record in records:
             record_type = record.get("record_type")
             expected_schema = {
@@ -917,11 +1292,14 @@ class AcquisitionLedger:
                 raise ValueError("ledger schema version mismatch")
             authorization_id = record["authorization_id"]
             plan_id = record["plan_id"]
+            campaign_id = record["campaign_id"]
             if (
                 not isinstance(authorization_id, str)
                 or _AUTHORIZATION_ID_PATTERN.fullmatch(authorization_id) is None
                 or not isinstance(plan_id, str)
                 or _HASH_PATTERN.fullmatch(plan_id) is None
+                or not isinstance(campaign_id, str)
+                or _HASH_PATTERN.fullmatch(campaign_id) is None
             ):
                 raise ValueError("ledger identity is invalid")
             if record_type == "authorization":
@@ -932,6 +1310,9 @@ class AcquisitionLedger:
                     raise ValueError("authorization calls must be an array")
                 calls = tuple(_call_from_document(value) for value in calls_value)
                 _validate_call_order(calls)
+                campaign_scope = _validate_campaign_scope(record["campaign_scope"])
+                if campaign_id != _content_id(campaign_scope):
+                    raise ValueError("authorization campaign identity is invalid")
                 allocation = record["allocation"]
                 expected_allocation = {
                     "split_page": sum(value.kind == "split_page" for value in calls),
@@ -939,6 +1320,35 @@ class AcquisitionLedger:
                     "open_close": sum(value.kind == "open_close" for value in calls),
                 }
                 max_calls = record["max_calls"]
+                base_calls = record["campaign_base_calls"]
+                budget_delta = record["campaign_budget_delta"]
+                authorized_calls = record["campaign_authorized_calls"]
+                reserved_before = record["campaign_reserved_before"]
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in (
+                        max_calls,
+                        base_calls,
+                        budget_delta,
+                        authorized_calls,
+                        reserved_before,
+                    )
+                ):
+                    raise ValueError("authorization campaign counters are invalid")
+                max_calls = cast(int, max_calls)
+                base_calls = cast(int, base_calls)
+                budget_delta = cast(int, budget_delta)
+                authorized_calls = cast(int, authorized_calls)
+                reserved_before = cast(int, reserved_before)
+                prior_campaign_records = campaign_records.setdefault(campaign_id, [])
+                prior_authorized = campaign_authorized_calls.get(campaign_id, 0)
+                prior_reserved = campaign_reserved_calls.get(campaign_id, 0)
+                expected_base = campaign_base_calls.get(campaign_id, max_calls)
+                expected_delta = max(0, prior_reserved + len(calls) - prior_authorized)
+                hard_max = min(
+                    expected_base + MAX_RECOVERY_CALLS,
+                    ABSOLUTE_MAX_CAMPAIGN_CALLS,
+                )
                 if (
                     record["authorization"] != AUTHORIZATION_SENTINEL
                     or record["symbol"] != BACKFILL_SYMBOL
@@ -949,22 +1359,61 @@ class AcquisitionLedger:
                     or not isinstance(max_calls, int)
                     or max_calls != len(calls)
                     or not 1 <= max_calls <= MAX_AUTHORIZED_CALLS
+                    or isinstance(base_calls, bool)
+                    or not isinstance(base_calls, int)
+                    or base_calls != expected_base
+                    or not 1 <= base_calls <= MAX_AUTHORIZED_CALLS
+                    or isinstance(budget_delta, bool)
+                    or not isinstance(budget_delta, int)
+                    or budget_delta != expected_delta
+                    or isinstance(authorized_calls, bool)
+                    or not isinstance(authorized_calls, int)
+                    or authorized_calls != prior_authorized + budget_delta
+                    or authorized_calls > hard_max
+                    or authorized_calls < prior_reserved + len(calls)
+                    or isinstance(reserved_before, bool)
+                    or not isinstance(reserved_before, int)
+                    or reserved_before != prior_reserved
+                    or record["campaign_ledger_sha256_before"]
+                    != _content_id(prior_campaign_records)
                     or record["calls_sha256"]
                     != _content_id([value.ledger_document() for value in calls])
                 ):
                     raise ValueError("authorization header is invalid")
                 start = _parse_ledger_date(record["window_start"])
                 end = _parse_ledger_date(record["window_end"])
-                if start > end:
-                    raise ValueError("authorization window is inverted")
+                if (
+                    start > end
+                    or record["window_start"] != campaign_scope["window_start"]
+                    or record["window_end"] != campaign_scope["window_end"]
+                    or any(
+                        call.start < start
+                        or call.end > end
+                        or (
+                            call.kind == "open_close"
+                            and call.start.isoformat()
+                            not in cast(list[str], campaign_scope["expected_sessions"])
+                        )
+                        for call in calls
+                    )
+                ):
+                    raise ValueError("authorization calls escaped the campaign window")
                 _parse_ledger_timestamp(record["recorded_at"])
                 headers[authorization_id] = record
                 attempt_counts[authorization_id] = 0
                 last_call_positions[authorization_id] = -1
+                campaign_base_calls[campaign_id] = base_calls
+                campaign_authorized_calls[campaign_id] = authorized_calls
+                campaign_reserved_calls.setdefault(campaign_id, 0)
+                prior_campaign_records.append(record)
                 continue
 
             header = headers.get(authorization_id)
-            if header is None or header["plan_id"] != plan_id:
+            if (
+                header is None
+                or header["plan_id"] != plan_id
+                or header["campaign_id"] != campaign_id
+            ):
                 raise ValueError("ledger child precedes or mismatches authorization")
             call_id = record["call_id"]
             call_kind = record["call_kind"]
@@ -984,7 +1433,9 @@ class AcquisitionLedger:
             key = (authorization_id, call_id)
             if record_type == "attempt":
                 attempt_number = record["attempt_number"]
+                campaign_attempt_number = record["campaign_attempt_number"]
                 expected_number = attempt_counts[authorization_id] + 1
+                expected_campaign_number = campaign_reserved_calls[campaign_id] + 1
                 earlier_action_ids = {
                     value.call_id
                     for value in ordered_header_calls[: call_positions[call_id]]
@@ -1000,6 +1451,10 @@ class AcquisitionLedger:
                     or isinstance(attempt_number, bool)
                     or not isinstance(attempt_number, int)
                     or attempt_number != expected_number
+                    or isinstance(campaign_attempt_number, bool)
+                    or not isinstance(campaign_attempt_number, int)
+                    or campaign_attempt_number != expected_campaign_number
+                    or campaign_attempt_number > campaign_authorized_calls[campaign_id]
                     or record["endpoint"] != call.endpoint
                     or record["symbol"] != call.symbol
                     or record["start"] != call.start.isoformat()
@@ -1012,11 +1467,22 @@ class AcquisitionLedger:
                 attempts[key] = record
                 attempt_counts[authorization_id] = expected_number
                 last_call_positions[authorization_id] = call_positions[call_id]
+                campaign_reserved_calls[campaign_id] = expected_campaign_number
+                campaign_records[campaign_id].append(record)
                 continue
             status = record["status"]
             evidence_id = record["evidence_id"]
             failure_type = record["failure_type"]
-            if key not in attempts or key in outcomes or status not in {"checkpointed", "failed"}:
+            if (
+                key not in attempts
+                or key in outcomes
+                or status
+                not in {
+                    "checkpointed",
+                    "failed_before_admission",
+                    "failed_after_admission",
+                }
+            ):
                 raise ValueError("ledger outcome is invalid")
             if status == "checkpointed":
                 if (
@@ -1033,6 +1499,7 @@ class AcquisitionLedger:
                 raise ValueError("failed outcome detail is invalid")
             _parse_ledger_timestamp(record["recorded_at"])
             outcomes.add(key)
+            campaign_records[campaign_id].append(record)
 
     def _append(self, record: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1098,6 +1565,81 @@ def _validate_authorization_id(value: str) -> None:
         raise AcquisitionRefused("authorization_id must be 3-64 lowercase safe characters")
 
 
+def _campaign_high_water(state: CampaignLedgerState) -> VendorAcquisitionCampaignHighWater:
+    if state.base_calls is None or state.record_count < 1 or state.global_record_count < 1:
+        raise AcquisitionRefused("campaign ledger has no publishable high-water checkpoint")
+    return VendorAcquisitionCampaignHighWater(
+        checkpoint_number=state.global_record_count,
+        ledger_sha256=state.global_ledger_sha256,
+        campaign_id=state.campaign_id,
+        campaign_checkpoint_number=state.record_count,
+        campaign_ledger_sha256=state.ledger_sha256,
+        base_calls=state.base_calls,
+        authorized_calls=state.authorized_calls,
+        reserved_calls=state.reserved_calls,
+    )
+
+
+async def _require_database_high_water(
+    store: AcquisitionStore,
+    state: CampaignLedgerState,
+) -> None:
+    """Require exact global file/DB equality before any new ledger append."""
+
+    try:
+        visible = await store.campaign_high_water()
+    except VendorAcquisitionCampaignStoreOutcomeUnknown as exc:
+        raise AcquisitionHighWaterOutcomeUnknown(
+            "database acquisition high-water visibility is unknown"
+        ) from exc
+    except VendorAcquisitionCampaignStoreError as exc:
+        raise AcquisitionHighWaterConflict(
+            "database acquisition high-water is unavailable"
+        ) from exc
+    if state.global_record_count == 0:
+        matches = visible is None
+    else:
+        matches = (
+            visible is not None
+            and visible.checkpoint_number == state.global_record_count
+            and visible.ledger_sha256 == state.global_ledger_sha256
+        )
+    if not matches:
+        raise AcquisitionRefused(
+            "local acquisition ledger does not match the database high-water checkpoint"
+        )
+
+
+async def _publish_database_high_water(
+    store: AcquisitionStore,
+    ledger: AcquisitionLedger,
+    *,
+    campaign_id: str,
+    campaign_scope: dict[str, object],
+) -> CampaignLedgerState:
+    """Publish and re-observe the exact fsynced ledger state after one append."""
+
+    state = ledger.campaign_state(campaign_id, campaign_scope)
+    requested = _campaign_high_water(state)
+    try:
+        visible = await store.publish_campaign_high_water(requested)
+    except VendorAcquisitionCampaignStoreOutcomeUnknown as exc:
+        raise AcquisitionHighWaterOutcomeUnknown(
+            "database acquisition high-water publish visibility is unknown"
+        ) from exc
+    except VendorAcquisitionCampaignStoreConflict as exc:
+        raise AcquisitionHighWaterConflict(
+            "database acquisition high-water publish conflicted"
+        ) from exc
+    except VendorAcquisitionCampaignStoreError as exc:
+        raise AcquisitionHighWaterOutcomeUnknown(
+            "database acquisition high-water publish failed ambiguously"
+        ) from exc
+    if not requested.same_state(visible):
+        raise AcquisitionRefused("database acquisition high-water publish was not observable")
+    return state
+
+
 async def _current_plan(
     *,
     store: AcquisitionStore,
@@ -1118,12 +1660,16 @@ async def _current_plan(
         store.action_coverage("split", window_start, end_session),
         store.action_coverage("dividend", window_start, end_session),
     )
+    campaign_scope = _campaign_scope(expected_dates)
+    campaign = ledger.campaign_state(_content_id(campaign_scope), campaign_scope)
+    await _require_database_high_water(store, campaign)
     return _build_acquisition_plan(
         price_plan,
         split_coverage,
         dividend_coverage,
         unresolved_call_ids=ledger.unresolved_call_ids(),
         legacy_unresolved_dates=AttemptLedger(legacy_ledger_path).unresolved_dates(),
+        campaign=campaign,
     )
 
 
@@ -1318,6 +1864,8 @@ async def execute_acquisition(
     *,
     end_session: date,
     plan_id: str,
+    campaign_id: str,
+    campaign_budget_delta: int,
     max_calls: int,
     split_calls: int,
     dividend_calls: int,
@@ -1337,10 +1885,13 @@ async def execute_acquisition(
     if authorization != AUTHORIZATION_SENTINEL:
         raise AcquisitionRefused(f"authorization must be exactly {AUTHORIZATION_SENTINEL}")
     _validate_authorization_id(authorization_id)
-    if _HASH_PATTERN.fullmatch(plan_id) is None:
-        raise AcquisitionRefused("plan_id must be a sha256 digest from the plan command")
+    if _HASH_PATTERN.fullmatch(plan_id) is None or _HASH_PATTERN.fullmatch(campaign_id) is None:
+        raise AcquisitionRefused("plan_id and campaign_id must be sha256 plan digests")
     if (
         not 1 <= max_calls <= MAX_AUTHORIZED_CALLS
+        or isinstance(campaign_budget_delta, bool)
+        or not isinstance(campaign_budget_delta, int)
+        or not 0 <= campaign_budget_delta <= MAX_AUTHORIZED_CALLS
         or split_calls not in {0, 1}
         or dividend_calls not in {0, 1}
         or not 0 <= open_close_calls <= REQUIRED_SESSIONS - 1
@@ -1363,12 +1914,16 @@ async def execute_acquisition(
         )
         if plan.plan_id != plan_id:
             raise AcquisitionRefused("database state no longer matches the authorized plan_id")
+        if plan.campaign.campaign_id != campaign_id:
+            raise AcquisitionRefused("campaign_id does not match the authorized plan")
         if not plan.smoke_anchor_present:
             raise AcquisitionRefused("latest-session smoke bar and receipt must exist first")
         if plan.split_state.ambiguous or plan.dividend_state.ambiguous:
             raise AcquisitionRefused("action receipt state is ambiguous; stop for forensics")
         if plan.ambiguous_call_ids:
             raise AcquisitionRefused("an unresolved prior attempt overlaps required work")
+        if plan.campaign.budget_blocked(plan.required_outbound_attempts):
+            raise AcquisitionRefused("campaign recovery call allowance is exhausted")
         if not plan.calls:
             raise AcquisitionRefused("no outbound vendor calls are required")
         if not _allocation_matches(
@@ -1380,10 +1935,21 @@ async def execute_acquisition(
         ):
             raise AcquisitionRefused("typed allocation must exactly equal the acquisition plan")
 
+        await _require_database_high_water(
+            store,
+            ledger.campaign_state(plan.campaign.campaign_id, plan.campaign.campaign_scope),
+        )
         ledger.begin_authorization(
             authorization_id=authorization_id,
             plan=plan,
             max_calls=max_calls,
+            campaign_budget_delta=campaign_budget_delta,
+        )
+        await _publish_database_high_water(
+            store,
+            ledger,
+            campaign_id=plan.campaign.campaign_id,
+            campaign_scope=plan.campaign.campaign_scope,
         )
         repaired = await _repair_plan_receipts(store, plan)
         guard = PlanBoundGlobalGuard(
@@ -1405,10 +1971,23 @@ async def execute_acquisition(
                                 "planned action state changed before its call; obtain a fresh plan"
                             )
                         continue
+                    await _require_database_high_water(
+                        store,
+                        ledger.campaign_state(
+                            plan.campaign.campaign_id,
+                            plan.campaign.campaign_scope,
+                        ),
+                    )
                     ledger.reserve_call(
                         authorization_id=authorization_id,
                         plan_id=plan.plan_id,
                         call=call,
+                    )
+                    await _publish_database_high_water(
+                        store,
+                        ledger,
+                        campaign_id=plan.campaign.campaign_id,
+                        campaign_scope=plan.campaign.campaign_scope,
                     )
                     guard.arm(call)
                     caught: Exception | None = None
@@ -1423,22 +2002,50 @@ async def execute_acquisition(
                             "provider returned without one guarded HTTP attempt"
                         )
                     if caught is not None:
+                        await _require_database_high_water(
+                            store,
+                            ledger.campaign_state(
+                                plan.campaign.campaign_id,
+                                plan.campaign.campaign_scope,
+                            ),
+                        )
                         ledger.finish_call(
                             authorization_id=authorization_id,
                             plan_id=plan.plan_id,
                             call=call,
-                            status="failed",
+                            status=(
+                                "failed_after_admission" if admitted else "failed_before_admission"
+                            ),
                             failure_type=type(caught).__name__,
+                        )
+                        await _publish_database_high_water(
+                            store,
+                            ledger,
+                            campaign_id=plan.campaign.campaign_id,
+                            campaign_scope=plan.campaign.campaign_scope,
                         )
                         raise caught
                     if evidence_id is None:
                         raise AcquisitionRefused("checkpoint evidence identity is absent")
+                    await _require_database_high_water(
+                        store,
+                        ledger.campaign_state(
+                            plan.campaign.campaign_id,
+                            plan.campaign.campaign_scope,
+                        ),
+                    )
                     ledger.finish_call(
                         authorization_id=authorization_id,
                         plan_id=plan.plan_id,
                         call=call,
                         status="checkpointed",
                         evidence_id=evidence_id,
+                    )
+                    await _publish_database_high_water(
+                        store,
+                        ledger,
+                        campaign_id=plan.campaign.campaign_id,
+                        campaign_scope=plan.campaign.campaign_scope,
                     )
                     checkpointed[call.kind] += 1
         except Exception as exc:
@@ -1454,6 +2061,7 @@ async def execute_acquisition(
                     plan=plan,
                     authorization_id=authorization_id,
                     max_calls=max_calls,
+                    campaign_budget_delta=campaign_budget_delta,
                     ledger=ledger,
                     guard=guard,
                     checkpointed=checkpointed,
@@ -1487,6 +2095,7 @@ async def execute_acquisition(
                     plan=plan,
                     authorization_id=authorization_id,
                     max_calls=max_calls,
+                    campaign_budget_delta=campaign_budget_delta,
                     ledger=ledger,
                     guard=guard,
                     checkpointed=checkpointed,
@@ -1501,6 +2110,7 @@ async def execute_acquisition(
                     plan=plan,
                     authorization_id=authorization_id,
                     max_calls=max_calls,
+                    campaign_budget_delta=campaign_budget_delta,
                     ledger=ledger,
                     guard=guard,
                     checkpointed=checkpointed,
@@ -1508,6 +2118,10 @@ async def execute_acquisition(
                     failure_type="AttemptAccountingMismatch",
                 )
             )
+        campaign = ledger.campaign_state(
+            plan.campaign.campaign_id,
+            plan.campaign.campaign_scope,
+        )
         return {
             "status": "ok",
             "plan_id": plan.plan_id,
@@ -1519,6 +2133,22 @@ async def execute_acquisition(
             "calls_sha256": plan.calls_sha256,
             "authorized_max_calls": max_calls,
             "authorized_allocation": plan.allocation,
+            "campaign_id": campaign.campaign_id,
+            "campaign_ledger_sha256": campaign.ledger_sha256,
+            "campaign_ledger_record_count": campaign.record_count,
+            "global_ledger_sha256": campaign.global_ledger_sha256,
+            "global_ledger_record_count": campaign.global_record_count,
+            "campaign_budget_delta": campaign_budget_delta,
+            "campaign_base_calls": campaign.base_calls,
+            "campaign_authorized_calls": campaign.authorized_calls,
+            "campaign_attempts_reserved": campaign.reserved_calls,
+            "campaign_remaining_authorized_calls": campaign.remaining_authorized_calls,
+            "campaign_recovery_calls_authorized": campaign.recovery_calls_authorized,
+            "campaign_recovery_calls_remaining": campaign.recovery_calls_remaining,
+            "campaign_hard_max_authorized_calls": campaign.hard_max_authorized_calls,
+            "campaign_failed_after_admission_attempts": len(
+                campaign.failed_after_admission_call_ids
+            ),
             "attempts_reserved": attempts_reserved,
             "attempts_spent": guard.spent,
             "checkpointed": checkpointed,
@@ -1553,12 +2183,17 @@ def _failure_result(
     plan: AcquisitionPlan,
     authorization_id: str,
     max_calls: int,
+    campaign_budget_delta: int,
     ledger: AcquisitionLedger,
     guard: PlanBoundGlobalGuard,
     checkpointed: dict[str, int],
     remaining: int,
     failure_type: str,
 ) -> dict[str, object]:
+    campaign = ledger.campaign_state(
+        plan.campaign.campaign_id,
+        plan.campaign.campaign_scope,
+    )
     return {
         "status": "failed",
         "plan_id": plan.plan_id,
@@ -1567,6 +2202,21 @@ def _failure_result(
         "symbol": BACKFILL_SYMBOL,
         "authorized_max_calls": max_calls,
         "authorized_allocation": plan.allocation,
+        "campaign_id": campaign.campaign_id,
+        "campaign_ledger_sha256": campaign.ledger_sha256,
+        "campaign_ledger_record_count": campaign.record_count,
+        "global_ledger_sha256": campaign.global_ledger_sha256,
+        "global_ledger_record_count": campaign.global_record_count,
+        "campaign_budget_delta": campaign_budget_delta,
+        "campaign_base_calls": campaign.base_calls,
+        "campaign_authorized_calls": campaign.authorized_calls,
+        "campaign_attempts_reserved": campaign.reserved_calls,
+        "campaign_remaining_authorized_calls": campaign.remaining_authorized_calls,
+        "campaign_recovery_calls_authorized": campaign.recovery_calls_authorized,
+        "campaign_recovery_calls_remaining": campaign.recovery_calls_remaining,
+        "campaign_hard_max_authorized_calls": campaign.hard_max_authorized_calls,
+        "campaign_failed_after_admission_attempts": len(campaign.failed_after_admission_call_ids),
+        "campaign_failed_after_admission_call_ids": list(campaign.failed_after_admission_call_ids),
         "attempts_reserved": ledger.attempt_count(authorization_id),
         "attempts_spent": guard.spent,
         "checkpointed": checkpointed,
@@ -1582,23 +2232,43 @@ def _iso_date(value: str) -> date:
         raise argparse.ArgumentTypeError("date must be YYYY-MM-DD") from None
 
 
+def _add_ledger_path_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ledger-path",
+        type=Path,
+        default=DEFAULT_LEDGER_PATH,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--legacy-ledger-path",
+        type=Path,
+        default=LEGACY_LEDGER_PATH,
+        help=argparse.SUPPRESS,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     plan = subparsers.add_parser("plan", help="read-only exact typed-call plan")
     plan.add_argument("--end", required=True, type=_iso_date)
+    _add_ledger_path_arguments(plan)
     repair = subparsers.add_parser("repair", help="repair receipts without vendor calls")
     repair.add_argument("--end", required=True, type=_iso_date)
     repair.add_argument("--plan-id", required=True)
+    _add_ledger_path_arguments(repair)
     execute = subparsers.add_parser("execute", help="run one separately authorized plan")
     execute.add_argument("--end", required=True, type=_iso_date)
     execute.add_argument("--plan-id", required=True)
+    execute.add_argument("--campaign-id", required=True)
+    execute.add_argument("--campaign-budget-delta", required=True, type=int)
     execute.add_argument("--max-calls", required=True, type=int)
     execute.add_argument("--split-calls", required=True, type=int)
     execute.add_argument("--dividend-calls", required=True, type=int)
     execute.add_argument("--open-close-calls", required=True, type=int)
     execute.add_argument("--authorization", required=True)
     execute.add_argument("--authorization-id", required=True)
+    _add_ledger_path_arguments(execute)
     return parser
 
 
@@ -1606,23 +2276,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     configure_logging("INFO", json_logs=False, exception_details=False)
     try:
+        ledger_path = _validated_ledger_path(
+            args.ledger_path,
+            expected_name=DEFAULT_LEDGER_PATH.name,
+        )
+        legacy_ledger_path = _validated_ledger_path(
+            args.legacy_ledger_path,
+            expected_name=LEGACY_LEDGER_PATH.name,
+        )
         if args.command == "plan":
             result: dict[str, object] = asyncio.run(
-                plan_acquisition(end_session=args.end)
+                plan_acquisition(
+                    end_session=args.end,
+                    ledger_path=ledger_path,
+                    legacy_ledger_path=legacy_ledger_path,
+                )
             ).public_result()
         elif args.command == "repair":
-            result = asyncio.run(repair_acquisition(end_session=args.end, plan_id=args.plan_id))
+            result = asyncio.run(
+                repair_acquisition(
+                    end_session=args.end,
+                    plan_id=args.plan_id,
+                    ledger_path=ledger_path,
+                    legacy_ledger_path=legacy_ledger_path,
+                )
+            )
         else:
             result = asyncio.run(
                 execute_acquisition(
                     end_session=args.end,
                     plan_id=args.plan_id,
+                    campaign_id=args.campaign_id,
+                    campaign_budget_delta=args.campaign_budget_delta,
                     max_calls=args.max_calls,
                     split_calls=args.split_calls,
                     dividend_calls=args.dividend_calls,
                     open_close_calls=args.open_close_calls,
                     authorization=args.authorization,
                     authorization_id=args.authorization_id,
+                    ledger_path=ledger_path,
+                    legacy_ledger_path=legacy_ledger_path,
                 )
             )
     except AcquisitionExecutionFailed as exc:

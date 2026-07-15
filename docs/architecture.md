@@ -4,7 +4,7 @@ The authoritative product roadmap remains
 [STOCK_API_MASTER_PLAN.md](../STOCK_API_MASTER_PLAN.md). This page records the
 implemented first-forecast trust boundary.
 
-The schema head is `0013_adjustment_factors`. No real vendor-to-forecast proof is
+The schema head is `0014_vendor_campaign_anchor`. No real vendor-to-forecast proof is
 recorded yet; ordinary live-gate verification seeds only labelled synthetic
 throwaway evidence and cleans it before returning. The diagrams below describe
 enforced code and persistence boundaries, not populated production evidence or
@@ -39,8 +39,8 @@ typed operator acquisition (one splits page, one dividends page, then missing cl
   -> later adjustment_factor_set_availability receipt
   -> GET /v1/prices/{symbol}/adjusted?factor_set_id=sha256:...
        validates the complete factor/raw window before range filtering or pagination
-  -> low-level revision-attested adjusted factor/snapshot primitive
-       (read-only host plan/controller still pending)
+  -> revision-attested adjusted factor/snapshot primitive
+  -> read-only adjusted host plan + detached one-shot seal/serve controller
   -> target-routed /v1/forecast?target=adjusted_close under separate policy pins
 ```
 
@@ -135,8 +135,8 @@ while disabled; its Polygon jobs additionally require a positive finite
 per-lane, per-process call cap. Fundamentals and news remain unscheduled until
 they receive owned budgets. The separately authorized smoke, typed acquisition,
 lower-level backfill, and raw demo commands call bounded async/operator paths
-directly and do not enable Celery. The adjusted one-shot primitive is likewise
-non-Celery but remains behind the missing host plan/controller boundary above.
+  directly and do not enable Celery. The adjusted one-shot controller is likewise
+  non-Celery and is exposed only through the fixed `adjusted_close` demo target.
 
 Archive persistence uses an optimistic two-phase flow: a short keyed lookup,
 snapshot loading and pure forecast computation with no archive connection held,

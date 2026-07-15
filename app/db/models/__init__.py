@@ -22,6 +22,7 @@ from app.db.models.forecast_evidence import (
 )
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.db.models.predictions import ForecastRun
+from app.db.models.vendor_acquisition import VendorAcquisitionCampaignAnchor
 
 __all__ = [
     "AdjustmentFactorEntry",
@@ -42,4 +43,5 @@ __all__ = [
     "ForecastRealizedOutcome",
     "ForecastRealizedOutcomePublication",
     "ForecastRun",
+    "VendorAcquisitionCampaignAnchor",
 ]

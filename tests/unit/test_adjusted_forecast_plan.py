@@ -38,7 +38,13 @@ from app.services.corporate_actions import (
     DIVIDENDS_ENDPOINT,
     SPLITS_ENDPOINT,
 )
-from scripts.vendor_acquisition import AcquisitionPlan, ActionScopeState
+from scripts.vendor_acquisition import (
+    AcquisitionPlan,
+    ActionScopeState,
+    CampaignLedgerState,
+    _campaign_scope,
+    _content_id,
+)
 from scripts.vendor_backfill import (
     REQUIRED_SESSIONS,
     BackfillPlan,
@@ -150,6 +156,7 @@ def _acquisition_plan(
             DIVIDEND_AVAILABLE_AT,
         ),
     )
+    campaign_scope = _campaign_scope(dates)
     return AcquisitionPlan(
         price_plan=price,
         split_state=ActionScopeState(
@@ -165,6 +172,11 @@ def _acquisition_plan(
         calls=(),
         calls_sha256="sha256:" + "5" * 64,
         ambiguous_call_ids=(),
+        campaign=CampaignLedgerState(
+            campaign_id=_content_id(campaign_scope),
+            campaign_scope=campaign_scope,
+            ledger_sha256=_content_id([]),
+        ),
         plan_id=ACQUISITION_PLAN_ID,
     )
 

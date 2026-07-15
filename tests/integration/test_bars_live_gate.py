@@ -22,7 +22,7 @@ actually reject NaN/Infinity under Postgres NaN ordering, and the API
 statement-timeout cancels a pathological statement.
 The same command also proves forecast-input snapshot SHA-256 enforcement,
 idempotent insertion, semantic collision rejection, pure resolution, and
-database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0013`` wire
+database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0014`` wire
 the same gate to check content-addressed realized outcomes, immutable policy
 registration, the direct receipt-writer cutoff fence, source-bound publication,
 and cohort manifests whose availability can be sealed only after the manifest
@@ -233,6 +233,15 @@ _PUBLISH_ADJUSTMENT_FACTOR_RECEIPT = text(
     "SELECT factor_set_id, factor_set_recorded_at, available_at "
     "FROM public.publish_adjustment_factor_set_receipt(:factor_set_id)"
 )
+_PUBLISH_VENDOR_ACQUISITION_ANCHOR = text(
+    "SELECT checkpoint_number, ledger_sha256, campaign_id, "
+    "campaign_checkpoint_number, campaign_ledger_sha256, base_calls, "
+    "authorized_calls, reserved_calls "
+    "FROM public.publish_vendor_acquisition_campaign_anchor("
+    ":checkpoint_number, :ledger_sha256, :campaign_id, "
+    ":campaign_checkpoint_number, :campaign_ledger_sha256, :base_calls, "
+    ":authorized_calls, :reserved_calls)"
+)
 
 
 class _MissingReadBarrier:
@@ -393,6 +402,7 @@ def _drop_project_schema(url: str) -> None:
                 text(
                     "DROP TABLE IF EXISTS adjustment_factor_set_availability, "
                     "adjustment_factor_entries, adjustment_factor_sets, "
+                    "vendor_acquisition_campaign_anchors, "
                     "corporate_action_collection_availability, "
                     "corporate_action_collection_members, corporate_action_collections, "
                     "corporate_action_versions, forecast_outcome_cohort_availability, "
@@ -429,6 +439,7 @@ def _drop_project_schema(url: str) -> None:
                 "stamp_adjustment_factor_entry",
                 "reject_adjustment_factor_mutation",
                 "stamp_adjustment_factor_set_availability",
+                "reject_vendor_acquisition_anchor_mutation",
             ):
                 conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}()"))
             conn.execute(
@@ -469,6 +480,12 @@ def _drop_project_schema(url: str) -> None:
                 "publish_adjustment_factor_set_receipt(text)",
             ):
                 conn.execute(text(f"DROP FUNCTION IF EXISTS {function_name}"))
+            conn.execute(
+                text(
+                    "DROP FUNCTION IF EXISTS publish_vendor_acquisition_campaign_anchor("
+                    "bigint,text,text,bigint,text,integer,integer,integer)"
+                )
+            )
     finally:
         sync_engine.dispose()
 
@@ -1002,7 +1019,7 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0013_adjustment_factors"
+        assert version == "0014_vendor_campaign_anchor"
         hypertables = (
             await conn.execute(
                 text(
@@ -1292,6 +1309,175 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
             assert can_execute_run_trigger is False
 
 
+async def test_vendor_acquisition_global_anchor_transitions_acl_and_immutability(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+) -> None:
+    def checkpoint(
+        number: int,
+        *,
+        ledger_character: str,
+        campaign_character: str,
+        campaign_checkpoint: int,
+        campaign_ledger_character: str,
+        base_calls: int,
+        authorized_calls: int,
+        reserved_calls: int,
+    ) -> dict[str, object]:
+        return {
+            "checkpoint_number": number,
+            "ledger_sha256": "sha256:" + ledger_character * 64,
+            "campaign_id": "sha256:" + campaign_character * 64,
+            "campaign_checkpoint_number": campaign_checkpoint,
+            "campaign_ledger_sha256": "sha256:" + campaign_ledger_character * 64,
+            "base_calls": base_calls,
+            "authorized_calls": authorized_calls,
+            "reserved_calls": reserved_calls,
+        }
+
+    first = checkpoint(
+        1,
+        ledger_character="a",
+        campaign_character="b",
+        campaign_checkpoint=1,
+        campaign_ledger_character="c",
+        base_calls=4,
+        authorized_calls=4,
+        reserved_calls=0,
+    )
+    second = checkpoint(
+        2,
+        ledger_character="d",
+        campaign_character="b",
+        campaign_checkpoint=2,
+        campaign_ledger_character="e",
+        base_calls=4,
+        authorized_calls=4,
+        reserved_calls=1,
+    )
+    outcome = checkpoint(
+        3,
+        ledger_character="f",
+        campaign_character="b",
+        campaign_checkpoint=3,
+        campaign_ledger_character="0",
+        base_calls=4,
+        authorized_calls=4,
+        reserved_calls=1,
+    )
+    recovery_authorization = checkpoint(
+        4,
+        ledger_character="1",
+        campaign_character="b",
+        campaign_checkpoint=4,
+        campaign_ledger_character="3",
+        base_calls=4,
+        authorized_calls=5,
+        reserved_calls=1,
+    )
+    other_campaign = checkpoint(
+        5,
+        ledger_character="4",
+        campaign_character="6",
+        campaign_checkpoint=1,
+        campaign_ledger_character="5",
+        base_calls=2,
+        authorized_calls=2,
+        reserved_calls=0,
+    )
+
+    async with engine.connect() as conn:
+        transaction = await conn.begin()
+        try:
+            inserted = (await conn.execute(_PUBLISH_VENDOR_ACQUISITION_ANCHOR, first)).one()
+            replayed = (await conn.execute(_PUBLISH_VENDOR_ACQUISITION_ANCHOR, first)).one()
+            assert tuple(inserted) == tuple(replayed)
+            await conn.execute(_PUBLISH_VENDOR_ACQUISITION_ANCHOR, second)
+            await conn.execute(_PUBLISH_VENDOR_ACQUISITION_ANCHOR, outcome)
+            await conn.execute(
+                _PUBLISH_VENDOR_ACQUISITION_ANCHOR,
+                recovery_authorization,
+            )
+            latest_replay = (
+                await conn.execute(
+                    _PUBLISH_VENDOR_ACQUISITION_ANCHOR,
+                    recovery_authorization,
+                )
+            ).one()
+            assert latest_replay.checkpoint_number == 4
+
+            historical = await conn.begin_nested()
+            with pytest.raises(DBAPIError, match="historical campaign checkpoint"):
+                await conn.execute(_PUBLISH_VENDOR_ACQUISITION_ANCHOR, first)
+            await historical.rollback()
+
+            skipped = await conn.begin_nested()
+            with pytest.raises(DBAPIError, match="global high-water"):
+                await conn.execute(
+                    _PUBLISH_VENDOR_ACQUISITION_ANCHOR,
+                    {**other_campaign, "checkpoint_number": 6},
+                )
+            await skipped.rollback()
+
+            await conn.execute(_PUBLISH_VENDOR_ACQUISITION_ANCHOR, other_campaign)
+            count = (
+                await conn.execute(text("SELECT count(*) FROM vendor_acquisition_campaign_anchors"))
+            ).scalar_one()
+            assert count == 5
+        finally:
+            await transaction.rollback()
+
+    await _assert_immutability_triggers(
+        owner_engine,
+        ("vendor_acquisition_campaign_anchors",),
+    )
+    signature = (
+        "publish_vendor_acquisition_campaign_anchor("
+        "bigint,text,text,bigint,text,integer,integer,integer)"
+    )
+    async with owner_engine.connect() as conn:
+        privileges = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "has_table_privilege('stockapi_app', "
+                    "'vendor_acquisition_campaign_anchors', 'SELECT'), "
+                    "has_table_privilege('stockapi_app', "
+                    "'vendor_acquisition_campaign_anchors', 'INSERT'), "
+                    "has_table_privilege('stockapi_app', "
+                    "'vendor_acquisition_campaign_anchors', 'UPDATE'), "
+                    "has_table_privilege('stockapi_app', "
+                    "'vendor_acquisition_campaign_anchors', 'DELETE'), "
+                    "has_table_privilege('stockapi_app', "
+                    "'vendor_acquisition_campaign_anchors', 'TRUNCATE'), "
+                    "has_table_privilege('stockapi_snapshot_builder', "
+                    "'vendor_acquisition_campaign_anchors', 'SELECT'), "
+                    "has_function_privilege('stockapi_app', :signature, 'EXECUTE'), "
+                    "has_function_privilege('stockapi_snapshot_builder', :signature, 'EXECUTE')"
+                ),
+                {"signature": signature},
+            )
+        ).one()
+        assert tuple(privileges) == (True, False, False, False, False, False, True, False)
+
+        await conn.rollback()
+        transaction = await conn.begin()
+        try:
+            await conn.execute(_PUBLISH_VENDOR_ACQUISITION_ANCHOR, first)
+            for mutation in (
+                "UPDATE vendor_acquisition_campaign_anchors "
+                "SET schema_version = schema_version WHERE checkpoint_number = 1",
+                "DELETE FROM vendor_acquisition_campaign_anchors WHERE checkpoint_number = 1",
+                "TRUNCATE vendor_acquisition_campaign_anchors",
+            ):
+                savepoint = await conn.begin_nested()
+                with pytest.raises(DBAPIError, match="anchors are append-only"):
+                    await conn.execute(text(mutation))
+                await savepoint.rollback()
+        finally:
+            await transaction.rollback()
+
+
 async def test_nonempty_policy_registry_refuses_downgrade(
     engine: AsyncEngine,
     owner_engine: AsyncEngine,
@@ -1336,7 +1522,7 @@ async def test_nonempty_policy_registry_refuses_downgrade(
     assert "cannot downgrade nonempty outcome-policy evidence" in combined
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0013_adjustment_factors"
+    assert version == "0014_vendor_campaign_anchor"
 
 
 async def test_corporate_action_publication_replay_correction_and_withdrawal(
@@ -2049,7 +2235,7 @@ async def test_adjustment_factor_publication_replay_receipt_projection_and_lock(
     )
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0013_adjustment_factors"
+    assert version == "0014_vendor_campaign_anchor"
 
 
 async def test_adjustment_decimal_kernel_is_exact_decimal34(
