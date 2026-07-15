@@ -1,11 +1,19 @@
 # Operator scripts
 
-Operational scripts. `db-init/*.sql` runs on first TimescaleDB boot (see docker-compose.yml).
+Operational scripts. `db-init/*` runs on first TimescaleDB boot (see docker-compose.yml).
 
 No real vendor-to-forecast proof is recorded yet; the ordinary database gate
 uses labelled synthetic evidence and cleans it before returning. Every command
 below is documentation, not authorization; date scope and call budgets must
 come from a fresh owner grant where required.
+
+`ci-live-database-gate.sh` is the GitHub-hosted-runner counterpart to the local
+Windows `run-live-gate.ps1`. It refuses a checked-out `.env`, vendor credentials,
+enabled automation, or reusable Postgres storage; creates a fresh loopback-only,
+digest-pinned TimescaleDB container with masked ephemeral credentials; runs the
+repository extension and role bootstrap; executes only the destructive Postgres
+module; and removes the anonymous database volume afterward. It cannot run a
+vendor lane and is not an operator authorization mechanism.
 
 `vendor_smoke.py` is the deliberately narrow first-live-vendor harness behind
 `run-vendor-smoke.ps1`. It accepts only MSFT, the latest completed XNYS session,

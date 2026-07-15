@@ -1,10 +1,11 @@
 """Live-database gate: migrations, writes, reads, and immutable snapshots.
 
 Skipped unless ``TEST_DATABASE_URL`` points at a **throwaway** TimescaleDB
-through an owner/admin account. The fixture RESETS the target database (bars
-tables and alembic_version are dropped) before applying migrations. It never
-creates or mutates the cluster-global runtime roles: bootstrap them first and
-provide both least-privilege URLs. Never point this gate at shared data. Run with::
+through an owner/admin account. The fixture RESETS the project's database
+objects (tables and alembic_version are dropped) before applying migrations.
+It never creates or mutates the cluster-global runtime roles: bootstrap them
+first and provide both least-privilege URLs. Never point this gate at shared
+data. Run with::
 
     docker compose up -d timescaledb          # needs .env credentials
     $env:TEST_DATABASE_URL = "postgresql+asyncpg://<user>:<pass>@127.0.0.1:5432/<db>"
@@ -12,7 +13,7 @@ provide both least-privilege URLs. Never point this gate at shared data. Run wit
     $env:TEST_RUNTIME_DATABASE_URL = "postgresql+asyncpg://stockapi_app:<pass>@127.0.0.1:5432/<db>"
     $env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = "postgresql+asyncpg://stockapi_snapshot_builder:<pass>@127.0.0.1:5432/<db>"
     $env:TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET = "stockapi-test-only"
-    uv run pytest tests/integration -v
+    uv run pytest tests/integration/test_bars_live_gate.py -v
 
 This is the empirical proof the unit suite cannot give: the Alembic chain
 applies against a real hypertable, ``upsert_bars`` replay is a no-op while a

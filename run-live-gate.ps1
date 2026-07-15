@@ -182,7 +182,7 @@ try {
     uv run pytest `
         -p no:cacheprovider `
         --basetemp data/pytest-live-gate `
-        tests/integration `
+        tests/integration/test_bars_live_gate.py `
         -v
     if ($LASTEXITCODE -ne 0) {
         throw "live integration gate failed"

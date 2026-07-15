@@ -2,7 +2,11 @@
 
 The real workflows now live in [`.github/workflows/`](../../.github/workflows/):
 
-- **`ci.yml`** — lint (ruff), format check, type-check (mypy), and tests (pytest) on push/PR.
+- **`ci.yml`** — lint (ruff), format check, type-check (mypy), ordinary tests,
+  and a separate fresh TimescaleDB/PostgreSQL integration gate on every push/PR.
+  The ordinary pytest job remains skip-capable when live-service variables are
+  absent; `live-postgres` explicitly opts in only the destructive Postgres
+  module with generated credentials and no vendor secrets.
 - **`cd.yml`** — build and push the Docker image to GHCR on a published release.
 
 ## Pushing workflow files

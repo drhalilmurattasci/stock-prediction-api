@@ -11,8 +11,8 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 ## Status
 
 🚧 **The fail-closed data/forecast evidence substrate is code-complete through
-migration `0013`, but the product has not yet served a forecast over real
-vendor data.**
+migration `0014_vendor_campaign_anchor`, but the product has not yet served a
+forecast over real vendor data.**
 The repository now has API-key auth, bounded `/v1/prices` and `/v1/indicators`
 reads, versioned Polygon daily-bar ingestion, append-only restatement history, an
 owned causal indicator library, leakage-aware baselines, an
@@ -72,9 +72,16 @@ checkpoint above the database was empty; this API surface alone is not evidence
 of a real-data forecast.
 
 Unit/static gates cover the evidence substrate. The destructive TimescaleDB
-integration gate now passes through migration `0013` on real PostgreSQL 17.
+integration gate passes through migration `0014_vendor_campaign_anchor` on real
+PostgreSQL 17. The dedicated `live-postgres` GitHub Actions job provisions a
+fresh digest-pinned TimescaleDB for every push and pull request, initializes the
+fixed runtime roles from the repository bootstrap, and runs only the destructive
+Postgres module with generated ephemeral credentials. It supplies no vendor
+secret, keeps automation disabled, and removes the container and anonymous
+database volume even after failure.
 `run-live-gate.ps1` is hard-bound to the designated `stockapi_test` throwaway
-database and checks the complete migration chain, exact
+database and checks a fresh empty-schema upgrade to head plus the gate's empty
+`0014` to `0007` to `0014` downgrade/upgrade cycle, exact
 runtime/builder role boundaries, restatement history, historical point-in-time
 snapshot reconstruction, archived serving, schema-validated keyed replay, and
 the outcome/cohort hash, exact-receipt, immutability, role-boundary, and
@@ -86,8 +93,9 @@ READ-COMMITTED visibility, and tests frozen-cutoff restatement behavior. A
 clearly labelled synthetic throwaway target exercises the successful DB
 publisher/store/source-link path and rejects forged snapshot provenance; it is
 not evidence of a real market outcome.
-Ordinary test runs still skip that gate when
-its explicit live-database environment is absent. The first real
+Ordinary local test runs and the ordinary CI pytest job still skip that module
+when its explicit live-database environment is absent; the dedicated CI job is
+the per-build opt-in. The first real
 Massive/Polygon call remains a separate credentialed smoke gate.
 That gate has a one-attempt, fail-closed operator command documented in
 `INSTALL.md`; no vendor request runs as part of ordinary verification. The next

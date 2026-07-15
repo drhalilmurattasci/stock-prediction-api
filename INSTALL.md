@@ -475,7 +475,7 @@ First run pulls images (TimescaleDB, Redis) and the MLflow container pip-install
 Fresh databases create the fixed, non-owner `stockapi_app` and
 `stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
 Existing initialized database directories do not rerun Docker init scripts;
-bootstrap both roles once before applying migrations `0007` through the current
+bootstrap both roles once before applying migrations `0006` through the current
 head, `0014_vendor_campaign_anchor`:
 
 ```powershell
@@ -565,6 +565,19 @@ used by direct smoke/acquisition/backfill/demo lanes across reset and teardown. 
 fixture then drops its seeded test data and reapplies
 migrations, leaving an empty schema at migration head `0014_vendor_campaign_anchor` so the later vendor smoke
 still proves absence. It never makes a vendor call.
+
+CI proves the same database boundary on every push and pull request in the
+dedicated `live-postgres` job. `scripts/ci-live-database-gate.sh` refuses any
+non-GitHub-hosted runner, checked-out `.env`, vendor credential, enabled
+automation, or reusable Postgres data directory. It creates three distinct
+masked passwords, starts the digest-pinned TimescaleDB image on loopback with a
+fresh anonymous volume, runs the repository's extension and role init scripts,
+replays the transactional role bootstrap once, and executes only
+`tests/integration/test_bars_live_gate.py`. Cleanup removes the container and
+anonymous volume on success, failure, or cancellation. The job references no
+GitHub secret and does not authorize or perform vendor I/O. Ordinary local
+`pytest` remains skip-capable when the four explicit `TEST_*` values are absent;
+use `run-live-gate.ps1` for the corresponding owner-controlled Windows proof.
 
 ✅ When all rows pass, the database migration, privilege, revision, immutable
 snapshot, runtime-role serving, API-key short circuit, authenticated HTTP
