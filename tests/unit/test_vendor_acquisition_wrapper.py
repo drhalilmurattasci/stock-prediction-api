@@ -63,7 +63,7 @@ def test_wrapper_attests_exact_local_timescale_and_migration_head() -> None:
         '"healthy"',
         '"5432/tcp"',
         '"127.0.0.1"',
-        '"0015_calibration_evidence"',
+        '"0016_selection_policy_fence"',
         "--dbname stockapi_test",
         "\"SELECT current_database() || ''|'' || version_num FROM alembic_version\"",
         '"stockapi_test|$script:expectedMigrationHead"',

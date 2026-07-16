@@ -25,6 +25,7 @@ from app.db.models.forecast_evidence import (
     ForecastOutcomeResolutionPolicyRegistration,
     ForecastRealizedOutcome,
     ForecastRealizedOutcomePublication,
+    ForecastSelectionPolicyRegistration,
 )
 from app.db.models.forecast_snapshots import ForecastInputSnapshot
 from app.db.models.predictions import ForecastRun
@@ -50,6 +51,7 @@ __all__ = [
     "ForecastOutcomeCohortManifest",
     "ForecastOutcomeCohortMember",
     "ForecastOutcomeResolutionPolicyRegistration",
+    "ForecastSelectionPolicyRegistration",
     "ForecastRealizedOutcome",
     "ForecastRealizedOutcomePublication",
     "ForecastRun",

@@ -8,12 +8,19 @@ below is documentation, not authorization; date scope and call budgets must
 come from a fresh owner grant where required.
 
 `ci-live-database-gate.sh` is the GitHub-hosted-runner counterpart to the local
-Windows `run-live-gate.ps1`. It refuses a checked-out `.env`, vendor credentials,
+Windows `run-disposable-live-gate.ps1`. It refuses a checked-out `.env`, vendor credentials,
 enabled automation, or reusable Postgres storage; creates a fresh loopback-only,
 digest-pinned TimescaleDB container with masked ephemeral credentials; runs the
 repository extension and role bootstrap; executes only the destructive Postgres
 module; and removes the anonymous database volume afterward. It cannot run a
 vendor lane and is not an operator authorization mechanism.
+
+`run-disposable-live-gate.ps1` is the local nonpersistent counterpart. It leaves
+the owner-designated database on port 5432 untouched, creates one digest-pinned
+TimescaleDB container with an anonymous volume and random loopback port, proves a
+per-run marker before the destructive fixture can start, runs only the live
+PostgreSQL module with vendor access disabled, and removes only that captured
+container and volume afterward.
 
 `vendor_smoke.py` is the deliberately narrow first-live-vendor harness behind
 `run-vendor-smoke.ps1`. It accepts only MSFT, the latest completed XNYS session,

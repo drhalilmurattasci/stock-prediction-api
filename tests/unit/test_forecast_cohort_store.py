@@ -247,6 +247,8 @@ class _Database:
             self.members.extend(
                 ForecastOutcomeCohortMember(
                     cohort_id=row.cohort_id,
+                    selection_policy_hash=row.selection_policy_hash,
+                    purpose=row.purpose,
                     forecast_id=member.forecast_id,
                     step=member.step,
                     target_time=member.target_time,
@@ -567,7 +569,16 @@ async def test_read_validated_reports_a_missing_seal_as_incomplete_and_retryable
     assert excinfo.value.details == {"retryable": True}
 
 
-@pytest.mark.parametrize("corruption", ["member_count", "member_projection", "seal_xid"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "member_count",
+        "member_projection",
+        "member_selection_policy",
+        "member_purpose",
+        "seal_xid",
+    ],
+)
 async def test_read_validated_refuses_corrupt_membership_or_seal_projection(
     corruption: str,
 ) -> None:
@@ -578,6 +589,10 @@ async def test_read_validated_refuses_corrupt_membership_or_seal_projection(
         database.records[published.record.cohort_id].member_count += 1
     elif corruption == "member_projection":
         database.members[0].output_hash = "sha256:" + "0" * 64
+    elif corruption == "member_selection_policy":
+        database.members[0].selection_policy_hash = "sha256:" + "0" * 64
+    elif corruption == "member_purpose":
+        database.members[0].purpose = "calibration_fit"
     else:
         database.seals[published.record.cohort_id].sealer_xid = published.record.creator_xid
 

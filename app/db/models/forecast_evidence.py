@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Uuid,
     text,
 )
+from sqlalchemy.dialects.postgresql import ARRAY, ExcludeConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -64,6 +66,107 @@ class ForecastOutcomeResolutionPolicyRegistration(Base):
     availability_rule_set_hash: Mapped[str] = mapped_column(String(71), nullable=False)
     schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     resolution_lag_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    canonical_policy: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
+    )
+    creator_xid: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class ForecastSelectionPolicyRegistration(Base):
+    """Immutable, content-addressed prospective selection-policy registration."""
+
+    __tablename__ = "forecast_selection_policies"
+    __table_args__ = (
+        CheckConstraint("schema_version = 1", name="schema_version_supported"),
+        CheckConstraint(
+            "policy_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="policy_hash_format",
+        ),
+        CheckConstraint(
+            "forecast_resolution_policy_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="forecast_resolution_policy_hash_format",
+        ),
+        CheckConstraint(
+            "forecast_availability_rule_set_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="forecast_availability_rule_set_hash_format",
+        ),
+        CheckConstraint(
+            "outcome_resolution_policy_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="outcome_resolution_policy_hash_format",
+        ),
+        CheckConstraint(
+            "outcome_availability_rule_set_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="outcome_availability_rule_set_hash_format",
+        ),
+        CheckConstraint(
+            "resolution_lag_seconds BETWEEN 1 AND 31622400",
+            name="resolution_lag_bounded",
+        ),
+        CheckConstraint(
+            "fit_window_start <= fit_window_end "
+            "AND fit_window_end < heldout_window_start "
+            "AND heldout_window_start <= heldout_window_end",
+            name="window_order",
+        ),
+        CheckConstraint(
+            "minimum_fit_member_count BETWEEN 1 AND 1000000 "
+            "AND minimum_heldout_member_count BETWEEN 1 AND 1000000",
+            name="minimum_member_counts_bounded",
+        ),
+        CheckConstraint(
+            "minimum_seal_lead_seconds BETWEEN 14400 AND 31622400",
+            name="minimum_seal_lead_bounded",
+        ),
+        CheckConstraint(
+            "cardinality(selected_steps) BETWEEN 1 AND 252 "
+            "AND array_position(selected_steps, NULL) IS NULL",
+            name="selected_steps_bounded",
+        ),
+        CheckConstraint("creator_xid > 0", name="creator_xid_positive"),
+        CheckConstraint(
+            "octet_length(canonical_policy) BETWEEN 1 AND 262144",
+            name="canonical_policy_size_bounded",
+        ),
+        CheckConstraint(
+            "policy_hash = 'sha256:' || encode(digest(canonical_policy, 'sha256'), 'hex')",
+            name="policy_hash_matches_payload",
+        ),
+        ForeignKeyConstraint(
+            (
+                "outcome_resolution_policy_hash",
+                "outcome_availability_rule_set_hash",
+            ),
+            (
+                "forecast_outcome_resolution_policies.policy_hash",
+                "forecast_outcome_resolution_policies.availability_rule_set_hash",
+            ),
+            name="fk_forecast_selection_policies_registered_outcome_policy",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "policy_hash",
+            "outcome_resolution_policy_hash",
+            "outcome_availability_rule_set_hash",
+            name="uq_forecast_selection_policies_outcome_epoch",
+        ),
+    )
+
+    policy_hash: Mapped[str] = mapped_column(String(71), primary_key=True)
+    schema_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    forecast_resolution_policy_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    forecast_availability_rule_set_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    outcome_resolution_policy_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    outcome_availability_rule_set_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    resolution_lag_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    fit_window_start: Mapped[date] = mapped_column(Date, nullable=False)
+    fit_window_end: Mapped[date] = mapped_column(Date, nullable=False)
+    heldout_window_start: Mapped[date] = mapped_column(Date, nullable=False)
+    heldout_window_end: Mapped[date] = mapped_column(Date, nullable=False)
+    minimum_fit_member_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    minimum_heldout_member_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    minimum_seal_lead_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    selected_steps: Mapped[list[int]] = mapped_column(ARRAY(SmallInteger), nullable=False)
     canonical_policy: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("clock_timestamp()")
@@ -260,6 +363,26 @@ class ForecastOutcomeCohortManifest(Base):
             name="fk_forecast_outcome_cohort_manifests_registered_policy",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            (
+                "selection_policy_hash",
+                "outcome_resolution_policy_hash",
+                "availability_rule_set_hash",
+            ),
+            (
+                "forecast_selection_policies.policy_hash",
+                "forecast_selection_policies.outcome_resolution_policy_hash",
+                "forecast_selection_policies.outcome_availability_rule_set_hash",
+            ),
+            name="fk_cohort_manifests_registered_selection_policy",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "cohort_id",
+            "selection_policy_hash",
+            "purpose",
+            name="uq_forecast_outcome_cohort_manifests_selection_scope",
+        ),
         Index(
             "ix_forecast_outcome_cohorts_target_window",
             "earliest_target_time",
@@ -318,14 +441,45 @@ class ForecastOutcomeCohortMember(Base):
             name="opportunity_hash_format",
         ),
         CheckConstraint(
+            "selection_policy_hash ~ '^sha256:[0-9a-f]{64}$'",
+            name="selection_policy_hash_format",
+        ),
+        CheckConstraint(
+            "purpose IN ('calibration_fit', 'heldout_evaluation')",
+            name="purpose_supported",
+        ),
+        CheckConstraint(
             "output_hash ~ '^sha256:[0-9a-f]{64}$'",
             name="output_hash_format",
+        ),
+        ForeignKeyConstraint(
+            ("cohort_id", "selection_policy_hash", "purpose"),
+            (
+                "forecast_outcome_cohort_manifests.cohort_id",
+                "forecast_outcome_cohort_manifests.selection_policy_hash",
+                "forecast_outcome_cohort_manifests.purpose",
+            ),
+            name="fk_forecast_outcome_cohort_members_manifest_selection_scope",
+            ondelete="RESTRICT",
         ),
         UniqueConstraint(
             "cohort_id",
             "opportunity_hash",
             "step",
             name="uq_forecast_outcome_cohort_members_opportunity_step",
+        ),
+        UniqueConstraint(
+            "selection_policy_hash",
+            "opportunity_hash",
+            "step",
+            name="uq_forecast_outcome_cohort_members_policy_opportunity_step",
+        ),
+        ExcludeConstraint(
+            ("selection_policy_hash", "="),
+            ("opportunity_hash", "="),
+            ("purpose", "<>"),
+            name="ex_forecast_outcome_cohort_members_cross_purpose",
+            using="gist",
         ),
         Index(
             "ix_forecast_outcome_cohort_members_target",
@@ -342,6 +496,8 @@ class ForecastOutcomeCohortMember(Base):
         ),
         primary_key=True,
     )
+    selection_policy_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
     forecast_id: Mapped[UUID] = mapped_column(
         Uuid,
         ForeignKey("forecast_runs.forecast_id", ondelete="RESTRICT"),
@@ -401,6 +557,7 @@ __all__ = [
     "ForecastOutcomeCohortManifest",
     "ForecastOutcomeCohortMember",
     "ForecastOutcomeResolutionPolicyRegistration",
+    "ForecastSelectionPolicyRegistration",
     "ForecastRealizedOutcome",
     "ForecastRealizedOutcomePublication",
 ]

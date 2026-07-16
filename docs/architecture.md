@@ -4,15 +4,17 @@ The authoritative product roadmap remains
 [STOCK_API_MASTER_PLAN.md](../STOCK_API_MASTER_PLAN.md). This page records the
 implemented first-forecast trust boundary.
 
-The schema head is `0015_calibration_evidence`. No real vendor-to-forecast proof is
+The schema head is `0016_selection_policy_fence`. No real vendor-to-forecast proof is
 recorded yet; ordinary live-gate verification seeds only labelled synthetic
 throwaway evidence and cleans it before returning. The diagrams below describe
 enforced code and persistence boundaries, not populated production evidence or
 validated calibration.
 
-The owner-controlled local PostgreSQL 17/TimescaleDB gate passed all 31 tests
-through `0015` on 2026-07-15 and restored an empty migrated schema afterward.
-Remote CI has not yet exercised this local commit.
+The owner-controlled disposable PostgreSQL 17/TimescaleDB gate passed all 32
+tests through `0016` on 2026-07-16, then removed its captured container and
+anonymous volume. The persistent smoke database remained at `0015` with its one
+real bar and exact availability receipt intact. Remote CI has not yet exercised
+this local commit.
 
 Calibration evidence is reconstructed from one repeatable-read, read-only
 snapshot of a sealed cohort, its scheduled forecast archive rows, and the exact

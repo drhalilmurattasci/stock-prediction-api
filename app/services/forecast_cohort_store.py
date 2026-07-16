@@ -379,6 +379,12 @@ def _validate_member_projection(
     rows: list[ForecastOutcomeCohortMember],
     manifest: ForecastCohortManifest,
 ) -> None:
+    if any(
+        row.selection_policy_hash != manifest.selection_policy_hash
+        or row.purpose != manifest.purpose
+        for row in rows
+    ):
+        raise _corrupt()
     projected = tuple(
         sorted(
             (

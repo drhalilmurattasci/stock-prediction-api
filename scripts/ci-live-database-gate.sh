@@ -80,6 +80,7 @@ unset http_proxy https_proxy all_proxy no_proxy
 owner_password=$(openssl rand -hex 24)
 app_password=$(openssl rand -hex 24)
 builder_password=$(openssl rand -hex 24)
+gate_nonce=$(openssl rand -hex 16)
 [ "$owner_password" != "$app_password" ] || refuse "generated owner/runtime passwords collide"
 [ "$owner_password" != "$builder_password" ] || refuse "generated owner/builder passwords collide"
 [ "$app_password" != "$builder_password" ] || refuse "generated runtime/builder passwords collide"
@@ -98,6 +99,7 @@ fi
 
 if ! docker run --detach \
     --name "$CONTAINER_NAME" \
+    --label "stockapi.live-gate.nonce=$gate_nonce" \
     --platform linux/amd64 \
     --pull always \
     --publish 127.0.0.1:5432:5432 \
@@ -164,14 +166,36 @@ bootstrap=$(
 docker exec "$CONTAINER_NAME" \
     sh /docker-entrypoint-initdb.d/02-runtime-role.sh >/dev/null
 
+docker exec "$CONTAINER_NAME" psql \
+    --no-psqlrc \
+    --username stockapi_owner \
+    --dbname stockapi_test \
+    --set ON_ERROR_STOP=1 \
+    --command "CREATE TABLE public.stockapi_disposable_live_gate_marker (singleton boolean PRIMARY KEY CHECK (singleton), nonce varchar(32) NOT NULL CHECK (nonce ~ '^[0-9a-f]{32}$')); INSERT INTO public.stockapi_disposable_live_gate_marker (singleton, nonce) VALUES (true, '$gate_nonce'); REVOKE ALL ON TABLE public.stockapi_disposable_live_gate_marker FROM PUBLIC, stockapi_app, stockapi_snapshot_builder;" \
+    >/dev/null
+marker=$(
+    docker exec "$CONTAINER_NAME" psql \
+        --no-psqlrc \
+        --username stockapi_owner \
+        --dbname stockapi_test \
+        --tuples-only \
+        --no-align \
+        --set ON_ERROR_STOP=1 \
+        --command "SELECT nonce FROM public.stockapi_disposable_live_gate_marker WHERE singleton"
+)
+[ "$marker" = "$gate_nonce" ] || refuse "disposable database marker does not match this run"
+
 export TEST_DATABASE_URL="postgresql+asyncpg://stockapi_owner:${owner_password}@127.0.0.1:5432/stockapi_test"
 export TEST_RUNTIME_DATABASE_URL="postgresql+asyncpg://stockapi_app:${app_password}@127.0.0.1:5432/stockapi_test"
 export TEST_SNAPSHOT_BUILDER_DATABASE_URL="postgresql+asyncpg://stockapi_snapshot_builder:${builder_password}@127.0.0.1:5432/stockapi_test"
-export TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET=stockapi-test-only
+export TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET=stockapi-ci-container-only
+export TEST_DISPOSABLE_DATABASE_NONCE="$gate_nonce"
 export UV_OFFLINE=1
+unset ALEMBIC_CONFIG PYTEST_ADDOPTS PYTEST_PLUGINS
 
 uv run --frozen --no-sync pytest \
     -p no:cacheprovider \
     --basetemp "$RUNNER_TEMP/stockapi-live-postgres" \
     tests/integration/test_bars_live_gate.py \
+    --tb=short \
     -v

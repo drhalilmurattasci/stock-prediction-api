@@ -2,6 +2,7 @@
 # owner-designated local throwaway database and never performs vendor calls.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+throw "the persistent port-5432 live gate is retired; use .\run-disposable-live-gate.ps1"
 $mutex = [System.Threading.Mutex]::new($false, "Global\StockApiMutatingOperator")
 $mutexHeld = $false
 $testVariableNames = @(

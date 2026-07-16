@@ -16,6 +16,7 @@ from app.db.models import (
     ForecastOutcomeResolutionPolicyRegistration,
     ForecastRealizedOutcome,
     ForecastRealizedOutcomePublication,
+    ForecastSelectionPolicyRegistration,
 )
 from app.services.forecast_cohorts import ForecastCohortRecord, ForecastCohortSeal
 from app.services.forecast_outcome_store import ForecastOutcomePublicationRecord
@@ -23,6 +24,7 @@ from app.services.forecast_outcomes import RealizedOutcomeRecord
 
 MIGRATION = Path("migrations/versions/0010_forecast_evidence.py")
 POLICY_FENCE_MIGRATION = Path("migrations/versions/0011_outcome_policy_fence.py")
+SELECTION_POLICY_FENCE_MIGRATION = Path("migrations/versions/0016_selection_policy_fence.py")
 
 
 def test_outcome_model_binds_exact_receipt_and_content_hash() -> None:
@@ -115,10 +117,42 @@ def test_cohort_model_separates_manifest_from_commit_availability() -> None:
     member_foreign_keys = {key.target_fullname for key in members.foreign_keys}
     assert member_foreign_keys == {
         "forecast_outcome_cohort_manifests.cohort_id",
+        "forecast_outcome_cohort_manifests.selection_policy_hash",
+        "forecast_outcome_cohort_manifests.purpose",
         "forecast_runs.forecast_id",
     }
     member_constraints = {str(item.name) for item in members.constraints}
     assert "uq_forecast_outcome_cohort_members_opportunity_step" in member_constraints
+    assert "uq_forecast_outcome_cohort_members_policy_opportunity_step" in member_constraints
+    assert "ex_forecast_outcome_cohort_members_cross_purpose" in member_constraints
+    assert {
+        "selection_policy_hash",
+        "purpose",
+    } <= set(members.c.keys())
+
+    selection_scope = next(
+        key
+        for key in members.foreign_key_constraints
+        if tuple(column.name for column in key.columns)
+        == ("cohort_id", "selection_policy_hash", "purpose")
+    )
+    assert selection_scope.name == ("fk_forecast_outcome_cohort_members_manifest_selection_scope")
+    assert selection_scope.ondelete == "RESTRICT"
+
+    manifest_selection_key = next(
+        key
+        for key in manifest.foreign_key_constraints
+        if tuple(column.name for column in key.columns)
+        == (
+            "selection_policy_hash",
+            "outcome_resolution_policy_hash",
+            "availability_rule_set_hash",
+        )
+    )
+    assert next(iter(manifest_selection_key.elements)).target_fullname == (
+        "forecast_selection_policies.policy_hash"
+    )
+    assert manifest_selection_key.ondelete == "RESTRICT"
 
 
 def test_policy_registry_and_publication_models_bind_exact_provenance() -> None:
@@ -182,6 +216,45 @@ def test_policy_registry_and_publication_models_bind_exact_provenance() -> None:
     assert {field.name for field in fields(ForecastOutcomePublicationRecord)} == set(
         publications.c.keys()
     )
+
+
+def test_selection_policy_registry_is_content_addressed_and_epoch_projected() -> None:
+    table = ForecastSelectionPolicyRegistration.__table__
+    assert Base.metadata.tables[table.name] is table
+    assert tuple(column.name for column in table.primary_key) == ("policy_hash",)
+    assert isinstance(table.c.canonical_policy.type, LargeBinary)
+    assert isinstance(table.c.recorded_at.type, DateTime)
+    assert table.c.recorded_at.type.timezone is True
+    assert tuple(table.c.keys()) == (
+        "policy_hash",
+        "schema_version",
+        "forecast_resolution_policy_hash",
+        "forecast_availability_rule_set_hash",
+        "outcome_resolution_policy_hash",
+        "outcome_availability_rule_set_hash",
+        "resolution_lag_seconds",
+        "fit_window_start",
+        "fit_window_end",
+        "heldout_window_start",
+        "heldout_window_end",
+        "minimum_fit_member_count",
+        "minimum_heldout_member_count",
+        "minimum_seal_lead_seconds",
+        "selected_steps",
+        "canonical_policy",
+        "recorded_at",
+        "creator_xid",
+    )
+    constraints = {str(item.name): item for item in table.constraints}
+    assert {
+        "ck_forecast_selection_policies_policy_hash_matches_payload",
+        "ck_forecast_selection_policies_window_order",
+        "ck_forecast_selection_policies_minimum_member_counts_bounded",
+        "ck_forecast_selection_policies_minimum_seal_lead_bounded",
+        "ck_forecast_selection_policies_selected_steps_bounded",
+        "fk_forecast_selection_policies_registered_outcome_policy",
+        "uq_forecast_selection_policies_outcome_epoch",
+    } <= constraints.keys()
 
 
 def test_migration_uses_second_transaction_precommit_proof_and_exact_acls() -> None:
@@ -251,3 +324,41 @@ def test_policy_fence_migration_is_fail_closed_and_source_bound() -> None:
     assert 'op.drop_table("forecast_realized_outcome_publications")' in downgrade
     assert 'op.drop_table("forecast_outcome_resolution_policies")' in downgrade
     assert "DROP FUNCTION IF EXISTS forecast_bar_series_fence_id" in downgrade
+
+
+def test_selection_policy_fence_is_registered_scoped_and_reversible() -> None:
+    migration = SELECTION_POLICY_FENCE_MIGRATION.read_text(encoding="utf-8")
+    upgrade, downgrade = migration.split("def downgrade() -> None:", maxsplit=1)
+    validator = upgrade.split("def _create_manifest_validator() -> None:", maxsplit=1)[1]
+    validator = validator.split("def _install_acls_and_audit() -> None:", maxsplit=1)[0]
+
+    assert 'revision: str = "0016_selection_policy_fence"' in upgrade
+    assert 'down_revision: str | None = "0015_calibration_evidence"' in upgrade
+    assert "selection policy migration requires empty cohort evidence tables" in upgrade
+    assert "CREATE EXTENSION IF NOT EXISTS btree_gist" in upgrade
+    assert "CREATE FUNCTION canonical_forecast_selection_json(p_value jsonb)" in upgrade
+    assert "CREATE FUNCTION stamp_forecast_selection_policy()" in upgrade
+    assert "CREATE FUNCTION register_forecast_selection_policy(p_canonical_policy bytea)" in upgrade
+    assert "does not match a registered outcome-policy epoch" in upgrade
+    assert "length(symbol_document #>> '{}') > 32" in upgrade
+    assert "fk_cohort_manifests_registered_selection_policy" in upgrade
+    assert "fk_forecast_outcome_cohort_members_manifest_selection_scope" in upgrade
+    assert "uq_forecast_outcome_cohort_members_policy_opportunity_step" in upgrade
+    assert "ex_forecast_outcome_cohort_members_cross_purpose" in upgrade
+    assert "exact selected-step bundle" in validator
+    assert "scheduled run does not match its registered selection policy" in validator
+    assert "LEFT JOIN public.forecast_runs AS archived_run" in validator
+    assert "LEFT JOIN public.forecast_input_snapshots AS archived_snapshot" in validator
+    assert "{payload,interval_coverages}" in validator
+    assert "{payload,provenance,model_version}" in validator
+    assert "snapshot_document->'target_times'" in validator
+    assert "registered_policy.forecast_resolution_policy_hash" in validator
+    assert "registered_policy.forecast_availability_rule_set_hash" in validator
+    assert "minimum_seal_lead_seconds" not in validator
+    assert "GRANT EXECUTE ON FUNCTION public.register_forecast_selection_policy" in upgrade
+
+    assert "cannot downgrade nonempty selection-policy evidence" in downgrade
+    assert "_install_materializer(scoped=False)" in downgrade
+    assert 'op.drop_column("forecast_outcome_cohort_members", "purpose")' in downgrade
+    assert 'op.drop_table("forecast_selection_policies")' in downgrade
+    assert "DROP EXTENSION" not in downgrade

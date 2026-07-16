@@ -51,8 +51,12 @@ def test_ci_runner_opts_in_only_the_postgres_module() -> None:
     assert "stockapi_owner:${owner_password}@127.0.0.1:5432/stockapi_test" in runner
     assert "stockapi_app:${app_password}@127.0.0.1:5432/stockapi_test" in runner
     assert "stockapi_snapshot_builder:${builder_password}@127.0.0.1:5432/stockapi_test" in runner
-    assert "TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET=stockapi-test-only" in runner
+    assert "TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET=stockapi-ci-container-only" in runner
+    assert "stockapi_disposable_live_gate_marker" in runner
+    assert 'export TEST_DISPOSABLE_DATABASE_NONCE="$gate_nonce"' in runner
+    assert "unset ALEMBIC_CONFIG PYTEST_ADDOPTS PYTEST_PLUGINS" in runner
     assert "uv run --frozen --no-sync pytest" in runner
     assert "tests/integration/test_bars_live_gate.py" in runner
+    assert "--tb=short" in runner
     assert "tests/integration \\" not in runner
     assert "-p no:cacheprovider" in runner

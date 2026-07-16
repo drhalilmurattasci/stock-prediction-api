@@ -137,6 +137,8 @@ def _database(*, count: int = 4) -> tuple[_Database, object, tuple[object, ...]]
     member_rows = [
         ForecastOutcomeCohortMember(
             cohort_id=cohort.record.cohort_id,
+            selection_policy_hash=cohort.record.selection_policy_hash,
+            purpose=cohort.record.purpose,
             forecast_id=member.forecast_id,
             step=member.step,
             target_time=member.target_time,

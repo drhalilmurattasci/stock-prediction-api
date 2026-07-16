@@ -11,7 +11,7 @@ forecasts with central **prediction intervals** and point-in-time provenance.
 ## Status
 
 🚧 **The fail-closed data/forecast evidence substrate is code-complete through
-migration `0015_calibration_evidence`, but the product has not yet served a
+migration `0016_selection_policy_fence`, but the product has not yet served a
 forecast over real vendor data.**
 The repository now has API-key auth, bounded `/v1/prices` and `/v1/indicators`
 reads, versioned Polygon daily-bar ingestion, append-only restatement history, an
@@ -78,25 +78,29 @@ and separates formula-policy, window-policy, and exact-input hashes. The endpoin
 is a current-snapshot calculation, not an availability-as-of reconstruction;
 later restatements can change a historical request, raw values can include
 unresolved corporate-action discontinuities, and it does not assert that the
-newest stored row is the latest completed session. At the dated acceptance
-checkpoint above the database was empty; this API surface alone is not evidence
-of a real-data forecast.
+newest stored row is the latest completed session. The persistent database now
+contains only the owner-authorized MSFT smoke bar and its exact receipt; one bar
+and this API surface are not evidence of a real-data forecast.
 
-Unit/static gates cover the evidence substrate. On 2026-07-15 the separately
-controlled local TimescaleDB gate passed all 31 tests through migration
-`0015_calibration_evidence`, including the fitted/release publishers, later-
-transaction receipt, replay, scope rejection, ACLs, append-only triggers, and
-nonempty downgrade refusal. The last remote CI execution still proves `0014`;
-remote validation of `0015` requires an explicit later push. The dedicated
+Unit/static gates cover the evidence substrate. On 2026-07-16 the separately
+controlled disposable TimescaleDB gate passed all 32 tests through migration
+`0016_selection_policy_fence`, including exact selection-policy registration
+and replay, outcome-epoch binding, purpose-window and complete-step validation,
+cross-purpose contamination fences, ACLs, append-only triggers, and nonempty
+downgrade refusal. Remote CI has not exercised `0016`; that validation requires
+an explicit later push. The dedicated
 `live-postgres` GitHub Actions job provisions a
 fresh digest-pinned TimescaleDB for every push and pull request, initializes the
 fixed runtime roles from the repository bootstrap, and runs only the destructive
 Postgres module with generated ephemeral credentials. It supplies no vendor
 secret, keeps automation disabled, and removes the container and anonymous
 database volume even after failure.
-`run-live-gate.ps1` is hard-bound to the designated `stockapi_test` throwaway
-database and checks a fresh empty-schema upgrade to head plus the gate's empty
-`0015` to `0007` to `0015` downgrade/upgrade cycle, exact
+`run-disposable-live-gate.ps1` creates a nonce-marked container on a random
+non-5432 loopback port, checks a fresh empty-schema upgrade to head plus the
+gate's empty `0016` to `0007` to `0016` downgrade/upgrade cycle, and removes the
+captured container and anonymous volume afterward. The retired
+`run-live-gate.ps1` refuses before it can target the persistent database. The
+live module proves exact
 runtime/builder role boundaries, restatement history, historical point-in-time
 snapshot reconstruction, archived serving, schema-validated keyed replay, and
 the outcome/cohort hash, exact-receipt, immutability, role-boundary, and
@@ -110,14 +114,14 @@ publisher/store/source-link path and rejects forged snapshot provenance; it is
 not evidence of a real market outcome.
 Ordinary local test runs and the ordinary CI pytest job still skip that module
 when its explicit live-database environment is absent; the dedicated CI job is
-the per-build opt-in. The first real
-Massive/Polygon call remains a separate credentialed smoke gate.
-That gate has a one-attempt, fail-closed operator command documented in
-`INSTALL.md`; no vendor request runs as part of ordinary verification. The next
+the per-build opt-in. The first owner-authorized Massive/Polygon smoke call has
+completed and produced the one real bar and receipt described above. Its
+one-attempt, fail-closed operator command remains documented in `INSTALL.md`;
+no vendor request runs as part of ordinary verification. The next
 history step is now a typed combined acquisition lane, not an unscoped
 backfill. Its read-only plan covers the exact final 258 XNYS sessions plus one
 complete split page and one complete dividend page over the same window. From
-the empty state after a successful one-bar smoke, the initial campaign
+the otherwise-empty state after a successful one-bar smoke, the initial campaign
 authorization is exactly **259 outbound attempts: 1 split + 1 dividend + 257
 open-close**. The executor sends actions first, disables HTTP retries,
 checkpoints every exact receipt, enforces one shared 5/60 pacer, and durably

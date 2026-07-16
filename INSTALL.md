@@ -476,7 +476,7 @@ Fresh databases create the fixed, non-owner `stockapi_app` and
 `stockapi_snapshot_builder` roles through `scripts/db-init/02-runtime-role.sh`.
 Existing initialized database directories do not rerun Docker init scripts;
 bootstrap both roles once before applying migrations `0006` through the current
-head, `0015_calibration_evidence`:
+head, `0016_selection_policy_fence`:
 
 ```powershell
 docker compose exec timescaledb sh /docker-entrypoint-initdb.d/02-runtime-role.sh
@@ -544,27 +544,25 @@ python -c "import os,sqlalchemy as sa; from dotenv import load_dotenv; load_dote
 ```
 
 The empirical database gate is intentionally destructive and must only target
-a specifically designated throwaway TimescaleDB. It drops/recreates the project
+a fresh disposable TimescaleDB. It drops/recreates the project
 tables before proving migrations, role ACLs, bar revisions, snapshot creation,
 read-only serving, exact-receipt realized-outcome resolution/persistence, and
 pre-outcome cohort sealing:
 
 ```powershell
-.\run-live-gate.ps1
+.\run-disposable-live-gate.ps1
 ```
 
-The runner refuses any database/user except `stockapi_test` owned by
-`stockapi_owner`, requires distinct owner/runtime/snapshot-builder passwords in
-`.env`, starts TimescaleDB, waits at most five minutes for health, supplies the
-destructive-test sentinel only for the test process, and removes all test URLs
-afterward. Both wrapper and test module independently enforce the exact local
-owner target; the wrapper also refuses to reset while API/Celery/uvicorn
-processes could race it. All mutating operator wrappers share one machine-wide
-mutex, and the fixture holds the same PostgreSQL vendor-operation advisory lock
-used by direct smoke/acquisition/backfill/demo lanes across reset and teardown. The module
-fixture then drops its seeded test data and reapplies
-migrations, leaving an empty schema at migration head `0015_calibration_evidence` so the later vendor smoke
-still proves absence. It never makes a vendor call.
+The runner generates distinct owner/runtime/builder credentials, creates one
+digest-pinned container with an anonymous volume and non-5432 loopback port,
+proves a per-run database marker, disables vendor access and automation, and
+removes only that captured container and volume afterward. The retired
+`run-live-gate.ps1` refuses before it can target the persistent port-5432
+database. All mutating operator
+wrappers share one machine-wide mutex. The disposable fixture drops its seeded
+test data and reapplies migrations, leaving its temporary schema at migration
+head `0016_selection_policy_fence` before the entire container is removed. It
+never makes a vendor call.
 
 CI proves the same database boundary on every push and pull request in the
 dedicated `live-postgres` job. `scripts/ci-live-database-gate.sh` refuses any
@@ -577,7 +575,7 @@ replays the transactional role bootstrap once, and executes only
 anonymous volume on success, failure, or cancellation. The job references no
 GitHub secret and does not authorize or perform vendor I/O. Ordinary local
 `pytest` remains skip-capable when the four explicit `TEST_*` values are absent;
-use `run-live-gate.ps1` for the corresponding owner-controlled Windows proof.
+use `run-disposable-live-gate.ps1` for the corresponding local Windows proof.
 
 ✅ When all rows pass, the database migration, privilege, revision, immutable
 snapshot, runtime-role serving, API-key short circuit, authenticated HTTP
@@ -653,10 +651,11 @@ Interpret the result before asking for authorization:
 - `complete`: all 258 price receipts and both complete action-collection
   receipts exist. Do not execute.
 
-Immediately after the destructive live gate, the cleaned throwaway database has
-no smoke anchor, so an acquisition plan is correctly `blocked`. Once the
-separately authorized one-bar smoke succeeds, and assuming no other data exists,
-the expected acquisition allocation is exactly **259 outbound attempts**:
+The disposable live gate never changes the persistent acquisition database. On
+a fresh persistent database the acquisition plan has no smoke anchor and is
+correctly `blocked`. Once the separately authorized one-bar smoke succeeds, and
+assuming no other data exists, the expected acquisition allocation is exactly
+**259 outbound attempts**:
 
 | call kind | exact ceiling | purpose |
 |---|---:|---|
@@ -694,7 +693,7 @@ With those exact freshly reviewed values, execution is:
 
 The wrapper scrubs ambient vendor credentials so the key can come only from
 ignored `.env`, disables ambient HTTP proxy inheritance, pins and health-checks
-the local Docker Desktop database at migration head `0015_calibration_evidence`, and refuses the API,
+the local Docker Desktop database at migration head `0016_selection_policy_fence`, and refuses the API,
 worker, Beat, snapshot-builder, native Celery/uvicorn, or another mutating
 operator. Execute revalidates
 the exact one-line plan and runs the reviewed code from a detached Git worktree;

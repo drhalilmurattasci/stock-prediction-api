@@ -1,19 +1,14 @@
 """Live-database gate: migrations, writes, reads, and immutable snapshots.
 
-Skipped unless ``TEST_DATABASE_URL`` points at a **throwaway** TimescaleDB
-through an owner/admin account. The fixture RESETS the project's database
-objects (tables and alembic_version are dropped) before applying migrations.
-It never creates or mutates the cluster-global runtime roles: bootstrap them
-first and provide both least-privilege URLs. Never point this gate at shared
-data. Run with::
-
-    docker compose up -d timescaledb          # needs .env credentials
-    $env:TEST_DATABASE_URL = "postgresql+asyncpg://<user>:<pass>@127.0.0.1:5432/<db>"
-    # Optional when .env DATABASE_URL does not target the same throwaway DB:
-    $env:TEST_RUNTIME_DATABASE_URL = "postgresql+asyncpg://stockapi_app:<pass>@127.0.0.1:5432/<db>"
-    $env:TEST_SNAPSHOT_BUILDER_DATABASE_URL = "postgresql+asyncpg://stockapi_snapshot_builder:<pass>@127.0.0.1:5432/<db>"
-    $env:TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET = "stockapi-test-only"
-    uv run pytest tests/integration/test_bars_live_gate.py -v
+Skipped unless an attested wrapper points ``TEST_DATABASE_URL`` at a newly
+created **throwaway** TimescaleDB through an owner/admin account. The fixture
+RESETS the project's database objects (tables and alembic_version are dropped)
+before applying migrations. It never creates or mutates the cluster-global
+runtime roles: the wrapper must bootstrap them and provide both least-privilege
+URLs. Direct invocation is deliberately unsupported; use
+``run-disposable-live-gate.ps1`` locally or
+``scripts/ci-live-database-gate.sh`` on a GitHub-hosted runner. Never point this
+gate at shared data.
 
 This is the empirical proof the unit suite cannot give: the Alembic chain
 applies against a real hypertable, ``upsert_bars`` replay is a no-op while a
@@ -23,14 +18,15 @@ actually reject NaN/Infinity under Postgres NaN ordering, and the API
 statement-timeout cancels a pathological statement.
 The same command also proves forecast-input snapshot SHA-256 enforcement,
 idempotent insertion, semantic collision rejection, pure resolution, and
-database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0015`` wire
+database-level UPDATE/DELETE/TRUNCATE refusal. Migrations ``0010``-``0016`` wire
 the same gate to check content-addressed realized outcomes, immutable policy
 registration, the direct receipt-writer cutoff fence, source-bound publication,
 and cohort manifests whose availability can be sealed only after the manifest
 commits and before its first target. Migration ``0015`` additionally exercises
 runtime-only fitted-set and descriptive held-out publishers, post-commit release
 availability, replay, normalized projections, run-scope binding, and append-only
-database enforcement.
+database enforcement. Migration ``0016`` registers exact selection-policy bytes
+and durably prevents one policy-bound opportunity from crossing purposes.
 """
 
 from __future__ import annotations
@@ -187,6 +183,12 @@ from app.services.forecast_runs import (
     parse_output,
     request_hash,
 )
+from app.services.forecast_selection_policies import (
+    MINIMUM_SEAL_LEAD_SECONDS,
+    ForecastSelectionWindow,
+    ProspectiveForecastSelectionPolicy,
+)
+from app.services.forecast_selection_policy_store import SqlForecastSelectionPolicyStore
 from app.services.forecast_serving import (
     ForecastServingPolicy,
     SnapshotForecastService,
@@ -238,10 +240,13 @@ from scripts.vendor_backfill import (
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
 if not TEST_DATABASE_URL:
     pytest.skip("TEST_DATABASE_URL not set - live-DB gate skipped", allow_module_level=True)
-if os.environ.get("TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET") != "stockapi-test-only":
+_DESTRUCTIVE_RESET_MODE = os.environ.get("TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET", "")
+if _DESTRUCTIVE_RESET_MODE not in {
+    "stockapi-ci-container-only",
+    "stockapi-disposable-container-only",
+}:
     raise RuntimeError(
-        "set TEST_ALLOW_DESTRUCTIVE_DATABASE_RESET=stockapi-test-only only for the "
-        "owner-designated throwaway database"
+        "set an exact destructive-reset sentinel only for a verified throwaway database"
     )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -383,13 +388,68 @@ def _validated_owner_url(url: str) -> str:
         parsed.port or 5432,
         parsed.database,
     )
-    allowed = {
-        ("postgresql+asyncpg", "stockapi_owner", "localhost", 5432, "stockapi_test"),
-        ("postgresql+asyncpg", "stockapi_owner", "127.0.0.1", 5432, "stockapi_test"),
-    }
-    if target not in allowed or not parsed.password or parsed.query:
-        raise ValueError("TEST_DATABASE_URL must use stockapi_owner on local stockapi_test:5432")
+    if _DESTRUCTIVE_RESET_MODE == "stockapi-disposable-container-only":
+        raw_port = os.environ.get("TEST_DISPOSABLE_DATABASE_HOST_PORT", "")
+        if not raw_port.isascii() or not raw_port.isdecimal() or str(int(raw_port)) != raw_port:
+            raise ValueError("disposable live gate requires one canonical explicit host port")
+        disposable_port = int(raw_port)
+        expected = (
+            "postgresql+asyncpg",
+            "stockapi_owner",
+            "127.0.0.1",
+            disposable_port,
+            "stockapi_test",
+        )
+        if (
+            parsed.port is None
+            or target != expected
+            or not 1024 <= disposable_port <= 65535
+            or disposable_port == 5432
+        ):
+            raise ValueError("disposable live gate must use its explicit non-5432 loopback port")
+    else:
+        expected = (
+            "postgresql+asyncpg",
+            "stockapi_owner",
+            "127.0.0.1",
+            5432,
+            "stockapi_test",
+        )
+        if (
+            os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+            or os.environ.get("RUNNER_OS") != "Linux"
+            or parsed.port is None
+            or target != expected
+        ):
+            raise ValueError("CI live gate requires its exact GitHub-hosted container target")
+    if not parsed.password or parsed.query:
+        raise ValueError("live gate owner URL must have a password and no query parameters")
     return parsed.render_as_string(hide_password=False)
+
+
+def _verify_throwaway_database_marker(url: str) -> None:
+    """Require proof that reset authority came from this wrapper invocation."""
+
+    nonce = os.environ.get("TEST_DISPOSABLE_DATABASE_NONCE", "")
+    if len(nonce) != 32 or any(character not in "0123456789abcdef" for character in nonce):
+        raise ValueError("disposable live gate nonce is invalid")
+    marker_engine = create_engine(_sync_url(url))
+    try:
+        with marker_engine.connect() as connection:
+            marker = connection.execute(
+                text(
+                    "SELECT nonce FROM public.stockapi_disposable_live_gate_marker "
+                    "WHERE nonce = :nonce"
+                ),
+                {"nonce": nonce},
+            ).scalar_one_or_none()
+    except DBAPIError as exc:
+        raise ValueError("disposable live gate marker is missing") from exc
+    finally:
+        marker_engine.dispose()
+    if marker != nonce:
+        raise ValueError("disposable live gate marker does not match this invocation")
 
 
 def _runtime_url_for(owner_url: str) -> str:
@@ -435,6 +495,7 @@ def _drop_project_schema(url: str) -> None:
                     "forecast_heldout_coverage_release_buckets, "
                     "forecast_heldout_coverage_releases, "
                     "forecast_fitted_calibration_sets, "
+                    "forecast_selection_policies, "
                     "adjustment_factor_set_availability, "
                     "adjustment_factor_entries, adjustment_factor_sets, "
                     "vendor_acquisition_campaign_anchors, "
@@ -465,6 +526,8 @@ def _drop_project_schema(url: str) -> None:
                 "materialize_forecast_outcome_cohort_members",
                 "fence_bar_version_availability",
                 "stamp_forecast_outcome_resolution_policy",
+                "stamp_forecast_selection_policy",
+                "validate_forecast_cohort_selection_policy",
                 "validate_forecast_realized_outcome_policy",
                 "stamp_corporate_action_evidence",
                 "stamp_corporate_action_collection_member",
@@ -496,6 +559,8 @@ def _drop_project_schema(url: str) -> None:
             conn.execute(
                 text("DROP FUNCTION IF EXISTS register_forecast_outcome_resolution_policy(bytea)")
             )
+            conn.execute(text("DROP FUNCTION IF EXISTS register_forecast_selection_policy(bytea)"))
+            conn.execute(text("DROP FUNCTION IF EXISTS canonical_forecast_selection_json(jsonb)"))
             conn.execute(
                 text(
                     "DROP FUNCTION IF EXISTS publish_forecast_realized_outcome("
@@ -570,6 +635,7 @@ def _run_alembic(url: str, *arguments: str) -> None:
 def migrated_database_url() -> LiveDatabaseUrls:
     """Reset/migrate the throwaway DB, then restore an empty migrated schema."""
     url = _validated_owner_url(TEST_DATABASE_URL)
+    _verify_throwaway_database_marker(url)
     runtime_url = _runtime_url_for(url)
     snapshot_builder_url = _snapshot_builder_url_for(url)
     guard_engine = create_engine(_sync_url(url))
@@ -661,6 +727,68 @@ def _bar(
         source="polygon",
         fetched_at=ts + timedelta(hours=fetched_hour),
     )
+
+
+def _live_selection_policy(
+    *,
+    outcome_policy: ForecastOutcomeResolutionPolicy,
+    purpose: CohortPurpose,
+    target_dates: tuple[date, ...],
+    selected_steps: tuple[int, ...],
+    forecast_resolution_policy_hash: str,
+    forecast_availability_rule_set_hash: str,
+    symbols: tuple[str, ...],
+    identity: int = 1,
+) -> ProspectiveForecastSelectionPolicy:
+    """Build one explicit synthetic policy; no value is a production default."""
+
+    if not target_dates:
+        raise AssertionError("live selection policy requires target dates")
+    first_target = min(target_dates)
+    last_target = max(target_dates)
+    if purpose == "calibration_fit":
+        fit_window = ForecastSelectionWindow(first_target, last_target)
+        heldout_start = last_target + timedelta(days=1)
+        heldout_window = ForecastSelectionWindow(heldout_start, heldout_start)
+    else:
+        fit_end = first_target - timedelta(days=1)
+        fit_window = ForecastSelectionWindow(fit_end, fit_end)
+        heldout_window = ForecastSelectionWindow(first_target, last_target)
+    return ProspectiveForecastSelectionPolicy(
+        symbols=tuple(sorted(symbols)),
+        target="close",
+        series_basis="raw",
+        horizon_unit="trading_day",
+        currency="USD",
+        model_selector="baseline_naive",
+        model_version="baseline-naive@1",
+        horizon=max(selected_steps),
+        selected_steps=selected_steps,
+        interval_coverages_millis=(800,),
+        fit_window=fit_window,
+        heldout_window=heldout_window,
+        minimum_fit_member_count=identity,
+        minimum_heldout_member_count=identity,
+        minimum_seal_lead_seconds=MINIMUM_SEAL_LEAD_SECONDS,
+        cadence="xnys_session_daily",
+        snapshot_binding="explicit_snapshot_id",
+        selection_rule="complete_selected_step_bundle_within_one_utc_target_window",
+        resolution_lag_seconds=outcome_policy.resolution_lag_seconds,
+        forecast_resolution_policy_hash=forecast_resolution_policy_hash,
+        forecast_availability_rule_set_hash=forecast_availability_rule_set_hash,
+        outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
+        outcome_availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
+    )
+
+
+async def _register_live_selection_policy(
+    maker: async_sessionmaker[AsyncSession],
+    **values: Any,
+) -> ProspectiveForecastSelectionPolicy:
+    policy = _live_selection_policy(**values)
+    proof = await SqlForecastSelectionPolicyStore(maker).register(policy)
+    assert proof.policy == policy
+    return proof.policy
 
 
 def _dividend_collection(
@@ -1067,7 +1195,7 @@ async def test_migration_chain_applies_and_bars_is_a_hypertable(
 ) -> None:
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-        assert version == "0015_calibration_evidence"
+        assert version == "0016_selection_policy_fence"
         hypertables = (
             await conn.execute(
                 text(
@@ -1570,7 +1698,7 @@ async def test_nonempty_policy_registry_refuses_downgrade(
     assert "cannot downgrade nonempty outcome-policy evidence" in combined
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0015_calibration_evidence"
+    assert version == "0016_selection_policy_fence"
 
 
 async def test_corporate_action_publication_replay_correction_and_withdrawal(
@@ -2283,7 +2411,7 @@ async def test_adjustment_factor_publication_replay_receipt_projection_and_lock(
     )
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0015_calibration_evidence"
+    assert version == "0016_selection_policy_fence"
 
 
 async def test_adjustment_decimal_kernel_is_exact_decimal34(
@@ -2591,6 +2719,7 @@ async def test_forecast_evidence_schema_and_role_boundaries(
 ) -> None:
     tables = (
         "forecast_outcome_resolution_policies",
+        "forecast_selection_policies",
         "forecast_realized_outcomes",
         "forecast_realized_outcome_publications",
         "forecast_outcome_cohort_manifests",
@@ -2606,11 +2735,19 @@ async def test_forecast_evidence_schema_and_role_boundaries(
         "pk_forecast_outcome_resolution_policies",
         "ck_forecast_outcome_resolution_policies_resolution_lag_bounded",
         "uq_forecast_outcome_resolution_policies_policy_rules",
+        "pk_forecast_selection_policies",
+        "ck_forecast_selection_policies_policy_hash_matches_payload",
+        "fk_forecast_selection_policies_registered_outcome_policy",
+        "uq_forecast_selection_policies_outcome_epoch",
         "pk_forecast_realized_outcome_publications",
         "ck_forecast_outcome_cohort_manifests_cohort_id_matches_payload",
         "fk_forecast_outcome_cohort_manifests_registered_policy",
+        "fk_cohort_manifests_registered_selection_policy",
+        "uq_forecast_outcome_cohort_manifests_selection_scope",
         "pk_forecast_outcome_cohort_members",
         "uq_forecast_outcome_cohort_members_opportunity_step",
+        "uq_forecast_outcome_cohort_members_policy_opportunity_step",
+        "fk_forecast_outcome_cohort_members_manifest_selection_scope",
     }
     required_triggers = {
         ("forecast_realized_outcomes", "forecast_realized_outcomes_stamp"),
@@ -2629,6 +2766,15 @@ async def test_forecast_evidence_schema_and_role_boundaries(
             "forecast_outcome_resolution_policies",
             "forecast_outcome_resolution_policies_no_truncate",
         ),
+        ("forecast_selection_policies", "forecast_selection_policies_stamp"),
+        (
+            "forecast_selection_policies",
+            "forecast_selection_policies_no_row_mutation",
+        ),
+        (
+            "forecast_selection_policies",
+            "forecast_selection_policies_no_truncate",
+        ),
         (
             "forecast_realized_outcome_publications",
             "forecast_realized_outcome_publications_no_row_mutation",
@@ -2638,6 +2784,10 @@ async def test_forecast_evidence_schema_and_role_boundaries(
             "forecast_realized_outcome_publications_no_truncate",
         ),
         ("forecast_outcome_cohort_manifests", "forecast_outcome_cohorts_stamp"),
+        (
+            "forecast_outcome_cohort_manifests",
+            "forecast_outcome_cohorts_validate_selection",
+        ),
         (
             "forecast_outcome_cohort_manifests",
             "forecast_outcome_cohort_manifests_no_row_mutation",
@@ -2722,6 +2872,16 @@ async def test_forecast_evidence_schema_and_role_boundaries(
             name.startswith("ck_forecast_outcome_resolution_policies_canonical_polic")
             for name in constraints
         )
+        exclusion = (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_constraint "
+                    "WHERE conname = 'ex_forecast_outcome_cohort_members_cross_purpose' "
+                    "AND contype = 'x'"
+                )
+            )
+        ).scalar_one()
+        assert exclusion == 1
 
         indexes = set(
             (
@@ -2829,6 +2989,9 @@ async def test_forecast_evidence_schema_and_role_boundaries(
             "stamp_forecast_outcome_resolution_policy()",
             "validate_forecast_realized_outcome_policy()",
             "forecast_bar_series_fence_id(text,text,text)",
+            "canonical_forecast_selection_json(jsonb)",
+            "stamp_forecast_selection_policy()",
+            "validate_forecast_cohort_selection_policy()",
         ):
             executable = (
                 await conn.execute(
@@ -2844,6 +3007,7 @@ async def test_forecast_evidence_schema_and_role_boundaries(
 
         for function_name in (
             "register_forecast_outcome_resolution_policy(bytea)",
+            "register_forecast_selection_policy(bytea)",
             "publish_forecast_realized_outcome(varchar,uuid,smallint,varchar,bytea)",
         ):
             runtime, builder = (
@@ -2858,6 +3022,72 @@ async def test_forecast_evidence_schema_and_role_boundaries(
             ).one()
             assert runtime is True
             assert builder is False
+
+
+async def test_selection_policy_registry_replay_epoch_and_immutability(
+    engine: AsyncEngine,
+    owner_engine: AsyncEngine,
+) -> None:
+    runtime_maker = build_sessionmaker(engine)
+    outcome_policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=86_400)
+    await SqlForecastOutcomePolicyStore(runtime_maker).register(outcome_policy)
+    target_date = (datetime.now(UTC) + timedelta(days=2)).date()
+    policy = _live_selection_policy(
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=(target_date,),
+        selected_steps=(1,),
+        forecast_resolution_policy_hash="sha256:" + "1" * 64,
+        forecast_availability_rule_set_hash="sha256:" + "2" * 64,
+        symbols=("REG",),
+        identity=7,
+    )
+    store = SqlForecastSelectionPolicyStore(runtime_maker)
+
+    proof = await store.register(policy)
+    assert await store.register(policy) == proof
+    assert proof.record.policy_hash == policy.selection_policy_hash
+    assert proof.record.selected_steps == (1,)
+    assert proof.record.fit_window_end < proof.record.heldout_window_start
+    assert proof.record.creator_xid > 0
+
+    noncanonical = policy.canonical_policy.replace(b"{", b"{ ", 1)
+    mismatched_lag = replace(
+        policy,
+        resolution_lag_seconds=outcome_policy.resolution_lag_seconds + 1,
+    )
+    for payload, message in (
+        (noncanonical, "selection policy bytes are not canonical"),
+        (
+            mismatched_lag.canonical_policy,
+            "does not match a registered outcome-policy epoch",
+        ),
+    ):
+        async with engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match=message):
+                await conn.execute(
+                    text("SELECT register_forecast_selection_policy(:policy)"),
+                    {"policy": payload},
+                )
+            await transaction.rollback()
+
+    for mutation in (
+        "UPDATE forecast_selection_policies SET schema_version = schema_version "
+        "WHERE policy_hash = :policy_hash",
+        "DELETE FROM forecast_selection_policies WHERE policy_hash = :policy_hash",
+        "TRUNCATE forecast_selection_policies CASCADE",
+    ):
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match="forecast evidence is insert-only"):
+                await conn.execute(
+                    text(mutation),
+                    {"policy_hash": policy.selection_policy_hash}
+                    if ":policy_hash" in mutation
+                    else {},
+                )
+            await transaction.rollback()
 
 
 async def test_calibration_evidence_schema_and_role_boundaries(
@@ -3665,7 +3895,12 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     earliest_target = database_now + timedelta(days=1)
     resolution_policy_hash = "sha256:" + "7" * 64
     availability_rule_set_hash = "sha256:" + "8" * 64
-    snapshot = _forecast_snapshot_record(policy_hash=resolution_policy_hash)
+    snapshot = _forecast_snapshot_record(
+        policy_hash=resolution_policy_hash,
+        target_times=(earliest_target,),
+        horizon_unit="trading_day",
+        availability_rule_set_hash=availability_rule_set_hash,
+    )
     async with owner_engine.begin() as conn:
         await conn.execute(pg_insert(ForecastInputSnapshot).values(**_record_values(snapshot)))
 
@@ -3726,6 +3961,42 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     runtime_maker = build_sessionmaker(engine)
     outcome_policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=24 * 60 * 60)
     await SqlForecastOutcomePolicyStore(runtime_maker).register(outcome_policy)
+    selection_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=(
+            (database_now - timedelta(minutes=1)).date(),
+            earliest_target.date(),
+            (earliest_target + timedelta(minutes=20)).date(),
+        ),
+        selected_steps=(1,),
+        forecast_resolution_policy_hash=resolution_policy_hash,
+        forecast_availability_rule_set_hash=availability_rule_set_hash,
+        symbols=(snapshot.symbol,),
+    )
+    incomplete_bundle_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=(earliest_target.date(),),
+        selected_steps=(1, 2),
+        forecast_resolution_policy_hash=resolution_policy_hash,
+        forecast_availability_rule_set_hash=availability_rule_set_hash,
+        symbols=(snapshot.symbol,),
+        identity=8,
+    )
+    mismatched_run_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=(earliest_target.date(),),
+        selected_steps=(1,),
+        forecast_resolution_policy_hash=resolution_policy_hash,
+        forecast_availability_rule_set_hash=availability_rule_set_hash,
+        symbols=("OTHER",),
+        identity=9,
+    )
     async with runtime_maker() as session:
         scheduled_run = (
             await session.execute(select(ForecastRun).where(ForecastRun.forecast_id == forecast_id))
@@ -3736,15 +4007,42 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
         new_forecast_id: UUID,
         target_time: datetime,
     ) -> ForecastCohortMember:
+        snapshot_as_of = min(
+            target_time - timedelta(minutes=5),
+            database_now - timedelta(minutes=5),
+        ) - timedelta(microseconds=new_forecast_id.int % 1_000_000)
+        new_snapshot = _forecast_snapshot_record(
+            policy_hash=resolution_policy_hash,
+            symbol=snapshot.symbol,
+            as_of=snapshot_as_of,
+            target_times=(target_time,),
+            horizon_unit="trading_day",
+            availability_rule_set_hash=availability_rule_set_hash,
+        )
+        async with owner_engine.begin() as conn:
+            await conn.execute(
+                pg_insert(ForecastInputSnapshot).values(**_record_values(new_snapshot))
+            )
         new_response = _scheduled_response(
             forecast_id=new_forecast_id,
-            snapshot=snapshot,
+            snapshot=new_snapshot,
             target_time=target_time,
         )
+        new_request = ForecastRequest(
+            symbol=new_snapshot.symbol,
+            horizon=1,
+            horizon_unit=new_snapshot.horizon_unit,
+            target="close",
+            snapshot_id=new_snapshot.snapshot_id,
+            model="baseline_naive",
+            interval_coverages=[0.8],
+        )
+        new_request_bytes = canonical_request(new_request)
         new_output = canonical_output(new_response)
         new_values = {
             **run_values,
             "forecast_id": new_forecast_id,
+            "request_hash": request_hash(new_request_bytes),
             "opportunity_hash": opportunity_hash(
                 new_response,
                 resolution_policy_hash=resolution_policy_hash,
@@ -3752,6 +4050,12 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
                 origin_kind="scheduled_evaluation",
             ),
             "output_hash": output_hash(new_output),
+            "snapshot_id": new_snapshot.snapshot_id,
+            "as_of": new_response.as_of,
+            "max_available_at": new_response.provenance.max_available_at,
+            "feature_set_hash": new_response.provenance.feature_set_hash,
+            "generated_at": new_response.provenance.generated_at,
+            "canonical_request": new_request_bytes,
             "canonical_output": new_output,
         }
         async with engine.begin() as conn:
@@ -3763,7 +4067,7 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
 
     manifest = ForecastCohortManifest(
         purpose="heldout_evaluation",
-        selection_policy_hash="sha256:" + "9" * 64,
+        selection_policy_hash=selection_policy.selection_policy_hash,
         outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
         availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
         members=(member,),
@@ -3783,7 +4087,10 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     forged_canonical = canonical_cohort_manifest(forged_manifest)
     async with engine.connect() as conn:
         transaction = await conn.begin()
-        with pytest.raises(DBAPIError, match="step does not match scheduled output"):
+        with pytest.raises(
+            DBAPIError,
+            match="scheduled run does not match its registered selection policy",
+        ):
             await conn.execute(
                 pg_insert(ForecastOutcomeCohortManifest).values(
                     cohort_id=cohort_id_for_manifest(forged_canonical),
@@ -3791,6 +4098,43 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
                 )
             )
         await transaction.rollback()
+
+    invalid_selection_manifests = (
+        (
+            replace(manifest, selection_policy_hash="sha256:" + "f" * 64),
+            "selection policy is not registered",
+        ),
+        (
+            replace(manifest, purpose="calibration_fit"),
+            "target lies outside its policy purpose window",
+        ),
+        (
+            replace(
+                manifest,
+                selection_policy_hash=incomplete_bundle_policy.selection_policy_hash,
+            ),
+            "exact selected-step bundle",
+        ),
+        (
+            replace(
+                manifest,
+                selection_policy_hash=mismatched_run_policy.selection_policy_hash,
+            ),
+            "scheduled run does not match its registered selection policy",
+        ),
+    )
+    for invalid_manifest, message in invalid_selection_manifests:
+        invalid_canonical = canonical_cohort_manifest(invalid_manifest)
+        async with engine.connect() as conn:
+            transaction = await conn.begin()
+            with pytest.raises(DBAPIError, match=message):
+                await conn.execute(
+                    pg_insert(ForecastOutcomeCohortManifest).values(
+                        cohort_id=cohort_id_for_manifest(invalid_canonical),
+                        canonical_manifest=invalid_canonical,
+                    )
+                )
+            await transaction.rollback()
 
     manifest_insert = (
         pg_insert(ForecastOutcomeCohortManifest)
@@ -3842,6 +4186,87 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     assert projected_member.target_time == earliest_target
     assert projected_member.opportunity_hash == run_opportunity_hash
     assert projected_member.output_hash == output_hash(canonical_output_bytes)
+    assert projected_member.selection_policy_hash == selection_policy.selection_policy_hash
+    assert projected_member.purpose == "heldout_evaluation"
+
+    async def _assert_global_member_fence(
+        conflicting_manifest: ForecastCohortManifest,
+        *,
+        expected_constraint: str,
+    ) -> None:
+        conflicting_member = conflicting_manifest.members[0]
+        conflicting_canonical = canonical_cohort_manifest(conflicting_manifest)
+        conflicting_cohort_id = cohort_id_for_manifest(conflicting_canonical)
+        async with owner_engine.connect() as conn:
+            transaction = await conn.begin()
+            # Disable only USER triggers so controlled relational rows can reach
+            # the declarative UNIQUE/GiST fences. FK and CHECK constraints remain
+            # active, and the transactional ALTER is rolled back with the probe.
+            await conn.execute(
+                text("ALTER TABLE forecast_outcome_cohort_manifests DISABLE TRIGGER USER")
+            )
+            await conn.execute(
+                text("ALTER TABLE forecast_outcome_cohort_members DISABLE TRIGGER USER")
+            )
+            await conn.execute(
+                pg_insert(ForecastOutcomeCohortManifest).values(
+                    cohort_id=conflicting_cohort_id,
+                    schema_version=1,
+                    selection_policy_hash=conflicting_manifest.selection_policy_hash,
+                    outcome_resolution_policy_hash=(
+                        conflicting_manifest.outcome_resolution_policy_hash
+                    ),
+                    availability_rule_set_hash=(conflicting_manifest.availability_rule_set_hash),
+                    purpose=conflicting_manifest.purpose,
+                    member_count=1,
+                    earliest_target_time=conflicting_member.target_time,
+                    latest_target_time=conflicting_member.target_time,
+                    recorded_at=conflicting_member.target_time - timedelta(seconds=1),
+                    creator_xid=1,
+                    canonical_manifest=conflicting_canonical,
+                )
+            )
+            with pytest.raises(IntegrityError, match=expected_constraint):
+                await conn.execute(
+                    pg_insert(ForecastOutcomeCohortMember).values(
+                        cohort_id=conflicting_cohort_id,
+                        selection_policy_hash=conflicting_manifest.selection_policy_hash,
+                        purpose=conflicting_manifest.purpose,
+                        forecast_id=conflicting_member.forecast_id,
+                        step=conflicting_member.step,
+                        target_time=conflicting_member.target_time,
+                        opportunity_hash=conflicting_member.opportunity_hash,
+                        output_hash=conflicting_member.output_hash,
+                    )
+                )
+            await transaction.rollback()
+
+    await _assert_global_member_fence(
+        replace(
+            manifest,
+            members=(
+                replace(
+                    member,
+                    target_time=earliest_target + timedelta(minutes=2),
+                ),
+            ),
+        ),
+        expected_constraint="uq_forecast_outcome_cohort_members_policy_opportunity_step",
+    )
+    await _assert_global_member_fence(
+        replace(
+            manifest,
+            purpose="calibration_fit",
+            members=(
+                replace(
+                    member,
+                    step=2,
+                    target_time=earliest_target - timedelta(days=2),
+                ),
+            ),
+        ),
+        expected_constraint="ex_forecast_outcome_cohort_members_cross_purpose",
+    )
 
     seal = proof.seal
     assert seal.sealer_xid != stored_manifest.creator_xid
@@ -3855,7 +4280,6 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     )
     expired_manifest = replace(
         manifest,
-        selection_policy_hash="sha256:" + "b" * 64,
         members=(expired_member,),
     )
     expired_cohort_id = cohort_id_for_manifest(expired_manifest)
@@ -3876,7 +4300,6 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     )
     manifest_race = replace(
         manifest,
-        selection_policy_hash="sha256:" + "c" * 64,
         members=(manifest_race_member,),
     )
     manifest_barrier = _MissingReadBarrier(ForecastOutcomeCohortManifest)
@@ -3901,7 +4324,6 @@ async def test_cohort_requires_post_commit_seal_and_is_immutable(
     )
     seal_race = replace(
         manifest,
-        selection_policy_hash="sha256:" + "d" * 64,
         members=(seal_race_member,),
     )
     seal_race_canonical = canonical_cohort_manifest(seal_race)
@@ -4010,23 +4432,36 @@ async def test_synthetic_publisher_path_binds_exact_snapshot_and_source(
     outcome_policy = ForecastOutcomeResolutionPolicy(resolution_lag_seconds=10)
     await SqlForecastOutcomePolicyStore(runtime_maker).register(outcome_policy)
 
+    forecast_policy_hash = "sha256:" + "1" * 64
+    forecast_rule_set_hash = "sha256:" + "2" * 64
     snapshot = _forecast_snapshot_record(
         symbol="PUB",
         as_of=database_now - timedelta(minutes=5),
         target_times=(target_time,),
+        horizon_unit="trading_day",
+        policy_hash=forecast_policy_hash,
+        availability_rule_set_hash=forecast_rule_set_hash,
     )
     async with snapshot_builder_engine.begin() as conn:
         await conn.execute(pg_insert(ForecastInputSnapshot).values(**_record_values(snapshot)))
 
-    forecast_policy_hash = "sha256:" + "1" * 64
-    forecast_rule_set_hash = "sha256:" + "2" * 64
+    selection_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=(target_time.date(),),
+        selected_steps=(1,),
+        forecast_resolution_policy_hash=forecast_policy_hash,
+        forecast_availability_rule_set_hash=forecast_rule_set_hash,
+        symbols=(snapshot.symbol,),
+        identity=2,
+    )
     cohort_store = SqlForecastCohortStore(runtime_maker)
 
     async def archive_and_seal(
         *,
         forecast_id: UUID,
         response_snapshot: ForecastInputSnapshotRecord,
-        selection_hash: str,
     ) -> tuple[ForecastOutcomePublicationSource, ForecastCohortProof]:
         response = _scheduled_response(
             forecast_id=forecast_id,
@@ -4086,7 +4521,7 @@ async def test_synthetic_publisher_path_binds_exact_snapshot_and_source(
             member = member_from_scheduled_run(run, step=1)
         manifest = ForecastCohortManifest(
             purpose="heldout_evaluation",
-            selection_policy_hash=selection_hash,
+            selection_policy_hash=selection_policy.selection_policy_hash,
             outcome_resolution_policy_hash=outcome_policy.outcome_resolution_policy_hash,
             availability_rule_set_hash=outcome_policy.availability_rule_set_hash,
             members=(member,),
@@ -4104,16 +4539,17 @@ async def test_synthetic_publisher_path_binds_exact_snapshot_and_source(
     valid_source, valid_cohort = await archive_and_seal(
         forecast_id=UUID("61616161-6161-6161-6161-616161616161"),
         response_snapshot=snapshot,
-        selection_hash="sha256:" + "3" * 64,
     )
     forged_snapshot = replace(snapshot, snapshot_id="sha256:" + "e" * 64)
-    forged_source, forged_cohort = await archive_and_seal(
-        forecast_id=UUID("62626262-6262-6262-6262-626262626262"),
-        response_snapshot=forged_snapshot,
-        selection_hash="sha256:" + "4" * 64,
-    )
+    forged_forecast_id = UUID("62626262-6262-6262-6262-626262626262")
+    with pytest.raises(AppError) as forged_cohort_error:
+        await archive_and_seal(
+            forecast_id=forged_forecast_id,
+            response_snapshot=forged_snapshot,
+        )
+    assert forged_cohort_error.value.code == "forecast_cohort_integrity_failed"
+    forged_source = replace(valid_source, forecast_id=forged_forecast_id)
     assert valid_cohort.seal.sealed_at < target_time
-    assert forged_cohort.seal.sealed_at < target_time
 
     async def wait_for_database(moment: datetime) -> None:
         while True:
@@ -4191,7 +4627,7 @@ async def test_synthetic_publisher_path_binds_exact_snapshot_and_source(
 
     with pytest.raises(AppError) as forged_error:
         await store.publish(payload, source=forged_source)
-    assert forged_error.value.code == "forecast_outcome_integrity_failed"
+    assert forged_error.value.code == "forecast_outcome_source_unavailable"
 
     published = await store.publish(payload, source=valid_source)
     replayed = await store.publish(payload, source=valid_source)
@@ -4565,6 +5001,7 @@ def _forecast_snapshot_record(
     as_of: datetime | None = None,
     target_times: tuple[datetime, ...] | None = None,
     horizon_unit: str = "calendar_day",
+    availability_rule_set_hash: str | None = None,
 ) -> ForecastInputSnapshotRecord:
     snapshot_as_of = as_of or datetime(2026, 7, 10, 21, tzinfo=UTC)
     return build_snapshot_record(
@@ -4606,7 +5043,15 @@ def _forecast_snapshot_record(
                     fields=("close",),
                 ),
             ),
-            availability=SnapshotAvailabilityEvidence(status="not_run"),
+            availability=(
+                SnapshotAvailabilityEvidence(
+                    status="passed",
+                    rule_set_hash=availability_rule_set_hash,
+                    checked_at=snapshot_as_of,
+                )
+                if availability_rule_set_hash is not None
+                else SnapshotAvailabilityEvidence(status="not_run")
+            ),
         ),
         sealed_at=snapshot_as_of + timedelta(minutes=1),
     )
@@ -4762,6 +5207,8 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
     # version. Replaying the old semantic key must reconstruct the prior close
     # from bars_revisions, while a later cutoff must select the restatement.
     previous = bars[-1]
+    restatement_fetched_at = await database_snapshot_cutoff(builder_maker)
+    assert restatement_fetched_at > max(historical_cutoff, previous.fetched_at)
     restated_close = previous.close + 7.0
     restatement = OHLCVBar(
         symbol=previous.symbol,
@@ -4775,7 +5222,7 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
         volume=previous.volume,
         source=previous.source,
         adjustment_basis=previous.adjustment_basis,
-        fetched_at=previous.fetched_at + timedelta(minutes=1),
+        fetched_at=restatement_fetched_at,
     )
     async with runtime_maker() as session, session.begin():
         restated_plan = await upsert_bars(session, [restatement])
@@ -4885,6 +5332,17 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
         resolution_lag_seconds=24 * 60 * 60
     )
     await SqlForecastOutcomePolicyStore(runtime_maker).register(prospective_outcome_policy)
+    scheduled_selection_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=prospective_outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=tuple(item.target_time.date() for item in response.forecasts),
+        selected_steps=(1, 2),
+        forecast_resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
+        forecast_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
+        symbols=("AAPL",),
+        identity=3,
+    )
     scheduled_spec = ScheduledEvaluationSpec(
         request=scheduled_request,
         purpose="heldout_evaluation",
@@ -4893,7 +5351,7 @@ async def test_bars_to_verified_snapshot_to_served_forecast(
         code_version="live-gate-scheduled-1",
         forecast_resolution_policy_hash=DEFAULT_RESOLUTION_POLICY_HASH,
         forecast_availability_rule_set_hash=DEFAULT_AVAILABILITY_RULE_SET_HASH,
-        selection_policy_hash="sha256:" + "d" * 64,
+        selection_policy_hash=scheduled_selection_policy.selection_policy_hash,
         outcome_resolution_policy_hash=(prospective_outcome_policy.outcome_resolution_policy_hash),
         outcome_availability_rule_set_hash=(prospective_outcome_policy.availability_rule_set_hash),
     )
@@ -5515,6 +5973,7 @@ async def _archive_live_calibration_cohort(
             as_of=target_time - timedelta(minutes=10, seconds=index * 10),
             target_times=(target_time,),
             horizon_unit="trading_day",
+            availability_rule_set_hash=forecast_availability_rule_set_hash,
         )
         snapshots.append(snapshot)
         response = _scheduled_response(
@@ -5707,6 +6166,39 @@ async def test_calibration_publishers_replay_fence_scope_and_immutability(
     await SqlForecastOutcomePolicyStore(runtime_maker).register(outcome_policy)
     forecast_policy_hash = "sha256:" + "a" * 64
     forecast_rule_set_hash = "sha256:" + "b" * 64
+    fit_selection_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=outcome_policy,
+        purpose="calibration_fit",
+        target_dates=(fit_target.date(),),
+        selected_steps=(1,),
+        forecast_resolution_policy_hash=forecast_policy_hash,
+        forecast_availability_rule_set_hash=forecast_rule_set_hash,
+        symbols=("CAL",),
+        identity=4,
+    )
+    heldout_selection_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=(heldout_target.date(),),
+        selected_steps=(1,),
+        forecast_resolution_policy_hash=forecast_policy_hash,
+        forecast_availability_rule_set_hash=forecast_rule_set_hash,
+        symbols=("CAL",),
+        identity=5,
+    )
+    wrong_scope_selection_policy = await _register_live_selection_policy(
+        runtime_maker,
+        outcome_policy=outcome_policy,
+        purpose="heldout_evaluation",
+        target_dates=(heldout_target.date(),),
+        selected_steps=(1,),
+        forecast_resolution_policy_hash=forecast_policy_hash,
+        forecast_availability_rule_set_hash=forecast_rule_set_hash,
+        symbols=("BAD",),
+        identity=6,
+    )
 
     def ids(prefix: str) -> tuple[UUID, ...]:
         return tuple(UUID(f"{prefix}000000-0000-0000-0000-{number:012d}") for number in range(1, 5))
@@ -5716,7 +6208,7 @@ async def test_calibration_publishers_replay_fence_scope_and_immutability(
         snapshot_builder_engine=snapshot_builder_engine,
         outcome_policy=outcome_policy,
         purpose="calibration_fit",
-        selection_policy_hash="sha256:" + "c" * 64,
+        selection_policy_hash=fit_selection_policy.selection_policy_hash,
         forecast_resolution_policy_hash=forecast_policy_hash,
         forecast_availability_rule_set_hash=forecast_rule_set_hash,
         symbol="CAL",
@@ -5728,7 +6220,7 @@ async def test_calibration_publishers_replay_fence_scope_and_immutability(
         snapshot_builder_engine=snapshot_builder_engine,
         outcome_policy=outcome_policy,
         purpose="heldout_evaluation",
-        selection_policy_hash="sha256:" + "d" * 64,
+        selection_policy_hash=heldout_selection_policy.selection_policy_hash,
         forecast_resolution_policy_hash=forecast_policy_hash,
         forecast_availability_rule_set_hash=forecast_rule_set_hash,
         symbol="CAL",
@@ -5740,7 +6232,7 @@ async def test_calibration_publishers_replay_fence_scope_and_immutability(
         snapshot_builder_engine=snapshot_builder_engine,
         outcome_policy=outcome_policy,
         purpose="heldout_evaluation",
-        selection_policy_hash="sha256:" + "e" * 64,
+        selection_policy_hash=wrong_scope_selection_policy.selection_policy_hash,
         forecast_resolution_policy_hash=forecast_policy_hash,
         forecast_availability_rule_set_hash=forecast_rule_set_hash,
         symbol="BAD",
@@ -6030,9 +6522,9 @@ async def test_calibration_publishers_replay_fence_scope_and_immutability(
         "0014_vendor_campaign_anchor",
     )
     assert downgrade.returncode != 0
-    assert "cannot downgrade nonempty forecast calibration evidence" in (
+    assert "cannot downgrade nonempty selection-policy evidence" in (
         f"{downgrade.stdout}\n{downgrade.stderr}"
     )
     async with owner_engine.connect() as conn:
         version = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-    assert version == "0015_calibration_evidence"
+    assert version == "0016_selection_policy_fence"
